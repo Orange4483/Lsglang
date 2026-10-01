@@ -151,6 +151,18 @@ logger = logging.getLogger(__name__)
 
 @contextmanager
 def device_loading_context(module: torch.nn.Module, target_device: torch.device):
+    from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
+    if isinstance(module, FusedMoE) and not module.is_gpu_resident_layer:
+        yield module
+        return
+    # lk embedding tables (e.g. n-gram oe_embeder) stay CPU/NUMA resident;
+    # never move them to the GPU target device.
+    from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
+    if isinstance(module, VocabParallelEmbedding) and getattr(
+        module, "is_lk_embedding", False
+    ):
+        yield module
+        return
     if target_device.type == "cpu":
         yield module
         return
@@ -1071,7 +1083,13 @@ class DefaultModelLoader(BaseModelLoader):
 
     @staticmethod
     def postprocess_weights(model, target_device):
+        from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
         for module, quant_method in _modules_with_quant_method(model):
+            moe_pending = isinstance(module, FusedMoE) and not getattr(
+                module, "process_lk_moe_already_called", False
+            )
+            if moe_pending:
+                module.process_weights_after_loading()
             # When quant methods need to process weights after loading
             # (for repacking, quantizing, etc), they expect parameters
             # to be on the global target device. This scope is for the
@@ -1079,6 +1097,9 @@ class DefaultModelLoader(BaseModelLoader):
             # parameters onto device for processing and back off after.
             with device_loading_context(module, target_device):
                 quant_method.process_weights_after_loading(module)
+            if moe_pending:
+                module.clean_weights_after_loading()
+                module.process_lk_moe_already_called = True
 
     @staticmethod
     def restore_weights_before_loading(model, target_device):

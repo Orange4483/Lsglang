@@ -2420,6 +2420,10 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ):
+        from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
+        device = torch.cuda.current_device()
+        if isinstance(layer, FusedMoE) and not layer.is_gpu_resident_layer:
+            device = "cpu"
         # TODO(ch-wan): check if this is needed
         layer.intermediate_size_per_partition = intermediate_size_per_partition
         layer.params_dtype = params_dtype
@@ -2440,6 +2444,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 # 2 fp4 items are packed in the input dimension
                 hidden_size // 2,
                 dtype=weight_dtype,
+                device=device,
             ),
             input_dim=1,
             output_dim=2,
@@ -2455,6 +2460,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 # 2 fp4 items are packed in the input dimension
                 intermediate_size_per_partition // 2,
                 dtype=weight_dtype,
+                device=device,
             ),
             input_dim=1,
             output_dim=2,
@@ -2468,6 +2474,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 num_shards * intermediate_size_per_partition,
                 hidden_size // self.quant_config.group_size,
                 dtype=weight_scale_dtype,
+                device=device,
             ),
             input_dim=1,
             output_dim=2,
@@ -2478,15 +2485,15 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         # TRTLLM replaces blockscale_swizzled with an alias to weight_scale
         # during process_weights_after_loading, so skip the expensive
         # swizzle+allocate here to avoid GPU memory fragmentation
-        if (
-            self.enable_flashinfer_trtllm_moe
-            or get_moe_runner_backend().is_flashinfer_megamoe()
-        ):
-            layer.w13_blockscale_swizzled = None
+        if isinstance(layer, FusedMoE) and not layer.is_gpu_resident_layer:
+            pass
         else:
-            layer.w13_blockscale_swizzled = Parameter(
-                swizzle_blockscale(layer.w13_weight_scale), requires_grad=False
-            )
+            if self.enable_flashinfer_trtllm_moe:
+                layer.w13_blockscale_swizzled = None
+            else:
+                layer.w13_blockscale_swizzled = Parameter(
+                    swizzle_blockscale(layer.w13_weight_scale), requires_grad=False
+                )
 
         w2_weight_scale = ModelWeightParameter(
             data=torch.empty(
@@ -2494,6 +2501,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 hidden_size,
                 intermediate_size_per_partition // self.quant_config.group_size,
                 dtype=weight_scale_dtype,
+                device=device,
             ),
             input_dim=1,
             output_dim=2,
@@ -2501,15 +2509,16 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         )
         layer.register_parameter("w2_weight_scale", w2_weight_scale)
 
-        if (
-            self.enable_flashinfer_trtllm_moe
-            or get_moe_runner_backend().is_flashinfer_megamoe()
-        ):
-            layer.w2_blockscale_swizzled = None
+
+        if isinstance(layer, FusedMoE) and not layer.is_gpu_resident_layer:
+            pass
         else:
-            layer.w2_blockscale_swizzled = Parameter(
-                swizzle_blockscale(layer.w2_weight_scale), requires_grad=False
-            )
+            if self.enable_flashinfer_trtllm_moe:
+                layer.w2_blockscale_swizzled = None
+            else:
+                layer.w2_blockscale_swizzled = Parameter(
+                    swizzle_blockscale(layer.w2_weight_scale), requires_grad=False
+                )
 
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
 
@@ -2523,13 +2532,13 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             else (layer.num_local_experts,)
         )
         w13_weight_scale_2 = PerTensorScaleParameter(
-            data=torch.empty(w13_weight_scale_shape, dtype=torch.float32),
+            data=torch.empty(w13_weight_scale_shape, dtype=torch.float32, device=device),
             weight_loader=weight_loader,
         )
         layer.register_parameter("w13_weight_scale_2", w13_weight_scale_2)
 
         w2_weight_scale_2 = PerTensorScaleParameter(
-            data=torch.empty(layer.num_local_experts, dtype=torch.float32),
+            data=torch.empty(layer.num_local_experts, dtype=torch.float32, device=device),
             weight_loader=weight_loader,
         )
         layer.register_parameter("w2_weight_scale_2", w2_weight_scale_2)
@@ -2629,6 +2638,9 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         layer._mega_moe_weights_built = True
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
+        if isinstance(layer, FusedMoE) and not layer.is_gpu_resident_layer:
+            return None
         """Transform packed FP4 MoE weights and scales for the selected backend."""
         if getattr(layer, "inference_moe_w13_interleaved", False) and not getattr(
             layer, "_w13_deinterleaved", False
