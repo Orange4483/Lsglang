@@ -106,9 +106,7 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 logger = logging.getLogger(__name__)
 
-import threading
-from sglang.srt.utils.common import is_pin_memory_available
-from sglang.srt.utils.common import is_lk_moe_feature_enabled, is_lk_moe_gpu_resident_layer, get_gpu_prefetch_window, get_gpu_prefill_min_batch_size, is_lk_moe_use_gpu_prefill, get_model_type_from_layer_name, is_lk_pool_layer, lk_route_probe_enabled
+from sglang.srt.utils.common import is_lk_moe_feature_enabled, get_pool_log, get_pool_inflight, is_lk_prefill_debug, is_lk_moe_gpu_resident_layer, get_gpu_prefetch_window, get_gpu_prefill_min_tokens, get_pool_window, get_super_chunk_size, get_bool_env_var, get_int_env_var, is_lk_gpu_prefill_enabled, get_model_type_from_layer_name, is_lk_pool_layer, get_pool_slots, is_lk_pool_decode_enabled, lk_route_probe_enabled
 from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import CompressedTensorsFusedMoEMethod
 from sglang.srt.model_executor.runner import get_is_capture_mode
 if is_lk_moe_feature_enabled():
@@ -122,9 +120,7 @@ else:
 # Log the deferred-finalize config at most once per process (rank). Different MoE
 # layers can resolve to different quant methods, so print_info_once (keyed on the
 # full message) would otherwise fire once per distinct quant method.
-_deferred_finalize_info_logged = False
-
-LK_POOL_MAX_TOKENS = 2
+_deferred_finalize_info_logged = False# floor when max_running_requests unknown
 
 
 def _fuses_routed_scaling_factor_in_topk(quant_method) -> bool:
@@ -546,36 +542,36 @@ class FusedMoE(torch.nn.Module):
                 
         self.max_running_requests = server_args.max_running_requests
         self.speculative_num_draft_tokens = server_args.speculative_num_draft_tokens
-        self.max_num_batched_tokens = server_args.chunked_prefill_size
+
+        self.max_num_batched_tokens = max(server_args.chunked_prefill_size or 0,
+                                          get_super_chunk_size())
         self.speculative_dspark_block_size = server_args.speculative_dspark_block_size
         self.max_num_seqs = self._get_max_num_seqs() 
-        self.gpu_prefill_min_batch_size = min(get_gpu_prefill_min_batch_size(), self.max_num_batched_tokens)
+        self.gpu_prefill_min_tokens = get_gpu_prefill_min_tokens()
      
         
         self.gpu_prefetch_window = get_gpu_prefetch_window()
         self.lk_moe = None
         self.lk_moe_config = None 
-        self._pool_gpu = None
         self.model_type = get_model_type_from_layer_name(self.layer_name)
 
-        self.use_gpu_prefill = is_lk_moe_use_gpu_prefill()
 
-        self.is_gpu_resident_layer = is_lk_moe_gpu_resident_layer(
-            self.layer_id, 
-            self.model_type
-        )
-        self.is_gpu_prefill_layer = (
-            self.use_gpu_prefill and not self.is_gpu_resident_layer
-        )
-        self.is_cpu_layer = (
-            is_lk_moe_feature_enabled()
-            and not self.is_gpu_resident_layer
-            and not self.is_gpu_prefill_layer
-        )
-   
+        self.is_gpu_resident_layer = is_lk_moe_gpu_resident_layer(self.layer_id, self.model_type)
+        # Prefill membership is NOT role-gated: a draft instance runs the
+        # draft-extend pass at full prefill sizes, and the staging ring needs
+        # no pool content (its snapshot is an all-zero table -> everything
+        # stages). The DECODE half stays main-only via is_pool_layer.
+        self.is_gpu_prefill_layer = is_lk_gpu_prefill_enabled()
         
-      
-        self.max_num_group_batch_size = self.get_max_num_group_batch_size()
+
+        self.is_pool_layer = is_lk_pool_layer(self.layer_id, self.model_type)
+        self.route_probe = lk_route_probe_enabled()
+        self.pool_decode = is_lk_pool_decode_enabled() and self.is_pool_layer
+
+        self._triton_prefill = None
+        self._pool_layer_info = None
+   
+        self.cpu_prefill_group_max_len = self.get_cpu_prefill_group_max_len()
         model_arch = server_args._model_config.hf_config.architectures[0]
         self.check_nan_in_output = (model_arch in ["MiniMaxM2ForCausalLM", "Step3p5ForCausalLM", "KimiK25ForConditionalGeneration"])
         self.has_gate_proj  = not (model_arch == "NemotronHForCausalLM")
@@ -1734,13 +1730,13 @@ class FusedMoE(torch.nn.Module):
                 dispatch_output.topk_output.topk_ids,
             )
         # Prefill large input: GPU computation
-        elif self.should_use_gpu_prefill(dispatch_output.hidden_states):
+        elif self.should_prefill_gpu(dispatch_output.hidden_states):
             lk_result = self._gpu_prefill(
                 dispatch_output.hidden_states,
                 dispatch_output.topk_output.topk_weights,
                 dispatch_output.topk_output.topk_ids,
             )
-        # Prefill small input: CPU computation
+        # Prefill short input: plain CPU path (below the GPU prefill tier).
         else:
             lk_result = self._cpu_prefill(
                 dispatch_output.hidden_states,
@@ -1931,13 +1927,12 @@ class FusedMoE(torch.nn.Module):
                             param.materialize(stacked.shape, dtype=stacked.dtype)
                             param.data.copy_(stacked)
 
-    def get_max_num_group_batch_size(self) -> int:
+    def get_cpu_prefill_group_max_len(self) -> int:
+        # Buffer ceiling for the CPU prefill group path (feeds
+        # cfg.group_max_len): super-chunk sized, never GPU staging.
         max_num_batched_tokens = get_server_args().chunked_prefill_size
     
-        if is_lk_moe_use_gpu_prefill():
-            group_batch_size = min(max_num_batched_tokens, get_gpu_prefill_min_batch_size()) + 128
-        else:
-            group_batch_size = min(4096, max_num_batched_tokens) + 128
+        group_batch_size = min(4096, max(max_num_batched_tokens, get_super_chunk_size()))
             
         return group_batch_size
     
@@ -1953,12 +1948,16 @@ class FusedMoE(torch.nn.Module):
         
         return result
     
-    def should_use_gpu_prefill(self, hidden_states: torch.Tensor) -> bool:
+    def should_prefill_gpu(self, hidden_states: torch.Tensor) -> bool:
         if get_is_capture_mode():
             return False
         if torch.cuda.is_current_stream_capturing():
             return False
-        return self.is_gpu_prefill_layer and hidden_states.size(0) >= self.gpu_prefill_min_batch_size
+        # The driver (or its absence) was decided once at init by probe() --
+        # a draft whose format lacks staging GEMMs keeps the CPU baseline.
+        return (self.is_gpu_prefill_layer
+                and self._triton_prefill is not None
+                and hidden_states.size(0) >= self.gpu_prefill_min_tokens)
              
     def _zero_tensor(self, tensor: torch.Tensor):
         if tensor is not None:
@@ -2010,10 +2009,10 @@ class FusedMoE(torch.nn.Module):
                 self._initialize_cuda_graph_buffers()
                 logger.info(f"Initialized lk_moe with {self.moe_runner_config.num_local_experts} experts for layer {self.layer_id} [" + 
                 ("CPU" if not self.is_gpu_resident_layer else "GPU") + "]")
-        except Exception as e:
-            logger.error(f"Failed to initialize lk_moe: {e}") 
-            self.lk_moe = None
-            self.lk_moe_config = None 
+        except Exception:
+            logger.exception("lk_moe init failed for layer %s",
+                             self.layer_id)
+            raise
     def clean_weights_after_loading(self): 
         if self.is_gpu_resident_layer:
             return
@@ -2032,12 +2031,45 @@ class FusedMoE(torch.nn.Module):
             return self.moe_ep_size, self.moe_ep_rank, torch.cuda.current_device()
         return self.moe_tp_size, self.moe_tp_rank, torch.cuda.current_device()
 
-    def _set_pool_identity(self, cfg):
-        # Pool membership (draft role, GPU-resident, LK_POOL_LAYERS) collapses
-        # into one predicate here; the engine only ever sees cfg.gpu_pool.
+    def _fill_lk_cfg(self, cfg):
+        # Geometry + tuning surface, ONE definition shared by all five
+        # format builders; groupN/groupK (scale groups) are format facts
+        # and stay in the builders.
         cfg.layer_id = self.layer_id
-        cfg.route_probe = lk_route_probe_enabled()
-        cfg.gpu_pool = is_lk_pool_layer(self.layer_id, self.model_type)
+        cfg.route_probe = self.route_probe
+        # pool = infra MEMBERSHIP (cache OR prefill staging); pool_cache says
+        # whether this instance's slots are real (main) or a pure prefill
+        # shell with an all-zero snapshot (draft).
+        cfg.pool = self.is_pool_layer or self.is_gpu_prefill_layer
+        cfg.pool_cache = self.is_pool_layer
+        cfg.prefill_gpu = self.is_gpu_prefill_layer
+        cfg.role_draft = self.model_type != "main"
+        cfg.pool_decode = self.pool_decode
+        cfg.pool_slots = get_pool_slots()
+        num_processes, process_id, gpu_id = self._get_processes_info()
+        cfg.num_processes = num_processes
+        cfg.process_id = process_id
+        cfg.gpu_id = gpu_id
+        cfg.has_gate_proj = self.has_gate_proj
+        cfg.expert_num = self.moe_runner_config.num_local_experts
+        cfg.top_k = self.top_k
+        cfg.hidden_size = self.hidden_size
+        cfg.intermediate_size = self.intermediate_size_per_partition
+        cfg.max_batch_size = self.max_num_batched_tokens
+        cfg.max_num_seqs = self.max_num_seqs
+        cfg.stride = 32
+        cfg.group_min_len = 10
+        cfg.group_max_len = self.cpu_prefill_group_max_len
+        cfg.activation_type = self.activation_type
+        if self.swiglu_limit is not None:
+            cfg.swiglu_limit = self.swiglu_limit
+        cfg.prefill_min_tokens = self.gpu_prefill_min_tokens
+        cfg.prefill_window = self.gpu_prefetch_window
+        cfg.pool_window = get_pool_window()
+        cfg.pool_inflight = get_pool_inflight()
+        cfg.pool_log = get_pool_log()
+        cfg.prefill_dbg = is_lk_prefill_debug()
+        cfg.super_batch_size = get_super_chunk_size()
                 
     def _get_quant_params(self, w13_weight, w13_weight_scale, w2_weight, w2_weight_scale, pack_ratio):
         unpack_factor = 1 if pack_ratio == 1 else 2  # FP8=1, 4bit=2
@@ -2079,30 +2111,10 @@ class FusedMoE(torch.nn.Module):
         w13_weight_scale_ptr = w13_scale.data_ptr()
         w2_weight_scale_ptr = w2_scale.data_ptr()
         
-        num_processes, process_id, gpu_id = self._get_processes_info()
-        
-        # V2: MOEConfigV2 + MOE_WNA16
         self.lk_moe_config = lk_moe.MOEConfigV2()
-        self._set_pool_identity(self.lk_moe_config)
-        self.lk_moe_config.num_processes = num_processes
-        self.lk_moe_config.process_id = process_id
-        self.lk_moe_config.gpu_id = gpu_id
-        self.lk_moe_config.has_gate_proj = self.has_gate_proj
-        self.lk_moe_config.expert_num = self.moe_runner_config.num_local_experts
-        self.lk_moe_config.top_k = self.top_k
-        self.lk_moe_config.hidden_size = self.hidden_size
-        self.lk_moe_config.intermediate_size = self.intermediate_size_per_partition
-        self.lk_moe_config.max_batch_size = self.max_num_batched_tokens
-        self.lk_moe_config.max_num_seqs = self.max_num_seqs
-        self.lk_moe_config.stride = 32
-        self.lk_moe_config.group_min_len = 10
-        self.lk_moe_config.group_max_len = self.max_num_group_batch_size
+        self._fill_lk_cfg(self.lk_moe_config)
         self.lk_moe_config.groupN = groupN
         self.lk_moe_config.groupK = groupK
-        self.lk_moe_config.activation_type = self.activation_type
-        if self.swiglu_limit is not None:
-            self.lk_moe_config.swiglu_limit = self.swiglu_limit
-        self.lk_moe_config.use_gpu_prefill = self.use_gpu_prefill
 
         # no global scale
         if self.params_dtype == torch.bfloat16:
@@ -2160,30 +2172,10 @@ class FusedMoE(torch.nn.Module):
         w13_weight_scale_ptr = w13_weight_scale.contiguous().data_ptr()
         w2_weight_scale_ptr = w2_weight_scale.contiguous().data_ptr()
 
-        num_processes, process_id, gpu_id = self._get_processes_info()
-
-        # V2: MOEConfigV2 + MOE_FP8
         self.lk_moe_config = lk_moe.MOEConfigV2()
-        self._set_pool_identity(self.lk_moe_config)
-        self.lk_moe_config.num_processes = num_processes
-        self.lk_moe_config.process_id = process_id
-        self.lk_moe_config.gpu_id = gpu_id
-        self.lk_moe_config.has_gate_proj = self.has_gate_proj
-        self.lk_moe_config.expert_num = self.moe_runner_config.num_local_experts
-        self.lk_moe_config.top_k = self.top_k
-        self.lk_moe_config.hidden_size = self.hidden_size
-        self.lk_moe_config.intermediate_size = self.intermediate_size_per_partition
-        self.lk_moe_config.max_batch_size = self.max_num_batched_tokens
-        self.lk_moe_config.max_num_seqs = self.max_num_seqs
-        self.lk_moe_config.stride = 32
-        self.lk_moe_config.group_min_len = 10
-        self.lk_moe_config.group_max_len = self.max_num_group_batch_size
+        self._fill_lk_cfg(self.lk_moe_config)
         self.lk_moe_config.groupN = groupN
         self.lk_moe_config.groupK = groupK
-        self.lk_moe_config.activation_type = self.activation_type
-        if self.swiglu_limit is not None:
-            self.lk_moe_config.swiglu_limit = self.swiglu_limit
-        self.lk_moe_config.use_gpu_prefill = self.use_gpu_prefill
 
         # no global scale
         if self.params_dtype == torch.bfloat16:
@@ -2211,31 +2203,12 @@ class FusedMoE(torch.nn.Module):
     def _process_bf6_fp16(self):
         w13_weight = self.w13_weight
         w2_weight = self.w2_weight
-         
+
         w13_ptr = w13_weight.contiguous().data_ptr()
         w2_ptr = w2_weight.contiguous().data_ptr()
         
-        num_processes, process_id, gpu_id = self._get_processes_info()
-        
         self.lk_moe_config = lk_moe.MOEConfigV2()
-        self._set_pool_identity(self.lk_moe_config)
-        self.lk_moe_config.num_processes = num_processes
-        self.lk_moe_config.process_id = process_id
-        self.lk_moe_config.gpu_id = gpu_id
-        self.lk_moe_config.has_gate_proj = self.has_gate_proj
-        self.lk_moe_config.expert_num = self.moe_runner_config.num_local_experts
-        self.lk_moe_config.top_k = self.top_k
-        self.lk_moe_config.hidden_size = self.hidden_size
-        self.lk_moe_config.intermediate_size = self.intermediate_size_per_partition
-        self.lk_moe_config.max_batch_size = self.max_num_batched_tokens
-        self.lk_moe_config.max_num_seqs = self.max_num_seqs
-        self.lk_moe_config.stride = 32
-        self.lk_moe_config.group_min_len = 10
-        self.lk_moe_config.group_max_len = self.max_num_group_batch_size
-        self.lk_moe_config.activation_type = self.activation_type
-        if self.swiglu_limit is not None:
-            self.lk_moe_config.swiglu_limit = self.swiglu_limit
-        self.lk_moe_config.use_gpu_prefill = self.use_gpu_prefill
+        self._fill_lk_cfg(self.lk_moe_config)
         
         # no scale
         if self.params_dtype == torch.bfloat16:
@@ -2286,29 +2259,10 @@ class FusedMoE(torch.nn.Module):
         w13_weight_global_scale_ptr = w13_weight_global_scale.contiguous().data_ptr()
         w2_weight_global_scale_ptr = w2_weight_global_scale.contiguous().data_ptr()
         
-        num_processes, process_id, gpu_id = self._get_processes_info()
-         
         self.lk_moe_config = lk_moe.MOEConfigV2()
-        self._set_pool_identity(self.lk_moe_config)
-        self.lk_moe_config.num_processes = num_processes
-        self.lk_moe_config.process_id = process_id
-        self.lk_moe_config.gpu_id = gpu_id
-        self.lk_moe_config.has_gate_proj = self.has_gate_proj
-        self.lk_moe_config.expert_num = self.moe_runner_config.num_local_experts
-        self.lk_moe_config.top_k = self.top_k
-        self.lk_moe_config.hidden_size = self.hidden_size
-        self.lk_moe_config.intermediate_size = self.intermediate_size_per_partition
-        self.lk_moe_config.max_batch_size = self.max_num_batched_tokens
-        self.lk_moe_config.max_num_seqs = self.max_num_seqs
-        self.lk_moe_config.stride = 32
-        self.lk_moe_config.group_min_len = 10
-        self.lk_moe_config.group_max_len = self.max_num_group_batch_size
+        self._fill_lk_cfg(self.lk_moe_config)
         self.lk_moe_config.groupN = groupN
         self.lk_moe_config.groupK = groupK
-        self.lk_moe_config.activation_type = self.activation_type
-        if self.swiglu_limit is not None:
-            self.lk_moe_config.swiglu_limit = self.swiglu_limit
-        self.lk_moe_config.use_gpu_prefill = self.use_gpu_prefill
          
         if self.params_dtype == torch.bfloat16:
             self.lk_moe = lk_moe.MOE_NVFP4(
@@ -2346,30 +2300,10 @@ class FusedMoE(torch.nn.Module):
         w13_weight_scale_ptr = w13_weight_scale.contiguous().data_ptr()
         w2_weight_scale_ptr = w2_weight_scale.contiguous().data_ptr()
 
-        num_processes, process_id, gpu_id = self._get_processes_info()
-
-        # V2: MOEConfigV2 + MOE_MXFP4
         self.lk_moe_config = lk_moe.MOEConfigV2()
-        self._set_pool_identity(self.lk_moe_config)
-        self.lk_moe_config.num_processes = num_processes
-        self.lk_moe_config.process_id = process_id
-        self.lk_moe_config.gpu_id = gpu_id
-        self.lk_moe_config.has_gate_proj = self.has_gate_proj
-        self.lk_moe_config.expert_num = self.moe_runner_config.num_local_experts
-        self.lk_moe_config.top_k = self.top_k
-        self.lk_moe_config.hidden_size = self.hidden_size
-        self.lk_moe_config.intermediate_size = self.intermediate_size_per_partition
-        self.lk_moe_config.max_batch_size = self.max_num_batched_tokens
-        self.lk_moe_config.max_num_seqs = self.max_num_seqs
-        self.lk_moe_config.stride = 32
-        self.lk_moe_config.group_min_len = 10
-        self.lk_moe_config.group_max_len = self.max_num_group_batch_size
+        self._fill_lk_cfg(self.lk_moe_config)
         self.lk_moe_config.groupN = groupN
         self.lk_moe_config.groupK = groupK
-        self.lk_moe_config.activation_type = self.activation_type
-        if self.swiglu_limit is not None:
-            self.lk_moe_config.swiglu_limit = self.swiglu_limit
-        self.lk_moe_config.use_gpu_prefill = self.use_gpu_prefill
 
         # no global scale
         if self.params_dtype == torch.bfloat16:
@@ -2421,17 +2355,35 @@ class FusedMoE(torch.nn.Module):
                 requires_grad=False
             ).contiguous()
 
-        self._init_pool_gpu_half()
+        self._init_pool()
 
-    def _init_pool_gpu_half(self):
-        self._pool_gpu = None
-        self.lk_moe.pool_gpu_report(False)
-        info = self.lk_moe.pool_layer_info()
-        caps = info.get("kernel_caps") if info else None
-        if not caps or info.get("gpu_view_ok", 0) != 1:
+    def _init_pool(self):
+        if not (self.is_pool_layer or self.is_gpu_prefill_layer):
             return
+        self._triton_prefill = None
+        if self.is_gpu_prefill_layer:
+            from lk_moe.prefill_staging import StagingPrefill
+            # A GPU-prefill layer that cannot go GPU is a broken boot,
+            # not a CPU layer: probe raises and the boot dies with it.
+            self._triton_prefill = StagingPrefill.probe(self.lk_moe)
+        self._pool_layer_info = None
+        self.lk_moe.pool_gpu_report(False)
+        if self.pool_decode:
+            self._init_pool_decode()
+
+    def _init_pool_decode(self):
+        info = self.lk_moe.pool_layer_info()
         gds = self.lk_moe.pool_gds()
-        if not gds.get("gpu_half_on", 0):
+        if not gds.get("pool_decode_on", 0):
+            logger.warning(
+                "pool_decode on but lk_moe declined for layer %s "
+                "(master/membership/format/view)", self.layer_id)
+            return
+        caps = (info or {}).get("kernel_caps")
+        if not caps:
+            logger.warning(
+                "pool_decode on but no kernel_caps for layer %s format",
+                self.layer_id)
             return
         cfg = self.lk_moe.cfg
         H, I, k = cfg.hidden_size, cfg.intermediate_size, cfg.top_k
@@ -2444,20 +2396,28 @@ class FusedMoE(torch.nn.Module):
                    if total_iters % cand == 0
                    and k * NB_GATEUP * cand <= 2048)
         KS = total_iters // NGK
-        rows = LK_POOL_MAX_TOKENS * k
+        # Sized ONCE from the concurrency limit: every decode batch is
+        # covered by construction, no runtime growth path.
+        cap = max(1, self.max_running_requests)
+        rows = cap * k
         dev = torch.cuda.current_device()
         if not hasattr(FusedMoE, "pool_hbuf"):
+            FusedMoE._pool_k = k
+            FusedMoE._pool_decode_cap = cap
             FusedMoE.pool_hbuf = torch.zeros((rows, 2 * I), dtype=torch.float32, device=dev)
-            FusedMoE.pool_gout = torch.zeros((LK_POOL_MAX_TOKENS, H), dtype=torch.float32, device=dev)
+            FusedMoE.pool_gout = torch.zeros((cap, H), dtype=torch.float32, device=dev)
             FusedMoE.pool_slot_tab = torch.full((rows,), -1, dtype=torch.int32, device=dev)
             FusedMoE.pool_gathered_ids = torch.zeros((rows,), dtype=torch.int32, device=dev)
             FusedMoE.pool_gathered_weights = torch.zeros((rows,), dtype=torch.float32, device=dev)
             FusedMoE.pool_stream = torch.cuda.Stream()
+            from lk_moe.prefill_staging import StagingPrefill
+            if StagingPrefill._pool_stream is None:
+                StagingPrefill._pool_stream = FusedMoE.pool_stream
         if (not hasattr(FusedMoE, "pool_hpart")
                 or FusedMoE.pool_hpart.shape != (NGK, rows, 2 * I)):
             FusedMoE.pool_hpart = torch.zeros((NGK, rows, 2 * I), dtype=torch.float32, device=dev)
             FusedMoE.pool_gout_part = torch.zeros((rows, H), dtype=torch.float32, device=dev)
-        self._pool_gpu = dict(
+        self._pool_layer_info = dict(
             snapshot_addr=info["snapshot_addr"],
             weight_addr=info["weight_addr"], scale_addr=info["scale_addr"],
             slot_bytes=info["slot_weight_bytes"],
@@ -2469,9 +2429,9 @@ class FusedMoE(torch.nn.Module):
         )
         self.lk_moe.pool_gpu_report(True)
 
-    def _pool_gpu_launch(self, hidden_states, topk_ids, topk_weights,
+    def _pool_decode_launch(self, hidden_states, topk_ids, topk_weights,
                          real_tokens=None, rows_per_token=1):
-        geo = self._pool_gpu
+        geo = self._pool_layer_info
         H, I, k = geo["H"], geo["I"], geo["k"]
         SG, SGB, PK = geo["scale_group"], geo["scale_groups_blk"], geo["packed_k_per_iter"]
         real_tokens = hidden_states.size(0) if real_tokens is None else real_tokens
@@ -2531,21 +2491,24 @@ class FusedMoE(torch.nn.Module):
                 gout_part, gout[:real_tokens], slot_tab, HIDDEN=H,
                 SLOTS_PER_TOKEN=k, BATCH=real_tokens, BLOCK=1024,
                 RESIDENT_ONLY=1)
+        # fence for worker copies: record the pool stream's progress so no
+        # inbound H2D lands before these gemvs finish reading their slots.
+        self.lk_moe.pool_record_aux(FusedMoE.pool_stream.cuda_stream)
 
-    
     def _cpu_decode(self, hidden_states, topk_weights, topk_ids):
         bs = hidden_states.size(0)
 
-        draft_tokens = getattr(self, "speculative_num_draft_tokens", 1) or 1
-        rows_per_token = draft_tokens if (
-            draft_tokens > 1 and bs > LK_POOL_MAX_TOKENS and bs % draft_tokens == 0
-            and bs // draft_tokens <= LK_POOL_MAX_TOKENS) else 1
+        draft_tokens = self.speculative_num_draft_tokens or 1
+        mult = draft_tokens if draft_tokens > 1 else 1
+        rows_per_token = mult if (mult > 1 and bs % mult == 0) else 1
         real_tokens = bs // rows_per_token
 
-        covered = self._pool_gpu is not None and real_tokens <= LK_POOL_MAX_TOKENS
- 
+        covered = (self._pool_layer_info is not None
+                 and real_tokens <= FusedMoE._pool_decode_cap)
+
         if covered:
-            self._pool_gpu_launch(hidden_states, topk_ids, topk_weights,
+            self.lk_moe.pool_gpu_report(True)
+            self._pool_decode_launch(hidden_states, topk_ids, topk_weights,
                                   real_tokens=real_tokens,
                                   rows_per_token=rows_per_token)
         stream_ptr = torch.cuda.current_stream().cuda_stream
@@ -2579,22 +2542,7 @@ class FusedMoE(torch.nn.Module):
  
 
     def _cpu_prefill(self, hidden_states, topk_weights, topk_ids): 
-        # Split prefill: GPU group-GEMM half covers the pool-resident slots on
-        # a side stream while the CPU half skips exactly those (same frozen
-        # snapshot on both sides; no arming of the decode half). See
-        # lk_moe/pool_prefill_half.py.
-        half = self._pool_prefill_half()
-        gpu_part = None
-        gpu_ev = None
-        if half is not None:
-            try:
-                r = half.launch(hidden_states, topk_ids, topk_weights)
-                if r is not None:
-                    gpu_ev, gpu_part = r
-            except Exception:
-                gpu_part = None
-        pool_skip = gpu_part is not None
-         
+        
         expert_ids_cpu = topk_ids.to(dtype=torch.int32, device='cpu', non_blocking=True)
         weights_cpu = topk_weights.to(dtype=torch.float32, device='cpu', non_blocking=True)
         hidden_states_cpu = hidden_states.to(device='cpu', non_blocking=True)
@@ -2602,7 +2550,7 @@ class FusedMoE(torch.nn.Module):
         
         current_stream = torch.cuda.current_stream()
         current_stream.synchronize()
-        
+         
         self.lk_moe.cpu_prefill(
             hidden_states.size(0),
             expert_ids_cpu.size(1),
@@ -2610,54 +2558,24 @@ class FusedMoE(torch.nn.Module):
             weights_cpu.data_ptr(),
             hidden_states_cpu.data_ptr(),
             output_cpu.data_ptr(),
-            pool_skip,
+            False,
         )
-             
-        if pool_skip:
-            current_stream.wait_event(gpu_ev)
-            output_gpu = output_cpu.to(torch.cuda.current_device(), dtype=torch.float32, non_blocking=True)
-            output_gpu += gpu_part
-            output_gpu = output_gpu.to(hidden_states.dtype)
-        else:
-            output_gpu = output_cpu.to(torch.cuda.current_device(), dtype=hidden_states.dtype, non_blocking=True) 
+
+        output_gpu = output_cpu.to(torch.cuda.current_device(), dtype=hidden_states.dtype, non_blocking=True) 
         
         if self.check_nan_in_output:
             torch.nan_to_num(output_gpu, nan=0.0, out=output_gpu)
         
         return output_gpu
-
-    def _pool_prefill_half(self):
-        cached = getattr(self, "_pool_half", False)
-        if cached is not False:
-            return cached
-        if self.lk_moe is None:
-            return None
-        try:
-            from lk_moe.pool_prefill_half import PoolPrefillHalf
-            self._pool_half = PoolPrefillHalf.probe(self.lk_moe)
-        except Exception:
-            self._pool_half = None
-        return self._pool_half
-
+ 
     def _gpu_prefill(self, hidden_states, topk_weights, topk_ids):
-        output = torch.empty_like(hidden_states)
-        
-        self.lk_moe.gpu_prefill(
-            hidden_states.data_ptr(),
-            output.data_ptr(),
-            topk_ids.data_ptr(),
-            topk_weights.data_ptr(),
-            hidden_states.size(0),
-            topk_ids.size(1),
-            torch.cuda.current_stream().cuda_stream,
-        )
-        
+        ev, gout = self._triton_prefill.prefill_gpu(
+            hidden_states, topk_ids, topk_weights)
+        torch.cuda.current_stream().wait_event(ev)
+        out = gout.to(hidden_states.dtype)
         if self.check_nan_in_output:
-            bad_mask = torch.isnan(output) | torch.isinf(output)
-            if bad_mask.any():
-                output.masked_fill_(bad_mask, 0.0)
-        
-        return output
+            torch.nan_to_num(out, nan=0.0, out=out)
+        return out
             
     
     

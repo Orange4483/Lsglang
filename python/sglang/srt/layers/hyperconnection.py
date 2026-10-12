@@ -8,6 +8,9 @@ import torch.nn.functional as F
 from sglang.kernels.ops.gemm.hc_mix import fused_hc_mix, fused_hc_mix_supported
 
 
+_DBG_SEEN = set()
+
+
 def _hc_block_rows() -> int:
     """Token budget for one row-parallel hyper-connection pass. Matches the
     super-chunk inner-loop knob (attention wrapper / PLE blocked conv): a
@@ -252,6 +255,20 @@ class GatedResidual(HyperConnectionBase):
         # row counts, so the full-tensor dispatch would also have landed on
         # the compiled _mix_compute, whose [rows, hc*hs] gate temporary is
         # CAP-sized.
+        from sglang.srt.environ import envs as _e
+        if _e.SGLANG_RS_DEBUG.get():
+            import torch as _t
+            global _DBG_SEEN
+            _seen = _DBG_SEEN
+            _key = (hyper_input.shape[0] > 8, int(_t.cuda.is_current_stream_capturing())
+                    if hyper_input.is_cuda else -1)
+            if _key not in _seen:
+                _seen.add(_key)
+                import logging as _lg; _lg.getLogger(__name__).warning("[hc-dbg] first-call rows=%d capturing=%s block=%d fused_ok=%s",
+                               hyper_input.shape[0], bool(_key[1]) if _key[1] >= 0 else False,
+                               _hc_block_rows(),
+                               fused_hc_mix_supported(hyper_input, self.input_mix_weight_down.weight,
+                                                     self.input_mix_weight_up.weight))
         block = _hc_block_rows()
         if (
             hyper_input.is_cuda

@@ -9,6 +9,7 @@ import triton
 import triton.language as tl
 
 from sglang.srt.layers import deep_gemm_wrapper
+from sglang.kernels.ops.quantization.fp8_kernel import fp8_dot_supported
 from sglang.srt.runtime_context import get_platform
 from sglang.srt.utils import (
     get_device_core_count,
@@ -823,8 +824,17 @@ def w8a8_block_fp8_matmul_triton(
     )
     if hopper_tuned:
         kernel = _w8a8_block_fp8_matmul_hopper
-    elif _is_gfx1250:
-        config = {**config, "num_stages": 1}
+    elif _is_gfx1250 or not fp8_dot_supported():
+        # No fp8 tl.dot on this arch (gfx1250, or CUDA before Ada): upcast the
+        # fp8 tiles to bf16 in-register. That kernel also needs num_stages=1.
+        # With per-row weight scales (block_size[0] == 1) the default config
+        # would ask for BLOCK_SIZE_N == 1, which tl.dot cannot express, so
+        # clamp it to the dot minimum; the scales stay indexed per column.
+        config = {
+            **config,
+            "num_stages": 1,
+            "BLOCK_SIZE_N": max(config["BLOCK_SIZE_N"], 16),
+        }
         kernel = _w8a8_block_fp8_matmul_gfx1250
     else:
         kernel = select_w8a8_block_fp8_matmul_kernel(M, N, config)

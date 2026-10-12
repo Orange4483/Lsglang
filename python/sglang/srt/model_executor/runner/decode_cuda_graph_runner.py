@@ -159,6 +159,7 @@ def build_replay_fb_view(
     seq_len_fill_value: int,
     capture_forward_mode: ForwardMode,
     is_encoder_decoder: bool,
+    c128_width: Optional[int] = None,
 ) -> SimpleNamespace:
     """Construct a ForwardBatch-like view for backend replay-side init.
 

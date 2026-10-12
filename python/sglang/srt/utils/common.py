@@ -259,6 +259,10 @@ def device_context(device: torch.device):
         else:
             raise ValueError(f"Unknown device module: {device}")
 
+@lru_cache(maxsize=16)
+def _cuda_device_capability_major(device_id: int) -> int:
+    return torch.cuda.get_device_capability(device_id)[0]
+
 
 def _check_cuda_device_version(
     device_capability_majors: List[int], cuda_version: Tuple[int, int]
@@ -266,59 +270,79 @@ def _check_cuda_device_version(
     if not is_cuda():
         return False
     # get_device_sm() answers from NVML while torch.cuda is uninitialized, so
-    # the platform probes evaluated at import time do not create a CUDA context.
+    # the platform probes evaluated at import time do not create a CUDA
+    # context; once initialized, ask this rank's device directly.
+    if torch.cuda.is_initialized():
+        major = _cuda_device_capability_major(torch.cuda.current_device())
+    else:
+        major = get_device_sm() // 10
     return (
-        get_device_sm() // 10 in device_capability_majors
+        major in device_capability_majors
         and tuple(map(int, torch.version.cuda.split(".")[:2])) >= cuda_version
     )
 
 
-is_ampere_with_cuda_12_3 = lru_cache(maxsize=1)(
-    partial(
-        _check_cuda_device_version, device_capability_majors=[8], cuda_version=(12, 3)
-    )
-)
-is_hopper_with_cuda_12_3 = lru_cache(maxsize=1)(
-    partial(
-        _check_cuda_device_version, device_capability_majors=[9], cuda_version=(12, 3)
-    )
-)
-is_blackwell_supported = is_blackwell = lru_cache(maxsize=1)(
-    partial(
-        _check_cuda_device_version,
-        device_capability_majors=[10, 11, 12],
-        cuda_version=(12, 8),
-    )
-)
-is_sm120_supported = lru_cache(maxsize=1)(
-    partial(
-        _check_cuda_device_version, device_capability_majors=[12], cuda_version=(12, 8)
-    )
-)
-is_sm100_supported = lru_cache(maxsize=1)(
-    partial(
-        _check_cuda_device_version, device_capability_majors=[10], cuda_version=(12, 8)
-    )
-)
+def is_ampere_with_cuda_12_3():
+    return _check_cuda_device_version([8], (12, 3))
+
+
+def is_hopper_with_cuda_12_3():
+    return _check_cuda_device_version([9], (12, 3))
+
+
+def is_blackwell_supported():
+    return _check_cuda_device_version([10, 11, 12], (12, 8))
+
+
+is_blackwell = is_blackwell_supported
+
+
+def is_sm120_supported():
+    return _check_cuda_device_version([12], (12, 8))
+
+
+def is_sm100_supported():
+    return _check_cuda_device_version([10], (12, 8))
+
+
 # Datacenter Blackwell (SM100) plus SM110; excludes consumer Blackwell (SM120).
 # This is the arch set flash_attn.cute accepts for the absorbed-MLA qv argument.
-is_sm100_or_sm110_supported = lru_cache(maxsize=1)(
-    partial(
-        _check_cuda_device_version,
-        device_capability_majors=[10, 11],
-        cuda_version=(12, 8),
-    )
-)
-is_sm80_supported = lru_cache(maxsize=1)(
-    partial(
-        _check_cuda_device_version, device_capability_majors=[8], cuda_version=(11, 0)
-    )
-)
-is_sm90_supported = lru_cache(maxsize=1)(
-    partial(
-        _check_cuda_device_version, device_capability_majors=[9], cuda_version=(12, 3)
-    )
-)
+def is_sm100_or_sm110_supported():
+    return _check_cuda_device_version([10, 11], (12, 8))
+
+
+def is_sm80_supported():
+    return _check_cuda_device_version([8], (11, 0))
+
+
+def is_sm90_supported():
+    return _check_cuda_device_version([9], (12, 3))
+
+
+def align_cute_dsl_arch_to_current_device() -> None:
+    """Make the CuTe DSL compile for *this* rank's GPU.
+
+    The DSL resolves its target arch through ``detect_gpu_arch()`` ->
+    ``get_compute_capability_major_minor(device_id=0)``, i.e. it always asks
+    CUDA device 0.  On a mixed-arch host (SM86 + SM120 in one TP group) every
+    rank except the one holding device 0 then compiles for the wrong chip and
+    libNVVM dies on a perfectly valid kernel.  Re-resolving from the current
+    device gives the same string the auto-detection would produce on a
+    homogeneous host, so nothing changes there.
+    """
+    if not is_cuda():
+        return
+    try:
+        from cutlass.base_dsl import env_manager as _em
+    except ImportError:
+        return
+    try:
+        major, minor = torch.cuda.get_device_capability()
+    except Exception:
+        return
+    # Same spelling the DSL's own detection uses (arch-specific suffix >= SM90).
+    arch = f"sm_{major}{minor}{'a' if major >= 9 else ''}"
+    _em.detect_gpu_arch = lambda _prefix, _arch=arch: _arch
 
 
 # RTX Blackwell. Unlike is_sm120_supported(), this excludes SM121/GB10.
@@ -1119,12 +1143,15 @@ def get_compiler_backend(mode=None) -> str:
 
 
 def set_cuda_arch():
+    # An explicit FLASHINFER_CUDA_ARCH_LIST (e.g. a pinned multi-arch list on
+    # mixed-GPU hosts) wins: overwriting it with the local single-GPU probe is
+    # what made JIT flags drift and rebuild every session.
+    if os.environ.get("FLASHINFER_CUDA_ARCH_LIST"):
+        return
     if is_flashinfer_available():
         capability = torch.cuda.get_device_capability()
         arch = f"{capability[0]}.{capability[1]}"
-        os.environ["FLASHINFER_CUDA_ARCH_LIST"] = (
-            f"{arch}{'a' if capability[0] >= 9 else ''}"
-        )
+        os.environ["FLASHINFER_CUDA_ARCH_LIST"] = arch
 
 
 @lru_cache(maxsize=1)
@@ -1362,7 +1389,7 @@ _LK_ENV_RENAMES = {
     "LVLLM_MOE_NUMA_ENABLED": "LK_MOE_HYBRID_ENABLED",
     "LVLLM_ENABLE_NUMA_INTERLEAVE": "LK_NUMA_INTERLEAVE",
     "LVLLM_EMBEDDING_NUMA_ENABLED": "LK_EMBEDDING_NUMA",
-    "LVLLM_GPU_PREFILL_MIN_BATCH_SIZE": "LK_GPU_PREFILL_MIN_BATCH_SIZE",
+    "LVLLM_GPU_PREFILL_MIN_BATCH_SIZE": "LK_GPU_PREFILL_MIN_TOKENS",
     "LVLLM_GPU_PREFETCH_WINDOW": "LK_GPU_PREFETCH_WINDOW",
     "LVLLM_GPU_RESIDENT_MOE_LAYERS": "LK_GPU_RESIDENT_MOE_LAYERS",
     "LVLLM_GPU_RESIDENT_MOE_LAYERS_SPEC": "LK_GPU_RESIDENT_MOE_LAYERS_SPEC",
@@ -5020,45 +5047,45 @@ def is_lk_moe_feature_enabled() -> bool:
 
 def is_numa_interleave_enabled() -> bool:
     return get_bool_env_var("LK_NUMA_INTERLEAVE")
- 
-# Whether to keep the (very large) n-gram embedding table resident on CPU /
-# NUMA host memory and gather it via lk_moe, instead of VRAM. Defaults to the
-# original GPU-resident behavior.
+
 def is_lk_embedding_cpu_enabled() -> bool:
     return get_bool_env_var("LK_EMBEDDING_NUMA")
 
-def is_lk_moe_use_gpu_prefill() -> bool:
-    return get_int_env_var("LK_GPU_PREFILL_MIN_BATCH_SIZE") > 0
+def get_gpu_prefill_min_tokens() -> int:
+    # Sole GPU-prefill gate: >0 enables the tier, 0 = pure CPU prefill.
+    # Forwarded to lk_moe via cfg; lk_moe itself never reads the env.
+    return get_int_env_var("LK_GPU_PREFILL_MIN_TOKENS", 256)
+
+def get_pool_window() -> int:
+    # Tuned default (hit ~81%). The ONLY pool switch is LK_POOL_SLOTS: any
+    # illegal value (incl. <=0) clamps to the minimum 8, never disables --
+    # a perf knob must not secretly flip the membership switch.
+    return max(8, get_int_env_var("LK_POOL_WINDOW", 32))
+
+def is_lk_gpu_prefill_enabled() -> bool:
+    return is_lk_moe_feature_enabled() and get_gpu_prefill_min_tokens() > 0
 
 def get_super_chunk_size() -> int:
-    if not is_lk_moe_use_gpu_prefill():
+    if not is_lk_gpu_prefill_enabled():
         return 0
     return get_int_env_var("LK_GPU_PREFILL_SUB_M")
 
-def disable_lk_moe_gpu_prefill() -> int:
-    origin_value = get_int_env_var("LK_GPU_PREFILL_MIN_BATCH_SIZE")
-    set_int_env_var("LK_GPU_PREFILL_MIN_BATCH_SIZE", 0)
-    return origin_value
+def get_pool_inflight() -> int:
+    # In-flight DMA jobs / event-ring depth of the decode pump; the
+    # backpressure cap is 8x this -- 12 false-positives at small batch.
+    return get_int_env_var("LK_POOL_INFLIGHT", 16)
 
-def enable_lk_moe_gpu_prefill(value: int) -> int:
-    set_int_env_var("LK_GPU_PREFILL_MIN_BATCH_SIZE", value)
-    return value
+def get_pool_log() -> int:
+    # dstep interval of the C++ [pool] stats line (0 = silent).
+    return get_int_env_var("LK_POOL_LOG")
 
-_is_in_profile_run = True
-
-def is_in_profile_run(): 
-    return _is_in_profile_run
-
-def set_profile_run(status: bool): 
-    global _is_in_profile_run
-    _is_in_profile_run = status
-
-def get_gpu_prefill_min_batch_size() -> int:
-    return get_int_env_var("LK_GPU_PREFILL_MIN_BATCH_SIZE")
-
+def is_lk_prefill_debug() -> bool:
+    # Extra tracing inside the prefill staging tier.
+    return get_bool_env_var("LK_PP_DEBUG")
 
 def get_gpu_prefetch_window() -> int:
-    return get_int_env_var("LK_GPU_PREFETCH_WINDOW", 1)
+    # 2 = ping-pong rings (copy overlaps gemm); 1 serializes the two halves.
+    return get_int_env_var("LK_GPU_PREFETCH_WINDOW", 2)
 
 
 def get_model_type_from_layer_name(layer_name: str) -> str:
@@ -5146,16 +5173,28 @@ def get_lk_pool_layer_set() -> Optional[set]:
                 continue
     return pool_layers
 
+
+def get_pool_slots() -> int:
+    return get_int_env_var("LK_POOL_SLOTS", 0)
+
+def is_lk_pool_enabled() -> bool:
+    return is_lk_moe_feature_enabled() and get_pool_slots() > 0
+
 def is_lk_pool_layer(layer_id: str, model_type: str = "main") -> bool:
     if model_type != "main":
         return False
     if is_lk_moe_gpu_resident_layer(layer_id, model_type):
         return False
-    pool_layers = get_lk_pool_layer_set()
-    return pool_layers is None or layer_id in pool_layers
+    return is_lk_pool_enabled()
 
 def lk_route_probe_enabled() -> bool:
-    return os.environ.get("LK_ROUTE_PROBE") is not None
+    return is_lk_pool_enabled() and get_bool_env_var("LK_ROUTE_PROBE")
+
+def is_lk_pool_decode_enabled() -> bool:
+    if not is_lk_moe_feature_enabled():
+        return False
+    return get_bool_env_var("LK_POOL_DECODE",
+                            "true" if is_lk_pool_enabled() else "false")
 
 def enabled_layerwise_load() -> bool:
     return get_bool_env_var("LK_MOE_LAYERWISE_LOAD")

@@ -589,14 +589,72 @@ class _HostTable:
             # Every rank holds the fd before rank 0 continues; the /proc path only
             # resolves while rank 0 keeps its descriptor.
             group.barrier()
-        err = torch.cuda.cudart().cudaHostRegister(self.bytes.data_ptr(), nbytes, 0)
+        # cudaHostRegister pins whatever pages exist right now, and GUP-pinned
+        # base pages can never be folded again by khugepaged or MADV_COLLAPSE.
+        # Defer registration to finish_load, once the pages are in their final
+        # shape (see _register).
+        self.registered = False
+
+    def _register(self) -> None:
+        """cudaHostRegister once, after the pages are in their final shape."""
+        if self.registered:
+            return
+        if not envs.SGLANG_DSV41_ENGRAM_HOST_TABLE_PIN.get():
+            # Unpinned host tables are UVA-readable but pay a page lookup per
+            # row; skip the multi-minute GUP pin at startup with
+            # SGLANG_DSV41_ENGRAM_HOST_TABLE_PIN=0.
+            return
+        err = torch.cuda.cudart().cudaHostRegister(
+            self.bytes.data_ptr(), self.nbytes, 0
+        )
         if int(err) != 0:
-            raise RuntimeError(f"cudaHostRegister({nbytes} bytes) failed: {err}")
+            raise RuntimeError(f"cudaHostRegister({self.nbytes} bytes) failed: {err}")
+        self.registered = True
+
+    @staticmethod
+    def _memfd(name: str) -> int:
+        create = getattr(os, "memfd_create", None)
+        if create is not None:
+            return create(name, 0)
+        # This python build lacks os.memfd_create (glibc/py-build dependent,
+        # seen on py3.12 conda hosts): use an anonymous /dev/shm file
+        # (unlinked at once), equivalent for sharing EXCEPT capacity-wise —
+        # /dev/shm is a sized tmpfs (64 MiB under default Docker) while memfd
+        # pages ignore that quota. Probe before handing the fd out; exceeding
+        # the tmpfs quota later would fault SIGBUS with no Python path.
+        path = os.path.join("/dev/shm", f"{name}.{os.getpid()}")
+        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+        return fd
 
     def _open_shared_fd(self, nbytes: int, name: str) -> int:
         owner = None
         if self.group.rank_in_group == 0:
-            fd = os.memfd_create(name, 0)
+            fd = self._memfd(name)
+            if getattr(os, "memfd_create", None) is None:
+                # Some builds lack fstatfs entirely; fstatvfs (POSIX, fd)
+                # then statvfs (path, adds a benign TOCTOU) cover it.
+                if hasattr(os, "fstatfs"):
+                    fst = os.fstatfs(fd)
+                    free = fst.f_bavail * fst.f_frsize
+                elif hasattr(os, "fstatvfs"):
+                    fst = os.fstatvfs(fd)
+                    free = fst.f_bavail * fst.f_frsize
+                else:
+                    fst = os.statvfs("/dev/shm")
+                    free = fst.f_bavail * fst.f_frsize
+                if free < nbytes:
+                    os.close(fd)
+                    raise RuntimeError(
+                        f"engram host table ({nbytes / 2**30:.1f} GiB) needs that much "
+                        f"room in /dev/shm (only {free / 2**30:.1f} GiB free): this "
+                        "python build falls back to an anonymous /dev/shm file "
+                        "instead of memfd. Raise --shm-size / mount size=, or run "
+                        "on a python built with memfd_create support."
+                    )
             os.ftruncate(fd, nbytes)
             owner = (os.getpid(), fd)
         pid, owner_fd = self.group.broadcast_object(owner, src=0)
@@ -634,10 +692,15 @@ class _HostTable:
 
     def finish_load(self, label: str):
         if not self.dirty:
+            self._register()
             return
         self.dirty = False
         if self.layout == "shared":
             self.group.barrier()
+            # DRAM-tight hosts: shard reads fill the page cache to the brink;
+            # free it before expert/staging allocations pile on (same remedy
+            # the per_rank path already applies).
+            _drop_page_cache_once("after faulting the shared table")
         mapped_kb, huge_kb = _huge_pages_backing(self.bytes.data_ptr())
         if self.layout == "per_rank" and huge_kb < mapped_kb * 0.98:
             # The loader's own reads refilled the page cache; empty it again so the
@@ -645,6 +708,19 @@ class _HostTable:
             drop_checkpoint_page_cache()
             self._collapse()
             mapped_kb, huge_kb = _huge_pages_backing(self.bytes.data_ptr())
+        knob = "shmem_enabled" if self.layout == "shared" else "enabled"
+        if huge_kb < mapped_kb * 0.98 and _thp_mode(knob) != "never":
+            # khugepaged is the last folder before we pin: give it a bounded
+            # window so registration does not strand the table on base pages.
+            # When THP is set to never for this memory class, no daemon will
+            # ever fold these pages and the window is 20 s of dead wait.
+            deadline = time.time() + 20.0
+            while time.time() < deadline:
+                time.sleep(2.0)
+                mapped_kb, huge_kb = _huge_pages_backing(self.bytes.data_ptr())
+                if huge_kb >= mapped_kb * 0.98:
+                    break
+        self._register()
         pct = 100.0 * huge_kb / mapped_kb if mapped_kb else 0.0
         msg = (
             f"engram host table {label}: layout={self.layout}, "
@@ -652,7 +728,6 @@ class _HostTable:
             f"({pct:.0f}%)"
         )
         if huge_kb == 0:
-            knob = "shmem_enabled" if self.layout == "shared" else "enabled"
             logger.warning(
                 "%s. No huge pages: expect ~10x slower lookups (one TLB miss per row); "
                 "transparent_hugepage/%s is '%s'",
@@ -682,7 +757,36 @@ class EngramEmbedding(nn.Module):
         row_end = num_embeddings * (tp_rank + 1) // self.tp_size
         self.rows = row_end - self.row_start
         self.host_table: Optional[_HostTable] = None
-        if envs.SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE.get():
+        self.nvme_table = None
+        if envs.SGLANG_ENABLE_DSV41_ENGRAM_NVME.get():
+            from sglang.srt.layers.engram_nvme import (
+                NvmeEngramStore,
+                validate_configuration,
+            )
+            from sglang.srt.runtime_context import get_exec, get_schedule, get_spec
+
+            validate_configuration(
+                get_parallel(),
+                get_schedule(),
+                get_spec(),
+                get_exec().graph,
+                envs.SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE.get(),
+            )
+            self.nvme_table = NvmeEngramStore(
+                get_model().model_path,
+                layer_id,
+                num_embeddings,
+                dim,
+                envs.SGLANG_DSV41_ENGRAM_NVME_CACHE_BYTES.get(),
+                envs.SGLANG_DSV41_ENGRAM_NVME_STAGING_BYTES.get(),
+            )
+            self.weight = nn.Parameter(
+                torch.empty(0, dtype=torch.float8_e4m3fn), requires_grad=False
+            )
+            self.scale = nn.Parameter(
+                torch.empty(0, dtype=torch.float8_e8m0fnu), requires_grad=False
+            )
+        elif envs.SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE.get():
             self._init_host_table(num_embeddings, dim, layer_id)
         else:
             self.weight = nn.Parameter(
@@ -720,6 +824,11 @@ class EngramEmbedding(nn.Module):
         return self.host_table is not None and self.host_table.layout == "shared"
 
     def _load_rows(self, param: nn.Parameter, loaded_weight: torch.Tensor):
+        if self.nvme_table is not None:
+            self.nvme_table.validate_weight(
+                "weight" if param is self.weight else "scale", loaded_weight
+            )
+            return
         rows = slice(self.row_start, self.row_start + self.rows)
         if self._shared:
             param.data[rows].copy_(loaded_weight[rows])
@@ -730,6 +839,8 @@ class EngramEmbedding(nn.Module):
 
     def finish_load(self, label: str):
         """Collective in the shared layout: every rank calls it after loading."""
+        if self.nvme_table is not None:
+            self.nvme_table.finish_load()
         if self.host_table is not None:
             self.host_table.finish_load(label)
 
@@ -785,6 +896,8 @@ class EngramEmbedding(nn.Module):
 
     def _owned_rows(self, indices: torch.Tensor) -> torch.Tensor:
         """Rows of `indices` this rank's shard holds, zero for the rest."""
+        if self.nvme_table is not None:
+            return self.nvme_table.lookup(indices)
         if self.rows == 0:
             return self._empty(indices).zero_()
         if self.host_table is None and not _cuda_kernels(indices):

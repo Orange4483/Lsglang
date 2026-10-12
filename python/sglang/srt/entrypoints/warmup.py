@@ -144,6 +144,7 @@ async def prefill_shapes(disaggregation_mode: str, tokenizer_manager: TokenizerM
         if mid <= 32768:
             sizes.add(mid)
         base *= 2
+    sizes.add(17)   # non-16-multiple: covers triton "other" int specialization class
     sizes = sorted(sizes)
 
     for size in tqdm.tqdm(sizes, desc="Warmup prefill shapes (up to 32K)"):

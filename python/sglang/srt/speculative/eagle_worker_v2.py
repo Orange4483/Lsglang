@@ -1,5 +1,7 @@
 import contextlib
 import logging
+import functools
+import os
 import time
 from typing import List, Optional
 
@@ -122,6 +124,7 @@ from sglang.srt.utils.common import (
     empty_context,
     fast_topk,
     get_available_gpu_memory,
+    get_bool_env_var,
     is_cpu,
     is_cuda,
     is_hip,
@@ -150,6 +153,61 @@ _EMBED_TENSOR_NAMES = (
     "model.word_embeddings.weight",
     "tok_embeddings.weight",
 )
+
+
+class _SpecStageProbe:
+    """CUDA-event timed draft/verify stages; LK_SPEC_PROBE=1, every N steps
+    prints per-stage mean ms over the window. Events retire in order, so a
+    not-yet-done event just defers the flush (no sync in the hot path)."""
+
+    def __init__(self):
+        self.on = get_bool_env_var("LK_SPEC_PROBE")
+        self.pending = []
+        self.sums = {}
+        self.cnt = {}
+        self.steps = 0
+        self.every = envs.SGLANG_SPEC_STAGES_PROBE_EVERY.get() if hasattr(
+            envs, "SGLANG_SPEC_STAGES_PROBE_EVERY") else 100
+
+    def stage(self, name):
+        def deco(fn):
+            @functools.wraps(fn)
+            def wrap(*a, **k):
+                if not self.on:
+                    return fn(*a, **k)
+                e0, e1 = torch.cuda.Event(True), torch.cuda.Event(True)
+                e0.record()
+                r = fn(*a, **k)
+                e1.record()
+                self.pending.append((name, e0, e1))
+                if len(self.pending) > 4096:
+                    self.pending.clear()
+                self.tick()
+                return r
+            return wrap
+        return deco
+
+    def tick(self):
+        self.steps += 1
+        while self.pending:
+            name, e0, e1 = self.pending[0]
+            if not e1.query():
+                return
+            self.sums[name] = self.sums.get(name, 0.0) + e0.elapsed_time(e1)
+            self.cnt[name] = self.cnt.get(name, 0) + 1
+            self.pending.pop(0)
+        if self.steps >= self.every:
+            msg = " ".join(
+                f"{k}={self.sums[k] / max(self.cnt[k], 1):.2f}ms" for k in self.sums)
+            logger.info("[SP] %s (n=%d) tp=%s", msg, self.cnt.get("verify", 0),
+                        torch.distributed.get_rank()
+                        if torch.distributed.is_initialized() else -1)
+            self.sums.clear()
+            self.cnt.clear()
+            self.steps = 0
+
+
+_spec_probe = _SpecStageProbe()
 
 
 def _find_draft_input_embedding(model) -> "torch.nn.Module":
@@ -224,6 +282,8 @@ def _load_checkpoint_tensor(
 def _qsa_index_share_requested(hf_config) -> bool:
     """--json-model-override-args writes top-level hf_config attributes, while
     checkpoint configs carry the flag on the nested text_config; read both."""
+    if get_bool_env_var("LK_DISABLE_QSA_SHARE"):
+        return False
     text_config = getattr(hf_config, "text_config", hf_config)
     return bool(
         getattr(
@@ -574,7 +634,13 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             tail_width=get_spec().speculative_num_steps + 1,
             device=self.draft_runner.device,
         )
-        for backend in (self.draft_attn_backend, self.draft_extend_attn_backend):
+        # Target the backend the draft runner actually executes with: when
+        # draft-extend is wrapped in the super-chunk iterator, the wrapper
+        # must hold the state too (it propagates to primary AND the lazily
+        # created children; setting on the raw twin only would leave every
+        # child's should_capture_mtp_sparse_indices False — a silent
+        # no-op that reuses stale topk through the whole MTP decode).
+        for backend in (self.draft_attn_backend, self.draft_runner.attn_backend):
             backend.set_mtp_shared_sparse_indices(state)
         logger.info(
             "QSA MTP index sharing enabled: draft decode steps reuse the "
@@ -738,6 +804,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 f"avail mem={after_mem:.2f} GB.",
             )
 
+    @_spec_probe.stage("draft")
     def draft(self, batch: ScheduleBatch, *, with_topology: bool = False):
         draft_input: EagleDraftInput = batch.spec_info
         forward_batch, can_run_decode_cuda_graph = prepare_for_draft(
@@ -1911,7 +1978,27 @@ class EAGLEWorkerV2(BaseSpecWorker):
         # mirrors init_attention_backend. When None, the runner keeps its
         # initialized backend (consistent across step configs).
         if state.draft_extend_attn_backend is not None:
-            dw.draft_runner.attn_backend = state.draft_extend_attn_backend
+            # The wrapper only ever exists on draft_runner.attn_backend, so a
+            # naive assignment from the state's raw twin would silently drop
+            # the super-chunk iterator (correct but CAP-footprint forwards).
+            # Keep the wrapper whenever its primary IS the active raw backend;
+            # only fall back to the raw twin when they diverge (logged).
+            from sglang.srt.layers.attention.super_chunk_backend import (
+                SuperChunkAttnBackend,
+            )
+
+            cur = dw.draft_runner.attn_backend
+            if isinstance(cur, SuperChunkAttnBackend) and (
+                cur.primary is not state.draft_extend_attn_backend
+            ):
+                logger.warning(
+                    "Adaptive state switch: draft-extend wrapper primary "
+                    "diverged from the state backend; super-chunk iterator "
+                    "dropped for this state."
+                )
+                dw.draft_runner.attn_backend = state.draft_extend_attn_backend
+            elif not isinstance(cur, SuperChunkAttnBackend):
+                dw.draft_runner.attn_backend = state.draft_extend_attn_backend
         dw.cuda_graph_runner_for_draft_extend = state.cuda_graph_runner_for_draft_extend
         dw._rebuild_topk1_chain_buffers()
 
@@ -1999,6 +2086,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
             )
             dw._rebuild_topk1_chain_buffers()
 
+    @_spec_probe.stage("verify")
     def verify(self, batch: ScheduleBatch, pp_proxy_tensors=None, grammar_barrier=None):
         return run_eagle_verify(
             batch,

@@ -1092,6 +1092,26 @@ def mhc_pre_big_fuse_with_norm_tilelang(
             T.pdl_trigger()
 
 
+def _pick_splitk_hidden_block(hc_hidden_size: int, split_k: int) -> int | None:
+    """Largest power-of-two hidden block (<=256) the split-k kernel accepts.
+
+    The kernel maker asserts ``hc_hidden_size % hidden_block == 0`` and
+    ``split_size % hidden_block == 0`` with ``split_size = hc_hidden_size //
+    split_k``; the second implies the first, so scanning against the per-split
+    size is sufficient. The two shipped V4 widths resolve to their previous
+    hardcoded values (16384 -> 256, 28672 -> 128) and V4.1 (20480) resolves to
+    128. Returns None when no block divides the per-split size, i.e. the
+    split-k shape is unusable and the caller must take the generic path.
+    """
+    if split_k <= 0 or hc_hidden_size % split_k:
+        return None
+    per_split = hc_hidden_size // split_k
+    for block in (256, 128, 64):
+        if per_split % block == 0:
+            return block
+    return None
+
+
 def mhc_pre(
     residual: torch.Tensor,
     fn: torch.Tensor,
@@ -1170,17 +1190,13 @@ def mhc_pre(
         gemm_last_dim = hc_mult3
         big_fuse_n_splits = n_splits
     else:
-        if num_tokens <= 2048:
+        hidden_block = (
+            _pick_splitk_hidden_block(hc_hidden_size, n_splits_pre)
+            if num_tokens <= 2048
+            else None
+        )
+        if hidden_block is not None:
             assert n_splits == 1
-            if hc_hidden_size == 16384:
-                hidden_block = 256
-            elif hc_hidden_size == 28672:
-                hidden_block = 128
-            else:
-                raise NotImplementedError(
-                    f"mhc_pre splitk kernel only supports hc_hidden_size in {{16384, 28672}}, "
-                    f"got {hc_hidden_size}"
-                )
             kernel_0, _ = mhc_pre_gemm_sqrsum_splitk_kernel(
                 hc_mult3,
                 hc_hidden_size,
@@ -2277,6 +2293,13 @@ _HC_MIX_NUM_STAGES = 2
 _HC_MIX_BLOCK_M_SMALL = 8
 _HC_MIX_BLOCK_M_MID = 16
 _HC_MIX_MID_MAX_M = 2048
+# Row-chunk for large-M (prefill) launches.  Per-row arithmetic is chunk-
+# invariant, but a single launch over M > _HC_MIX_MID_MAX_M needs the BLOCK_M=32
+# specialization (never covered by the {1,2,12,16} prewarm sweep -> serving-time
+# compile stalls) and scales the [NUM_SLICES, M, MIX] fp32 part buffers with M.
+# Chunking keeps every launch inside the warmed BLOCK_M<=16 specs and bounds the
+# scratch to the 2048-row size, whatever the prompt length.
+_HC_MIX_CHUNK_M = _HC_MIX_MID_MAX_M
 
 
 def _block_m_for(m: int) -> int:
@@ -2320,46 +2343,54 @@ def hc_mix_stats(x_flat: torch.Tensor, hc_fn: torch.Tensor, eps: float) -> torch
     assert hc_fn.shape[1] == k
     num_slices = _num_slices_for(k)
     mix_pad = max(16, triton.next_power_of_2(mix))
-    part_mix = torch.empty(
-        (num_slices, m, mix), dtype=torch.float32, device=x_flat.device
-    )
-    part_sq = torch.empty((num_slices, m), dtype=torch.float32, device=x_flat.device)
     mixes = torch.empty((m, mix), dtype=torch.float32, device=x_flat.device)
     if m == 0:
         return mixes
-    block_m = _block_m_for(m)
-    grid_m = triton.cdiv(m, block_m)
-    _hc_mix_stats_partial_kernel[(grid_m, num_slices)](
-        x_flat,
-        hc_fn,
-        part_mix,
-        part_sq,
-        m,
-        k,
-        x_flat.stride(0),
-        hc_fn.stride(0),
-        MIX=mix,
-        MIX_PAD=mix_pad,
-        NUM_SLICES=num_slices,
-        BLOCK_M=block_m,
-        BLOCK_K=_HC_MIX_BLOCK_K,
-        DOT_PRECISION=_HC_MIX_DOT_PRECISION,
-        num_warps=_HC_MIX_NUM_WARPS,
-        num_stages=_num_stages_for(m, k),
-    )
-    _hc_mix_stats_reduce_kernel[(grid_m,)](
-        part_mix,
-        part_sq,
-        mixes,
-        m,
-        1.0 / k,
-        eps,
-        MIX=mix,
-        MIX_PAD=mix_pad,
-        NUM_SLICES=num_slices,
-        BLOCK_M=block_m,
-        num_warps=4,
-    )
+    step = _HC_MIX_CHUNK_M if m > _HC_MIX_CHUNK_M else m
+    for start in range(0, m, step):
+        end = min(start + step, m)
+        mm = end - start
+        single = mm == m
+        x_chunk = x_flat if single else x_flat[start:end]
+        part_mix = torch.empty(
+            (num_slices, mm, mix), dtype=torch.float32, device=x_flat.device
+        )
+        part_sq = torch.empty(
+            (num_slices, mm), dtype=torch.float32, device=x_flat.device
+        )
+        block_m = _block_m_for(mm)
+        grid_m = triton.cdiv(mm, block_m)
+        _hc_mix_stats_partial_kernel[(grid_m, num_slices)](
+            x_chunk,
+            hc_fn,
+            part_mix,
+            part_sq,
+            mm,
+            k,
+            x_chunk.stride(0),
+            hc_fn.stride(0),
+            MIX=mix,
+            MIX_PAD=mix_pad,
+            NUM_SLICES=num_slices,
+            BLOCK_M=block_m,
+            BLOCK_K=_HC_MIX_BLOCK_K,
+            DOT_PRECISION=_HC_MIX_DOT_PRECISION,
+            num_warps=_HC_MIX_NUM_WARPS,
+            num_stages=_num_stages_for(mm, k),
+        )
+        _hc_mix_stats_reduce_kernel[(grid_m,)](
+            part_mix,
+            part_sq,
+            mixes if single else mixes[start:end],
+            mm,
+            1.0 / k,
+            eps,
+            MIX=mix,
+            MIX_PAD=mix_pad,
+            NUM_SLICES=num_slices,
+            BLOCK_M=block_m,
+            num_warps=4,
+        )
     return mixes
 
 

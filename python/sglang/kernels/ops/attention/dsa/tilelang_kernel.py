@@ -1,4 +1,5 @@
 import functools
+import os
 from functools import lru_cache
 from typing import Any, Optional, Tuple
 
@@ -10,6 +11,16 @@ from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.utils import is_gfx95_supported, is_hip
 
 tilelang.set_log_level("WARNING")
+
+# Diagnostic gate: drop tilelang's ROCm target detector so target resolution
+# never spawns `which hipcc`/`hipconfig`. Under compute-sanitizer's tree
+# launcher that fork-exec handshake can wedge the whole TP group. The CUDA
+# detector resolves arch via torch without subprocesses. Same knob as lvllm's
+# VLLM_TILELANG_SKIP_ROCM_TARGET_DETECT.
+if os.environ.get("SGLANG_TILELANG_SKIP_ROCM_TARGET_DETECT", "0") == "1":
+    import tilelang.backend.target as _tt
+
+    _tt._TARGET_DETECTORS.pop("hip", None)
 
 # Workaround a tilelang bug: BaseKernelAdapter._legalize_result_idx mutates the
 # `out_idx` list in place when normalising negative indices to positive ones.
@@ -271,6 +282,8 @@ def sparse_attention_fwd_kernel_v1(
     block_I=64,
     num_stages=2,
     threads=256,
+    use_sink=False,
+    max_head_per_block=64,
 ):
     assert dim == tilelang.math.next_power_of_2(dim) or dim % 64 == 0, (
         f"dim={dim} must be a power of 2 or a multiple of 64"
@@ -283,9 +296,12 @@ def sparse_attention_fwd_kernel_v1(
     assert topk % block_I == 0, (
         "otherwise will load some index=0 thus causing wrong kv to be loaded"
     )
+    use_sink = bool(use_sink)
     if sm_scale is None:
-        sm_scale = (1.0 / (dim + tail_dim)) ** 0.5 * 1.44269504  # log2(e)
+        true_scale = (1.0 / (dim + tail_dim)) ** 0.5
+        sm_scale = true_scale * 1.44269504  # log2(e)
     else:
+        true_scale = sm_scale
         sm_scale = sm_scale * 1.44269504  # log2(e)
 
     batch = T.symbolic("batch")
@@ -310,19 +326,22 @@ def sparse_attention_fwd_kernel_v1(
     D = dim
     D_tail = tail_dim
 
-    if head_kv > 64:
-        assert head_kv % 64 == 0, "head_kv should be a multiple of 64"
-        REPLICATE_H = head_kv // 64
+    if head_kv > max_head_per_block:
+        assert head_kv % max_head_per_block == 0, (
+            "head_kv should be a multiple of max_head_per_block"
+        )
+        REPLICATE_H = head_kv // max_head_per_block
+        H_per_block = max_head_per_block
     else:
         REPLICATE_H = 1
-
-    H_per_block = padded_H if REPLICATE_H == 1 else 64
+        H_per_block = padded_H
 
     @T.prim_func
     def main(
         Q: T.Tensor(q_shape, dtype),  # type: ignore
         KV: T.Tensor(kv_shape, dtype),  # type: ignore
         Indices: T.Tensor(indices_shape, indices_dtype),  # type: ignore
+        Sink: T.Tensor([num_heads], FP32),  # type: ignore
         Output: T.Tensor(o_shape, dtype),  # type: ignore
     ):
         with T.Kernel(seq_len * REPLICATE_H, batch, kv_group, threads=threads) as (
@@ -357,8 +376,23 @@ def sparse_attention_fwd_kernel_v1(
             q_i = s_i
             max_kv_i = q_i
 
-            H0 = g_i * padded_H + (0 if REPLICATE_H == 1 else (bx % REPLICATE_H) * 64)
+            H0 = g_i * padded_H + (
+                0 if REPLICATE_H == 1 else (bx % REPLICATE_H) * H_per_block
+            )
             H1 = H0 + H_per_block
+
+            if use_sink:
+                # The learned sink logit ``Sink[h]`` lives in the same scaled
+                # domain as ``true_scale * (Q.K)``. It contributes a weight
+                # ``exp(Sink[h])`` to the denominator and no value, matching
+                # vllm-ds4's ``_finish_materialized_scores_with_sink_kernel``.
+                # Seed the online softmax state with it: the running max in raw
+                # score domain is ``Sink[h] / true_scale`` (so the sink term
+                # ``exp2(sm_scale*(m0 - m0)) = 1``), and the denominator starts
+                # at 1. acc_o stays 0, so the sink adds no output value.
+                for h_i in T.Parallel(H_per_block):
+                    m_i[h_i] = Sink[H0 + h_i] / true_scale
+                T.fill(sumexp, 1)
 
             T.copy(Q[b_i, s_i, H0:H1, :D], Q_shared)
             if has_tail:
@@ -1363,13 +1397,18 @@ def tilelang_sparse_fwd(
     indices: torch.Tensor,
     sm_scale: float,
     d_v: int = 512,
+    sink: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     assert q.dim() == 3 and kv.dim() == 3 and indices.dim() == 3
     num_heads = q.shape[1]
     dim = q.shape[2]
     tail_dim = dim - d_v
     topk = indices.shape[-1]
-    assert topk % 64 == 0, "topk must be padded to a multiple of 64"
+    # DSA (v3.2) decode always passes its indexer top-k (2048). The DSV4 SM8
+    # sparse-prefill fallback passes a padded combined width that varies with
+    # the live seq-len, so the only universal requirement is the kernels'
+    # block_I divisibility (v1/v2 makers assert their own stricter checks).
+    assert topk % 32 == 0, f"topk={topk} must be a multiple of 32"
 
     if _is_hip:
         is_fp8_kv = kv.dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
@@ -1423,13 +1462,103 @@ def tilelang_sparse_fwd(
         )
         out = kernel_combine(partial_o_batched, partial_lse_batched)
     else:
-        kernel_factory = (
-            sparse_attention_fwd_kernel_v1
-            if tail_dim == 0
-            else sparse_attention_fwd_kernel_v2
-        )
-        kernel = kernel_factory(num_heads, d_v, tail_dim, topk, sm_scale=sm_scale)
-        out = kernel(q.unsqueeze(0), kv.unsqueeze(0), indices.unsqueeze(0))  # type: ignore
+        cap = torch.cuda.get_device_capability()
+        # Per-block opt-in dynamic smem of the actual device (host query).
+        # Upper bound for v1 smem at block_I with num_stages=2:
+        #   bi*(3*d_v + 2*tail_dim + bi)*2  (GLM d=512/BI=64 -> 204800 vs the
+        #   196608 the compiler reports; DSV4 448+64/BI=32 -> 96256 exact).
+        # Consumer parts (Ampere 101376; consumer Blackwell similar) cannot
+        # host the BI=64 v1 default even though their arch number is >= 9, so
+        # for the tail==0 v1 path the gate is the byte budget, not the
+        # capability major alone — this is what keeps a mixed SM86+SM120 TP
+        # group on the same safe config (the crash observed on a 5060 Ti rank
+        # of a GLM tp4 run: "dynamic shared memory 151552" under the BI=64
+        # tuned default). tail>0 on SM90+ keeps the v2 kernel unchanged.
+        try:
+            _smem_limit = torch.cuda.get_device_properties(
+                q.device
+            ).shared_memory_per_block_optin
+        except Exception:
+            # sm8 and sm12x are the consumer lines (~100 KB opt-in); only
+            # sm9/sm10/sm11 (Hopper/Blackwell DC) get the large-budget guess.
+            _smem_limit = 101376 if cap[0] in (8, 12) else 232448
+
+        def _v1_smem_bytes(bi: int) -> int:
+            return bi * (3 * d_v + 2 * tail_dim + bi) * 2
+
+        if cap[0] == 8 or (
+            tail_dim == 0 and _v1_smem_bytes(64) > _smem_limit
+        ):
+            # Ampere (SM80/86/89) caps per-block dynamic shared memory at
+            # 101376 B. The GLM DSA MLA decode is a full (non-lora-absorbed)
+            # query with dim = v_head_dim = kv_lora_rank = 512, so the default
+            # block_I=64 needs 196608 B (num_stages=2) / 131072 B (num_stages=1)
+            # > 101376 B. Shrink block_I to 32 with threads=128 so the kernel
+            # fits: 2*32*512*2 + 2*32*32*2 + 2*32*512*2 = 100352 B <= 101376 B,
+            # while keeping 4 warps for good throughput (~296 us vs ~541 us for
+            # block_I=16/threads=64). SM90+ keeps the tuned config.
+            #
+            # DSV4 (tail_dim = 512 - 448 = 64) must use the v1 kernel (which
+            # handles tail via T.Pipelined, no T.alloc_barrier) on SM8: the v2
+            # kernel uses T.alloc_barrier which is SM90+-only and won't compile
+            # on Ampere. Shared-memory budget for dim=448/tail=64 with
+            # block_I=32, num_stages=1: 32*448*2*3(Q/KV/O) + 32*64*2*2(Q/K tail)
+            # + 32*32*2(S) = 28672*3 + 4096*2 + 2048 = 96256 B <= 101376 B.
+            #
+            # SM8 serving (both the main TP>1 MQA decode and the DSPARK
+            # self-draft worker) pads Q up to 64 heads before calling this
+            # (deepseek_v4.py MQA / deepseek_v4_dspark.py DSparkAttention both
+            # pad to _PAD_NUM_HEADS=64). Keeping all 64 heads in one block's
+            # shared memory blows the 101376 B Ampere budget (155648/163840 B).
+            # Cap max_head_per_block=32 so heads are split across replicated
+            # blocks (REPLICATE_H=2 for H=64, H_per_block=32), each block
+            # staying within the 96256 B budget.
+            kernel = sparse_attention_fwd_kernel_v1(
+                num_heads,
+                d_v,
+                tail_dim,
+                topk,
+                sm_scale=sm_scale,
+                block_I=32,
+                num_stages=1,
+                threads=128,
+                use_sink=(sink is not None),
+                max_head_per_block=32,
+            )
+            sink_arg = (
+                sink
+                if sink is not None
+                else torch.empty(
+                    (num_heads,), dtype=torch.float32, device=q.device
+                )
+            )
+            out = kernel(
+                q.unsqueeze(0), kv.unsqueeze(0), indices.unsqueeze(0), sink_arg
+            )  # type: ignore
+        elif tail_dim == 0:
+            kernel = sparse_attention_fwd_kernel_v1(
+                num_heads,
+                d_v,
+                tail_dim,
+                topk,
+                sm_scale=sm_scale,
+                use_sink=(sink is not None),
+            )
+            sink_arg = (
+                sink
+                if sink is not None
+                else torch.empty(
+                    (num_heads,), dtype=torch.float32, device=q.device
+                )
+            )
+            out = kernel(
+                q.unsqueeze(0), kv.unsqueeze(0), indices.unsqueeze(0), sink_arg
+            )  # type: ignore
+        else:
+            kernel = sparse_attention_fwd_kernel_v2(
+                num_heads, d_v, tail_dim, topk, sm_scale=sm_scale
+            )
+            out = kernel(q.unsqueeze(0), kv.unsqueeze(0), indices.unsqueeze(0))  # type: ignore
     return out
 
 
@@ -1559,7 +1688,9 @@ def tilelang_fp8_paged_mqa_logits(
         split_kv=split_kv,
     )
     q_fp8 = q_fp8.view(batch_size, num_heads, head_dim)
-    kvcache_u8 = kvcache_fp8.view(-1, block_size * (head_dim + 4))
+    kvcache_u8 = kvcache_fp8.contiguous().view(torch.uint8).view(
+        -1, block_size * (head_dim + 4)
+    )
     kernel(q_fp8, kvcache_u8, weight, seq_lens, page_table, logits)
     return logits
 

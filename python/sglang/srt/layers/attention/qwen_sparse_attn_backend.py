@@ -1598,7 +1598,11 @@ class QwenSparseAttnBackend(AttentionBackend):
             batch,
             topk,
         )
-        if is_hip():
+        if is_hip() or torch.cuda.get_device_capability(q.device) < (9, 0):
+            # No FA2/FA4 varlen below SM90: the FA4 cute DSL does not even
+            # compile there, and the installed flash_attn may only expose
+            # cute. The packed triton kernel (the HIP path) is pure triton
+            # and covers SM80/86/89 at identical math.
             relative_indices = torch.arange(
                 topk, dtype=torch.int32, device=q.device
             ).expand(batch, -1)

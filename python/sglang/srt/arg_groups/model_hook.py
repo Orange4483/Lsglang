@@ -41,6 +41,7 @@ from sglang.srt.runtime_context import derive_attention_widths, get_platform
 from sglang.srt.utils.common import (
     get_quantization_config,
     is_mps,
+    is_sm80_supported,
     parse_connector_type,
 )
 
@@ -429,6 +430,31 @@ def handle_model_specific_adjustments(server_args: Any):
 
             run_post_process_pass(server_args, _deepseek_spec_moe_resolution)
 
+        if model_arch in [
+            "Glm5NextForConditionalGeneration",
+            "Glm5NextForConditionalGenerationNextN",
+        ]:
+            # GLM-5.3-Flash (index_kpool=4 + NoPE) on Ampere/Ada (SM8x): the
+            # sm120-only `flashinfer_sparse_mla` backend and the DeepGEMM-backed
+            # `flashmla_*` paths are unavailable here, so the DSA backend
+            # resolution routes prefill+decode to TileLang. Set the supporting
+            # env vars: TileLang indexer paged MQA, TileLang MHC (instead of
+            # DeepGEMM), a bf16-compatible non-paged MQA fallback, and turn off
+            # DeepGEMM-only features. This block is deliberately gated to SM8x
+            # so it never alters the working sm120 / sm90 paths.
+            if (
+                is_sm80_supported()
+                and not get_platform().is_hip
+                and not get_platform().is_npu
+                and not get_platform().is_xpu
+            ):
+                envs.SGLANG_OPT_USE_TILELANG_INDEXER.set(True)
+                envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.set(True)
+                envs.SGLANG_OPT_USE_TILELANG_MHC_POST.set(True)
+                envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.set(False)
+                envs.SGLANG_OPT_USE_TOPK_V2.set(False)
+                envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.set(True)
+
     elif model_arch in [
         "DeepseekV4ForCausalLM",
     ]:
@@ -462,6 +488,30 @@ def handle_model_specific_adjustments(server_args: Any):
                 envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.set(True)
             if not envs.SGLANG_OPT_USE_TILELANG_INDEXER.is_set():
                 envs.SGLANG_OPT_USE_TILELANG_INDEXER.set(True)
+        elif is_sm80_supported():
+            # SM80/SM86/SM89 (Ampere) has no FP8 tensor cores. The DSV4
+            # deep_gemm-backed paths (MHC prenorm, fp8 MQA logits, topk_v2,
+            # fp8 dense linear) are unavailable here, so disable them and
+            # route to the portable TileLang/Triton/bf16 equivalents.
+            # sm120/sm90+ paths are untouched.
+            envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.set(False)
+            envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.set(True)
+            envs.SGLANG_OPT_USE_TILELANG_MHC_POST.set(True)
+            envs.SGLANG_OPT_FP8_WO_A_GEMM.set(False)
+            envs.SGLANG_OPT_USE_TOPK_V2.set(False)
+            envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.set(True)
+            # NOTE: SGLANG_OPT_USE_TILELANG_INDEXER stays False here. In
+            # the DSV4 indexer dispatch (dsv4/indexer.py) the TileLang
+            # branch takes priority over FP8_PAGED_MQA_LOGITS_TORCH and
+            # `tilelang_fp8_paged_mqa_logits` needs SM89 F32 MMA, which
+            # SM80/86 lacks. Leaving it False lets the fp8->bf16 torch
+            # paged MQA fallback (fp8_paged_mqa_logits_torch) win.
+            # FP4 experts: keep the checkpoint's native MXFP4 (E2M1)
+            # layout and let LK MoE (MOE_MXFP4, dispatch<80>/<86>) dequant
+            # E2M1 -> bf16 internally during compute. This is the same
+            # path SM120 uses; SGLANG_DSV4_FP4_DEQUANT stays False so the
+            # weights are NOT dequantized to fp8 (which would route the
+            # layer to the FP8 LK MoE path instead).
         elif get_platform().is_hip:
             envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.set(False)
             _configure_rocm_fp8_wo_a_gemm(model_config, cfg.download_dir)
@@ -473,6 +523,7 @@ def handle_model_specific_adjustments(server_args: Any):
             envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.set(True)
             envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP.set(False)
             envs.SGLANG_EAGER_INPUT_NO_COPY.set(True)
+
 
     elif model_arch in ["GptOssForCausalLM"]:
         # Attention backend selection + XPU dtype validation moved to the

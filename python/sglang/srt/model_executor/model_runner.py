@@ -218,6 +218,7 @@ from sglang.srt.state_capturer.routed_experts import (
     set_global_experts_capturer,
 )
 from sglang.srt.utils import (
+    align_cute_dsl_arch_to_current_device,
     cpu_has_amx_support,
     enable_show_time_cost,
     get_available_gpu_memory,
@@ -421,6 +422,11 @@ class ModelRunner:
                 f"Context: {self.device=} {get_device().gpu_id=} {os.environ.get('CUDA_VISIBLE_DEVICES')=} {get_parallel().tp_rank=} {get_parallel().tp_size=}"
             )
             raise
+
+        # Device is now this rank's GPU: re-point the CuTe DSL at it, because it
+        # otherwise probes CUDA device 0 and compiles for the wrong chip on a
+        # mixed-arch host (e.g. SM86 + SM120 in one TP group).
+        align_cute_dsl_arch_to_current_device()
 
         # Get available memory before model loading.
         # Stored for later use by alloc_memory_pool().

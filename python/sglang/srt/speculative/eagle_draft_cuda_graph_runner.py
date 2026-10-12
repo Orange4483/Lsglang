@@ -719,14 +719,13 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             forward_batch.seq_lens_sum = raw_seq_lens_sum
             forward_batch.out_cache_loc = raw_out_cache_loc
 
-        # draft_probs is the only graph output consumed after *other* graphs
-        # replay (verify reads it post-forward); with the shared graph pool a
-        # later-captured graph may hold allocator blocks that overlap this
-        # pool tensor's recorded peers, so a verify-graph replay can overwrite
-        # it before the read. Materialize it outside the pool to break the alias.
-        if get_spec().speculative_use_rejection_sampling and len(out) == 4:
-            parent_list, top_scores_index, draft_tokens, draft_probs = out
-            if draft_probs is not None:
-                out = (parent_list, top_scores_index, draft_tokens, draft_probs.clone())
+        # Draft outputs are graph outputs consumed later by verify, after
+        # other graphs may replay; with the shared graph pool a later-captured
+        # graph can hold allocator blocks overlapping these pool tensors, so a
+        # replay overwrites them before the read. Materialize outside the pool
+        # to break the alias (draft_probs only exists under rejection sampling).
+        if len(out) in (3, 4):
+            *head, draft_tokens = out[:3]
+            out = (*head, draft_tokens.clone(), *out[3:])
 
         return out

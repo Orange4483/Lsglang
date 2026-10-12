@@ -47,8 +47,23 @@ def _super_chunk_unsupported_reason(
         return "disabled (super_chunk_inner_size=0)"
     if not fb.forward_mode.is_extend():
         return "not an EXTEND forward"
+    if fb.forward_mode.is_mixed():
+        # MIXED carries decode rows alongside the extend rows, but the child
+        # views only slice the extend axis (extend_num_tokens); the decode
+        # tail would fall through every child. Not seen in our configs
+        # (is_mixed_chunk off), kept as a hard gate like the others.
+        return "mixed extend+decode batch"
     if torch.cuda.is_current_stream_capturing():
         return "cuda-graph capture"
+    from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
+        is_in_breakable_cuda_graph,
+    )
+
+    if is_in_breakable_cuda_graph():
+        # Same exclusion the model-side loops apply (deepseek_v4 hc/attn
+        # plans): a graph piece replaying wrapper.forward must not depend on
+        # live-iterator state.
+        return "breakable cuda-graph piece"
     if getattr(fb, "tbo_children", None) is not None:
         return "two-batch overlap"
     if fb.spec_info is not None:
@@ -143,6 +158,25 @@ def build_super_chunk_children(
         dev = fb.req_pool_indices.device
         child.extend_seq_lens_cpu = child_ext
         child.extend_prefix_lens_cpu = child_pref
+
+        # CPU-side track lists (lk_moe CPU-prefill metadata path): the parent
+        # decided "this request tracks at seqlen B in this chunk", but B lands
+        # in exactly ONE sub-chunk's window. Without the range filter every
+        # child would snap, and a child whose window ends before B computes an
+        # h row index past its own chunk grid (device-side OOB).
+        parent_cpu_mask = getattr(fb, "mamba_prefill_track_mask_cpu", None)
+        parent_cpu_trk = getattr(fb, "mamba_track_seqlens_cpu", None)
+        if parent_cpu_trk is not None:
+            child.mamba_track_seqlens_cpu = [parent_cpu_trk[r] for r in range(r1, r_end)]
+        if parent_cpu_mask is not None:
+            assert parent_cpu_trk is not None, (
+                "cpu-prefill track metadata requires mamba_track_seqlens_cpu"
+            )
+            child.mamba_prefill_track_mask_cpu = [
+                bool(parent_cpu_mask[r])
+                and child_pref[i] < parent_cpu_trk[r] <= child_pref[i] + child_ext[i]
+                for i, r in enumerate(range(r1, r_end))
+            ]
         child.extend_seq_lens = torch.tensor(child_ext, dtype=torch.int32, device=dev)
         child.extend_prefix_lens = torch.tensor(
             child_pref, dtype=torch.int32, device=dev
@@ -241,6 +275,7 @@ class SuperChunkAttnBackend(AttentionBackend):
         # per-forward plan: None => passthrough (primary runs the whole batch)
         self._active = False
         self._warned_kwargs = set()
+        self._warned_unknown_kwargs = set()
 
     @classmethod
     def init_new(
@@ -357,17 +392,38 @@ class SuperChunkAttnBackend(AttentionBackend):
         # loop too: GDN advances its state through the mamba pool exactly like
         # today's scheduler chunks do (child == one chunk window), and QSA's
         # per-token selections slice with the tokens they were computed for.
+        unknown = [
+            key
+            for key in kwargs
+            if key not in self._SLICEABLE_KWARGS
+            and key not in self._PASSTHROUGH_KWARGS
+        ]
         if (
             not self._active
             or self._child_batches is None
             or (q is None and mixed_qkv is None)
-            or any(
-                key not in self._SLICEABLE_KWARGS
-                and key not in self._PASSTHROUGH_KWARGS
-                for key in kwargs
-            )
+            or unknown
             or (mixed_qkv is not None and not torch.is_tensor(mixed_qkv))
         ):
+            if (
+                self._active
+                and unknown
+                and self._child_batches is not None
+                and (q is not None or mixed_qkv is not None)
+            ):
+                # The one silent-哑火 mode: a model-side kwarg outside the
+                # whitelist disables the loop for that layer EVERY forward.
+                # Loud once per key set, quiet after.
+                sig = tuple(sorted(unknown))
+                if sig not in self._warned_unknown_kwargs:
+                    self._warned_unknown_kwargs.add(sig)
+                    logger.warning(
+                        "super-chunk passthrough for layer %s: kwargs %s "
+                        "outside the slice/passthrough whitelist; SUB_M has "
+                        "no effect on this layer.",
+                        type(layer).__name__ if layer is not None else "?",
+                        list(sig),
+                    )
             return self.primary.forward(
                 q, k, v, layer, forward_batch, save_kv_cache=save_kv_cache,
                 **(

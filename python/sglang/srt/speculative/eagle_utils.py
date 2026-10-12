@@ -829,6 +829,14 @@ def eagle_sample(
             topk=verify_input.tree_topk,
         )
 
+        if envs.SGLANG_RS_DEBUG.get():
+            logger.warning(
+                "[verify-dbg] draft=%s target=%s ncorr=%s",
+                candidates[:2, :4].tolist(),
+                target_predict[:2, :4].tolist(),
+                num_correct_drafts[:2].tolist(),
+            )
+
         if _is_hip:
             # On ROCm, the per-rank draft tokens can differ, so ranks accept a
             # different number of drafts, desynchronize the committed seq_lens, and

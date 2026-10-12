@@ -247,6 +247,23 @@ def _flash_mla_sm120_prefill(
         if extra_indices is not None and extra_indices.dim() == 3
         else extra_indices
     )
+    # The SM120 sparse-MLA prefill specialization requires page_block_size=64
+    # for BOTH sources (the decode path accepts native page sizes).  V4.1
+    # ratio-1/2/c128 extra pools use 128/256-token pages, so split them the
+    # same way as the main source.  Token indices are invariant under the
+    # split; the persistent scratch is keyed per role so converting the extra
+    # source can never clobber the main source's buffer (or vice versa).
+    if (
+        extra_kv_u8 is not None
+        and extra_kv_u8.ndim >= 3
+        and extra_kv_u8.shape[1] != _PBS_DST
+    ):
+        extra_kv_u8 = _split_kv_pages_to_64(
+            extra_kv_u8,
+            extra_kv_u8.shape[1],
+            touched_indices=extra_idx,
+            buffer_tag="extra",
+        )
     output = q2.new_empty((num_tokens, num_heads, head_dim_v), dtype=torch.bfloat16)
     out_lse = torch.empty((num_tokens, num_heads), dtype=torch.float32, device=dev)
     _sparse_mla_sm120_paged_attention(
@@ -452,6 +469,79 @@ def _page_split_kernel(
 
 
 @triton.jit
+def _page_merge_kernel(
+    src_ptr,
+    dst_ptr,
+    N_pages,
+    src_stride0: tl.constexpr,
+    dst_stride0: tl.constexpr,
+    SRC_PBS: tl.constexpr,  # tokens per source page (< 64)
+    MERGE_RATIO: tl.constexpr,  # src pages per dst page (64 // SRC_PBS)
+    DATA_PER_TOKEN_U64: tl.constexpr,  # 576 // 8 = 72
+    TOKENS_PER_BLOCK: tl.constexpr,  # lanes per iteration = TB * 72
+    mask_ptr,
+    HAS_MASK: tl.constexpr,
+):
+    """Inverse of the page split: MERGE_RATIO small src pages per dst page.
+
+    The c128 compress pool of a ratio-128 model has page_size = global//128
+    (2 tokens at page_size 256), which the split direction (src_pbs % 64)
+    cannot express (ratio would be 0). Token order is identity; only the
+    page grouping changes, so this is a per-token gather copy in the same
+    footer format (data then scale). Mask semantics match the split kernel:
+    ``mask_ptr`` here is per DST page (marked with divisor 64), untouched
+    dst pages keep stale bytes, and every valid token's dst page is covered
+    by touched src pages by construction.
+    """
+    pid = tl.program_id(0)
+    if pid * MERGE_RATIO >= N_pages:
+        return
+    if HAS_MASK:
+        if tl.load(mask_ptr + pid) == 0:
+            return
+    src_u64 = src_ptr.to(tl.pointer_type(tl.uint64))
+    dst_u64 = dst_ptr.to(tl.pointer_type(tl.uint64))
+    first_src = pid * MERGE_RATIO
+    dst_base = dst_u64 + pid * (dst_stride0 // 8)
+    SCALE_REGION_U64: tl.constexpr = SRC_PBS * DATA_PER_TOKEN_U64
+    DST_SCALE_U64: tl.constexpr = 64 * DATA_PER_TOKEN_U64
+
+    LANES: tl.constexpr = 1024  # pow2 >= TOKENS_PER_BLOCK * DATA_PER_TOKEN_U64
+    for t0 in tl.static_range(0, 64, TOKENS_PER_BLOCK):
+        lanes = tl.arange(0, LANES)
+        keep = lanes < TOKENS_PER_BLOCK * DATA_PER_TOKEN_U64
+        tok = tl.minimum(
+            t0 + lanes // DATA_PER_TOKEN_U64, 64
+        )  # clamp: masked-out lanes must not address past the page
+        intra = lanes % DATA_PER_TOKEN_U64
+        src_page = tl.minimum(first_src + tok // SRC_PBS, N_pages - 1)
+        src_off = (tok % SRC_PBS) * DATA_PER_TOKEN_U64
+        vals = tl.load(
+            src_u64
+            + src_page * (src_stride0 // 8)
+            + src_off
+            + intra,
+            mask=keep,
+        )
+        tl.store(dst_base + tok * DATA_PER_TOKEN_U64 + intra, vals, mask=keep)
+
+    # Scale region: one u64 (8 B) per token, src scales sit right after the
+    # data of the src page group; dst scales at the fixed footer offset.
+    tl.store(
+        dst_base + DST_SCALE_U64 + tl.arange(0, 64),
+        tl.load(
+            src_u64
+            + tl.minimum(
+                first_src + tl.arange(0, 64) // SRC_PBS, N_pages - 1
+            )
+            * (src_stride0 // 8)
+            + SCALE_REGION_U64
+            + tl.arange(0, 64) % SRC_PBS
+        ),
+    )
+
+
+@triton.jit
 def _page_mark_kernel(
     indices_ptr,
     mask_ptr,
@@ -478,6 +568,7 @@ def _split_kv_pages_to_64(
     kv_u8: torch.Tensor,
     src_pbs: int,
     touched_indices: Optional[torch.Tensor] = None,
+    buffer_tag: str = "primary",
 ) -> torch.Tensor:
     """Split pbs=N footer-format pages into pbs=64 footer-format pages.
 
@@ -488,20 +579,31 @@ def _split_kv_pages_to_64(
     pool). The output buffer is persistent and reused across steps; untouched
     dst pages simply retain their (unreferenced) stale data.
     """
-    assert src_pbs % _PBS_DST == 0 and src_pbs >= _PBS_DST
+    split_mode = src_pbs % _PBS_DST == 0 and src_pbs >= _PBS_DST
+    merge_mode = _PBS_DST % src_pbs == 0 and src_pbs < _PBS_DST
+    assert split_mode or merge_mode, (
+        f"page size {src_pbs} is neither a multiple of {_PBS_DST} nor a "
+        f"divisor of it; neither split nor merge can re-page it"
+    )
     if src_pbs == _PBS_DST:
         return kv_u8
 
     N = kv_u8.shape[0]
-    ratio = src_pbs // _PBS_DST
-    num_dst_pages = N * ratio
+    if split_mode:
+        ratio = src_pbs // _PBS_DST
+        num_dst_pages = N * ratio
+    else:
+        merge_ratio = _PBS_DST // src_pbs
+        num_dst_pages = -(-N * src_pbs // _PBS_DST)  # ceil: pool tokens need
+        # not be 64-aligned; the ragged tail page is never addressed by real
+        # indices and its loads are clamped below.
 
     from sglang.srt.runtime_context import get_resources
 
     # Pre-allocated grow-only buffer for page-split output per device.
     dev = kv_u8.device
     buffers = get_resources().buffers
-    key = f"flash_mla_sm120_split:{dev}"
+    key = f"flash_mla_sm120_split:{dev}:{buffer_tag}"
     buf = buffers.get(key)
     if buf is None or buf.shape[0] < num_dst_pages:
         # The first allocation can happen under inference mode (autotune), but
@@ -530,17 +632,18 @@ def _split_kv_pages_to_64(
     if use_mask:
         # Persistent per-device int8 mask, zeroed each call (cheap memset,
         # captured cleanly by CUDA graph). 1 = page is referenced this step.
-        mkey = f"flash_mla_sm120_mask:{dev}"
+        mkey = f"flash_mla_sm120_mask:{dev}:{buffer_tag}"
         mbuf = buffers.get(mkey)
-        if mbuf is None or mbuf.shape[0] < N:
+        mask_pages = N if split_mode else num_dst_pages
+        if mbuf is None or mbuf.shape[0] < mask_pages:
             # The first allocation can happen under inference mode (autotune),
             # but the buffer is zeroed again later during CUDA graph capture
             # outside inference mode -- an inference tensor cannot be mutated
             # there, so force a normal tensor.
             with torch.inference_mode(False):
-                mbuf = torch.empty(N, dtype=torch.int8, device=dev)
+                mbuf = torch.empty(mask_pages, dtype=torch.int8, device=dev)
             buffers[mkey] = mbuf
-        mask = mbuf[:N]
+        mask = mbuf[:mask_pages]
         mask.zero_()
         idx_flat = touched_indices.reshape(-1).contiguous()
         if idx_flat.dtype != torch.int32:
@@ -550,12 +653,31 @@ def _split_kv_pages_to_64(
             idx_flat,
             mask,
             idx_flat.numel(),
-            src_pbs,  # SRC_PBS
+            src_pbs if split_mode else _PBS_DST,  # mark by src page / dst page
             _MARK_BLOCK,
         )
         mask_ptr = mask
 
     assert src_stride0 % 8 == 0 and _BYTES_PER_DST_PAGE_PADDED % 8 == 0
+    if merge_mode:
+        _page_merge_kernel[(num_dst_pages,)](
+            src_2d,
+            out,
+            N,
+            src_stride0,
+            _BYTES_PER_DST_PAGE_PADDED,
+            SRC_PBS=src_pbs,
+            MERGE_RATIO=merge_ratio,
+            DATA_PER_TOKEN_U64=_NOPE_ROPE_STRIDE // 8,
+            TOKENS_PER_BLOCK=8,
+            mask_ptr=mask_ptr,
+            HAS_MASK=use_mask,
+        )
+        bpt = _NOPE_ROPE_STRIDE + _SCALE_STRIDE  # 584
+        return out.as_strided(
+            (num_dst_pages, _PBS_DST, 1, bpt),
+            (_BYTES_PER_DST_PAGE_PADDED, bpt, bpt, 1),
+        )
     grid = (N * ratio,)
     _page_split_kernel[grid](
         src_2d,

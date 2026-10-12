@@ -145,6 +145,11 @@ def build_attention_backends(*, model_runner: ModelRunner) -> AttentionBackends:
             ),
             inner_size=get_schedule().chunked_prefill_size,
         )
+        logger.info(
+            "Super-chunk prefill wrapper active: CAP=%d, inner=%d.",
+            get_super_chunk_size(),
+            get_schedule().chunked_prefill_size,
+        )
         decode_attn_backend = None
         decode_attn_backend_group = []
     else:

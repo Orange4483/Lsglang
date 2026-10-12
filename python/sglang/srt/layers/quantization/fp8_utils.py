@@ -14,6 +14,7 @@ from sglang.kernels.ops.gemm.fp8_kernel import (
     w8a8_block_fp8_matmul_triton,
 )
 from sglang.kernels.ops.quantization.fp8_kernel import (
+    fp8_dot_supported,
     fp8_dtype,
     fp8_max,
     fp8_min,
@@ -22,6 +23,7 @@ from sglang.kernels.ops.quantization.fp8_kernel import (
     scaled_fp8_quant,
     sglang_per_token_group_quant_fp8,
     sglang_per_token_group_quant_fp8_row_padded,
+    w8a8_block_fp8_matmul_w8a16,
     sglang_per_token_quant_fp8,
     static_quant_fp8,
 )
@@ -463,7 +465,24 @@ def _fake_flashinfer_mxfp8_quantize(
     return q_input, scale
 
 
-if get_platform().is_blackwell and is_flashinfer_available():
+@lru_cache(maxsize=1)
+def _any_blackwell_gpu_visible() -> bool:
+    # get_platform().is_blackwell reflects the *current* device, which on a
+    # mixed-arch host is still device 0 (a non-Blackwell chip) at import time, so
+    # an SM12x rank whose device is set later would never get the FlashInfer MXFP8
+    # ops below registered. Scan all CUDA_VISIBLE_DEVICES-visible GPUs instead so a
+    # rank that later lands on Blackwell finds them. Pure non-Blackwell hosts return
+    # False, so the guarded block stays skipped exactly as before (no new import).
+    try:
+        return torch.cuda.is_available() and any(
+            torch.cuda.get_device_capability(i)[0] in (10, 11, 12)
+            for i in range(torch.cuda.device_count())
+        )
+    except Exception:
+        return get_platform().is_blackwell
+
+
+if _any_blackwell_gpu_visible() and is_flashinfer_available():
     from flashinfer import SfLayout
     from flashinfer import mm_mxfp8 as _raw_flashinfer_mm_mxfp8
     from flashinfer import mxfp8_quantize as _raw_flashinfer_mxfp8_quantize
@@ -579,6 +598,16 @@ if get_platform().is_sm90 and is_flashinfer_available():
     from flashinfer.gemm import fp8_blockscale_gemm_sm90
 
 
+@lru_cache(maxsize=1)
+def _is_ada_sm89() -> bool:
+    """Ada (SM89) only: has fp8 tl.dot support but no split-K tuned configs."""
+    return (
+        _is_cuda
+        and torch.cuda.is_available()
+        and (torch.cuda.get_device_capability() == (8, 9))
+    )
+
+
 def dispatch_w8a8_block_fp8_linear(
     weight_block_size: Optional[List[int]] = None,
     act_scale_ue8m0: bool = False,
@@ -593,6 +622,39 @@ def dispatch_w8a8_block_fp8_linear(
     # Only Triton reads the block size at launch; DeepGEMM, the FlashInfer
     # groupwise kernels and CUTLASS take 128-wide K blocks only.
     if weight_block_size is not None and weight_block_size[1] != 128:
+        # Before Ada, Triton cannot compile an fp8 operand at all, so use the
+        # bf16-activation w8a16 kernel instead of the fp8-dot one.
+        if not fp8_dot_supported():
+            return sm8_w8a16_block_fp8_linear
+        if _is_ada_sm89():
+            # Ada: fp8-dot at prefill-M, w8a16 at decode-M (see auto backend).
+            def ada_block_fp8_linear(
+                input,
+                weight,
+                block_size,
+                weight_scale,
+                input_scale=None,
+                bias=None,
+            ):
+                m = input.numel() // input.shape[-1]
+                gemm = (
+                    sm8_w8a16_block_fp8_linear
+                    if m <= envs.SGLANG_SM89_W8A16_MAX_M.get()
+                    else partial(
+                        triton_w8a8_block_fp8_linear,
+                        act_scale_ue8m0=act_scale_ue8m0,
+                    )
+                )
+                return gemm(
+                    input=input,
+                    weight=weight,
+                    block_size=block_size,
+                    weight_scale=weight_scale,
+                    input_scale=input_scale,
+                    bias=bias,
+                )
+
+            return ada_block_fp8_linear
         return partial(triton_w8a8_block_fp8_linear, act_scale_ue8m0=act_scale_ue8m0)
 
     backend = get_fp8_gemm_runner_backend()
@@ -704,7 +766,18 @@ def resolve_mxfp8_dense_gemm_backend() -> Mxfp8DenseGemmBackend:
     if _is_hip and _is_gfx95_supported:
         return Mxfp8DenseGemmBackend.GFX95_DOT_SCALED
 
-    if get_platform().is_blackwell and is_flashinfer_available():
+    # The FlashInfer MXFP8 ops are registered at import time only under an
+    # import-time `is_blackwell` check. On a mixed-arch host a rank's device is
+    # set *after* this module is imported, so an SM12x rank that lands on
+    # Blackwell never registered those ops; referencing them here would raise
+    # NameError. Treat "ops not registered in this process" as no FlashInfer
+    # MXFP8 and fall through to the block-fp8 fallback. Same-arch hosts always
+    # have the ops registered here, so they are unaffected.
+    if (
+        get_platform().is_blackwell
+        and is_flashinfer_available()
+        and "_raw_flashinfer_mm_mxfp8" in globals()
+    ):
         if _raw_flashinfer_mm_mxfp8.is_backend_supported("cute-dsl", get_device_sm()):
             return Mxfp8DenseGemmBackend.FLASHINFER_CUTEDSL
         return Mxfp8DenseGemmBackend.FLASHINFER_CUTLASS
@@ -955,6 +1028,43 @@ def _dispatch_auto_backend() -> Callable:
     elif _is_xpu:
         return torch_w8a8_block_fp8_linear
     else:
+        # Before Ada, Triton cannot compile an fp8 operand at all, so use the
+        # bf16-activation w8a16 kernel instead of the fp8-dot one.
+        if not fp8_dot_supported():
+            return sm8_w8a16_block_fp8_linear
+        if _is_ada_sm89():
+            # Ada has fp8 tensor cores, so route by M instead of pinning w8a16:
+            # at decode-M(=1) the fp8-dot kernel only gets split-K from the
+            # SM90 tuned configs and under-parallelizes (weight-stream bound),
+            # where the split-K w8a16 kernel wins; above the crossover the step
+            # is compute-bound and Ada's fp8 tensor cores beat w8a16's bf16
+            # math, so verify / prefill go back to the fp8-dot kernel.
+            # Crossover = SGLANG_SM89_W8A16_MAX_M. Each CUDA graph bakes the
+            # kernel for its own M at capture time.
+            def ada_block_fp8_linear(
+                input,
+                weight,
+                block_size,
+                weight_scale,
+                input_scale=None,
+                bias=None,
+            ):
+                m = input.numel() // input.shape[-1]
+                gemm = (
+                    sm8_w8a16_block_fp8_linear
+                    if m <= envs.SGLANG_SM89_W8A16_MAX_M.get()
+                    else triton_w8a8_block_fp8_linear
+                )
+                return gemm(
+                    input=input,
+                    weight=weight,
+                    block_size=block_size,
+                    weight_scale=weight_scale,
+                    input_scale=input_scale,
+                    bias=bias,
+                )
+
+            return ada_block_fp8_linear
         return triton_w8a8_block_fp8_linear
 
 
@@ -1420,6 +1530,41 @@ def aiter_w8a8_block_fp8_linear(
     return output.to(
         dtype=torch.bfloat16 if input_scale is not None else input_2d.dtype
     ).view(*output_shape)
+
+
+def sm8_w8a16_block_fp8_linear(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    block_size: List[int],
+    weight_scale: torch.Tensor,
+    input_scale: Optional[torch.Tensor] = None,
+    bias: Optional[torch.Tensor] = None,
+    act_scale_ue8m0: bool = False,
+) -> torch.Tensor:
+    """Block-fp8 linear for CUDA GPUs before Ada, where Triton cannot compile
+    ``fp8e4nv`` at all and Marlin has no grouped kernel for 32-wide K groups.
+
+    Activations stay bf16 (the w8a16 contract Marlin implements on these GPUs,
+    so no extra accuracy loss versus the route this replaces) and the e4m3
+    weight bytes are decoded inside the kernel, so no fp8-typed tensor ever
+    reaches the Triton compiler.
+    """
+    assert input_scale is None, (
+        "pre-quantized fp8 activations are not supported before SM89 "
+        "(Triton cannot read fp8e4nv there)"
+    )
+    input_2d = input.view(-1, input.shape[-1])
+    output_shape = [*input.shape[:-1], weight.shape[0]]
+    output = w8a8_block_fp8_matmul_w8a16(
+        input_2d,
+        weight.view(torch.uint8),
+        weight_scale,
+        block_size,
+        output_dtype=input_2d.dtype,
+    )
+    if bias is not None:
+        output += bias
+    return output.view(*output_shape)
 
 
 def triton_w8a8_block_fp8_linear(

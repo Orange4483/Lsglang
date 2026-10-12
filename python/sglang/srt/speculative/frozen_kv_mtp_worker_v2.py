@@ -55,7 +55,7 @@ from sglang.srt.speculative.eagle_utils import (
     build_tree_kernel_efficient,
     organize_draft_results,
 )
-from sglang.srt.speculative.eagle_worker_v2 import EAGLEWorkerV2
+from sglang.srt.speculative.eagle_worker_v2 import EAGLEWorkerV2, _spec_probe
 from sglang.srt.speculative.frozen_kv_mtp_info import (
     FrozenKVMTPContext,
     FrozenKVMTPDraftInput,
@@ -446,6 +446,7 @@ class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
         stashed.num_tokens_for_logprob_per_req = 1
         return stashed
 
+    @_spec_probe.stage("draft")
     def draft(self, batch: ScheduleBatch):
         if batch.forward_mode.is_idle():
             return FrozenKVMTPVerifyInput.create_idle_input(

@@ -49,6 +49,12 @@ from sglang.srt.speculative.spec_utils import (
 from sglang.srt.utils import is_npu
 from sglang.srt.utils.invariants import Bucket, Invariant, NotNaN, expect
 
+import logging
+
+from sglang.srt.environ import envs
+
+logger = logging.getLogger(__name__)
+
 _is_npu = is_npu()
 
 # Draft proposal probs feeding rejection sampling; the data layer is the
@@ -772,7 +778,42 @@ class DsparkVerifyEpilogue:
         self.commit_lens_buf[:bs].copy_(finalized.commit_lens)
         self.new_seq_lens_buf[:bs].copy_(finalized.new_seq_lens)
         self.out_tokens_buf[:bs].copy_(out_tokens.view(bs, self.stride))
+        probe = envs.SGLANG_L2_PROBE_ACCEPT.get()
+        if probe and not torch.cuda.is_current_stream_capturing():
+            self._probe_accept(
+                bs, candidates, draft_tokens, finalized, logits, seq_lens
+            )
         return finalized.commit_lens
+
+    def _probe_accept(
+        self, bs, candidates, draft_tokens, finalized, logits, seq_lens
+    ) -> None:
+        # SGLANG_L2_PROBE_ACCEPT: distinguishes the three accept-rate-0
+        # failure shapes without a reflash: (a) draft stream garbage (draft
+        # ids never match target argmax), (b) target argmax degenerate (all
+        # same/eos-like), (c) accept fine but commit/seq_lens not advancing.
+        # Host syncs only happen while the probe is on.
+        n = getattr(self, "_probe_n", 0) + 1
+        self._probe_n = n
+        if n > 40 and n % 64:
+            return
+        stride = self.stride
+        cand = candidates[:bs, :stride].cpu()
+        tgt = logits[: bs * stride].argmax(dim=-1).view(bs, stride).cpu()
+        draft = draft_tokens[:bs, : min(3, draft_tokens.shape[1])].cpu()
+        logger.info(
+            "[l2-probe accept] step=%d draft0=%s cand0=%s tgt0=%s "
+            "match0=%s correct_len=%s commit=%s seq %s->%s",
+            n,
+            draft[0].tolist(),
+            cand[0, :stride].tolist(),
+            tgt[0, :stride].tolist(),
+            (cand == tgt)[0].int().tolist(),
+            self.correct_len_buf[:bs].cpu().tolist(),
+            finalized.commit_lens[:bs].cpu().tolist(),
+            seq_lens[:bs].cpu().tolist(),
+            finalized.new_seq_lens[:bs].cpu().tolist(),
+        )
 
     def _commit_inject(
         self, commit_lens, verify_lens, seq_lens, req_pool_indices, bs: int

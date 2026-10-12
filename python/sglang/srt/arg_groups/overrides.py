@@ -69,6 +69,9 @@ from sglang.srt.utils.common import (
     get_quantization_config,
     is_fi_a2a_supported,
     is_gfx95_supported,
+    is_hip,
+    is_npu,
+    is_xpu,
     xpu_has_xmx_support,
 )
 
@@ -637,6 +640,38 @@ def _dsa_split_backend_resolution(view: Any) -> dict:
         logger.warning(
             "Set DSA backends for GLM FP8 KV Cache on SM120/SM121: "
             f"prefill={backend}, decode={backend}."
+        )
+        return declared
+
+    # GLM-5.3-Flash (Glm5NextForConditionalGeneration) introduces
+    # index_kpool=4 + NoPE. On SM80/SM86/SM89 the sm120-only
+    # `flashinfer_sparse_mla` backend is unavailable, and the DeepGEMM-backed
+    # `flashmla_*` paths have no sm80 cubins. Default the whole DSA prefill +
+    # decode to the portable TileLang backend (pure Triton/TileLang, no
+    # sgl-kernel/DeepGEMM dependency, NoPE-capable) so it runs out of the box
+    # on Ampere/Ada-class GPUs. fp8 KV on SM8 is left to the general branch
+    # below (GLM-5.3 targets bf16 KV on this class of hardware).
+    is_glm5next_sm8_tilelang = (
+        model_arch
+        in (
+            "Glm5NextForConditionalGeneration",
+            "Glm5NextForConditionalGenerationNextN",
+        )
+        and major == 8
+        and kv_cache_dtype in ("bfloat16", "bf16")
+        and not is_hip()
+        and not is_npu()
+        and not is_xpu()
+    )
+    if is_glm5next_sm8_tilelang:
+        backend = "tilelang"
+        if not user_set_prefill:
+            declared["dsa_prefill_backend"] = backend
+        if not user_set_decode:
+            declared["dsa_decode_backend"] = backend
+        logger.warning(
+            "Set DSA backends for GLM-5.3 NoPE kpool on SM80/SM86/SM89 "
+            f"(bf16 KV): prefill={backend}, decode={backend}."
         )
         return declared
 

@@ -446,8 +446,28 @@ class Fp8Config(QuantizationConfig):
                 return Mxfp4HummingMoEMethod(fp8_method, prefix=prefix)
 
             if self.is_fp4_experts and get_moe_runner_backend().is_flashinfer_mxfp4():
+                from sglang.srt.utils.common import is_sm80_supported
+
+                # SM80/86/89 have no FlashInfer FP4 kernels at all (the FP4
+                # module only ships 90/100/103/107/110/120 builds), so the
+                # TRT-LLM method would die in process_weights_after_loading
+                # with "Invalid backend: 86" as soon as a layer is GPU-resident.
+                # Marlin W4A16 is the only on-GPU MXFP4 kernel for major 8.
+                if is_sm80_supported():
+                    from sglang.srt.layers.quantization.mxfp4_marlin_moe import (
+                        Mxfp4MarlinMoEMethod,
+                    )
+
+                    log_info_on_rank0(
+                        logger,
+                        "FlashInfer has no MXFP4 kernels on SM8x; using Marlin "
+                        f"as the effective MoE runner for {prefix}.",
+                    )
+                    return Mxfp4MarlinMoEMethod(fp8_method, prefix=prefix)
+
                 # SM100 uses TRT-LLM; SM90 uses W4A16 and SM120 uses MXFP8xMXFP4.
                 if get_platform().is_sm90 or get_platform().is_sm120:
+
                     from sglang.srt.layers.quantization.mxfp4_flashinfer_cutlass_moe import (
                         Mxfp4FlashinferCutlassMoEMethod,
                     )
@@ -505,6 +525,16 @@ class Fp8LinearMethod(LinearMethodBase):
             force_marlin = get_bool_env_var("SGLANG_FORCE_FP8_MARLIN")
             auto_enable = can_auto_enable_marlin_fp8()
             self.use_marlin = force_marlin or auto_enable
+        # Marlin's grouped fp8 kernels are only instantiated for group sizes
+        # -1 (per-tensor) and 128 (group_blocks == 8). A block-fp8 checkpoint
+        # with a 32-wide K block (MXFP8 semantics, ue8m0 scales) has no marlin
+        # kernel for any thread config and marlin raises instead of falling
+        # back, so leave those to the arch-agnostic Triton block-fp8 GEMM that
+        # dispatch_w8a8_block_fp8_linear already selects for them.
+        if self.use_marlin:
+            _wbs = self.quant_config.weight_block_size
+            if _wbs is not None and len(_wbs) == 2 and _wbs[1] not in (-1, 128):
+                self.use_marlin = False
 
         self.use_mxfp8 = getattr(self.quant_config, "use_mxfp8", False)
         self.block_quant = (

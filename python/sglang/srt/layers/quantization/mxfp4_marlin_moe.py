@@ -10,6 +10,11 @@ from sglang.srt.layers.moe.moe_runner.marlin import MarlinMoeQuantInfo
 from sglang.srt.layers.moe.utils import MoeRunnerBackend
 from sglang.srt.runtime_context import get_platform
 from sglang.srt.utils import log_info_on_rank0, round_up, set_weight_attrs
+from sglang.srt.utils.common import (
+    is_sm80_supported,
+    is_sm90_supported,
+    is_sm120_supported,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import CombineInput, DispatchOutput
@@ -67,7 +72,8 @@ class Mxfp4MarlinMoEMethod:
     ):
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
         device = torch.cuda.current_device()
-        if isinstance(layer, FusedMoE) and not layer.is_gpu_resident_layer:
+        cpu_resident = isinstance(layer, FusedMoE) and not layer.is_gpu_resident_layer
+        if cpu_resident:
             device = "cpu"
         from sglang.srt.layers.moe.fused_moe_triton import (
             FusedMoeWeightScaleSupported,
@@ -75,8 +81,16 @@ class Mxfp4MarlinMoEMethod:
 
         layer._dsv4_mxfp4_backend = None  # set in process_weights_after_loading
         fp4_block_k = 32
-        intermediate_size_per_partition = round_up(intermediate_size_per_partition, 128)
-        hidden_size = round_up(hidden_size, 256)
+        # Only the on-GPU path needs tile-aligned buffers, and Marlin repack pads
+        # to tiles by itself anyway.  A CPU-resident layer is handed to lk_moe as
+        # raw pointers plus the exact per-partition strides, so padding the
+        # allocation here would desync the loader (garbage past column 576 at
+        # TP=4) -- keep those buffers unpadded.
+        if not cpu_resident:
+            intermediate_size_per_partition = round_up(
+                intermediate_size_per_partition, 128
+            )
+            hidden_size = round_up(hidden_size, 256)
         self.hidden_pad = hidden_size - layer.hidden_size
 
         w13_weight = torch.nn.Parameter(
@@ -153,8 +167,8 @@ class Mxfp4MarlinMoEMethod:
         if getattr(layer, "_mega_moe_weights_built", False):
             return
 
-        if not get_platform().is_sm90 and not get_platform().is_sm120:
-            raise RuntimeError("MXFP4 Marlin requires SM90 or SM120.")
+        if not (is_sm80_supported() or is_sm90_supported() or is_sm120_supported()):
+            raise RuntimeError("MXFP4 Marlin requires SM80, SM90 or SM120.")
 
         if not check_moe_marlin_supports_layer(layer, 32, allow_tile_padding=True):
             raise RuntimeError(

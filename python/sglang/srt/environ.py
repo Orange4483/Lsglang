@@ -1547,6 +1547,14 @@ class Envs:
     # anonymous mapping per rank holding only its rows, gathered with the
     # all-reduce, and the only layout that gets huge pages without shmem THP.
     SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT = EnvStr("shared")
+    # cudaHostRegister the host tables at load (~40 s per 24 GiB of base
+    # pages). False keeps them pageable: startup skips the pin, lookups pay
+    # a host-page walk per row.
+    SGLANG_DSV41_ENGRAM_HOST_TABLE_PIN = EnvBool(True)
+    # Read-only diagnostics for the dspark accept-rate-0 triage: logs
+    # draft/candidate/target-argmax/commit/seq_lens on the verify accept
+    # step (host syncs only while enabled). Off = zero behavior change.
+    SGLANG_L2_PROBE_ACCEPT = EnvBool(False)
 
     # Kernels and indexer
     SGLANG_OPT_DEEPGEMM_HC_PRENORM = EnvBool(True)
@@ -1568,6 +1576,34 @@ class Envs:
     SGLANG_DSV41_TORCH_PREFILL_INDEXER = EnvBool(False)
     SGLANG_FP8_PAGED_MQA_LOGITS_TORCH = EnvBool(False)
     SGLANG_OPT_FLASHMLA_SPARSE_PREFILL = EnvBool(True)
+    # SM8x bmm+finish decode attention: heads fused per finish-kernel CTA
+    # (single pass, KV tile shared). 0 = legacy two-pass per-head kernel.
+    # Default 0 (legacy): the fused variant ships from an unfinished (wip)
+    # commit and the 0731-spec-accept regression triage keeps unverified
+    # numerics out of the default path until the A/B on GPU clears it.
+    SGLANG_SM8X_FINISH_HEADS_PER_CTA = EnvInt(0)
+    # SM8x bmm+finish: keep the score buffer in bf16 (tensor-core bmm + half
+    # finish read traffic). False = fp32 scores (legacy numerics).
+    # Default False: same provenance note as FINISH_HEADS_PER_CTA.
+    SGLANG_SM8X_SCORES_BF16 = EnvBool(False)
+    # Bound score chunks and the dense FP4 score allocation; bytes.
+    SGLANG_DSV41_INDEXER_SCORE_BUDGET_BYTES = EnvInt(1 << 30)
+    # Optional SM120 MXFP8 route for decode and DSpark verification.
+    SGLANG_SM120_MXFP8_B12X_SMALL_BATCH = EnvBool(False)
+    # Exact, bounded-memory lookup from an immutable local safetensors shard.
+    # Cache and staging limits are per Engram layer, in bytes.
+    SGLANG_ENABLE_DSV41_ENGRAM_NVME = EnvBool(False)
+    SGLANG_DSV41_ENGRAM_NVME_CACHE_BYTES = EnvInt(1 << 30)
+    SGLANG_DSV41_ENGRAM_NVME_STAGING_BYTES = EnvInt(128 << 20)
+    # Diagnostic: disable the decode-only side streams (early compress/indexer
+    # sources on Blackwell, hc-mix stats stream, engram KV prefetch) so a plain
+    # decode step matches the SM80/86 single-stream structure for A/B.
+    SGLANG_DSV41_DISABLE_DECODE_SIDE_STREAMS = EnvBool(False)
+    # Ada (SM89) dense block-fp8 linear crossover: use the split-K w8a16 kernel for
+    # GEMMs with at most this many rows (decode, weight-bound) and the fp8-dot Triton
+    # kernel above it (DSPARK verify / prefill, compute-bound, where Ada's fp8 tensor
+    # cores beat w8a16's bf16 math). Keep it below block_size * min_verify_batch.
+    SGLANG_SM89_W8A16_MAX_M = EnvInt(4)
 
     # cache, GEMM, and distributed
     SGLANG_OPT_FP8_WO_A_GEMM = EnvBool(True)

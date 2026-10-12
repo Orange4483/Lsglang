@@ -53,6 +53,29 @@ def get_flashinfer_autotune_skip_ops(model_runner: ModelRunner) -> set[str]:
     return skip_ops
 
 
+def _tp_group_autotune_gate(model_runner: ModelRunner, local_needs: bool) -> bool:
+    """Whether the whole TP group agrees to run flashinfer autotune.
+
+    FlashInfer autotune must be enabled/disabled identically on every TP rank:
+    they run the same dummy forward and reduce timings over the TP group. A
+    per-process check is fine for homogeneous TP, but deadlocks heterogeneous
+    groups (e.g. mixed SM86 + SM120): hardware-dependent local predicates
+    (capability probes, hardware-auto-selected gemm backends) can diverge, and
+    the diverging ranks skip the decision collective entirely and block in a
+    capture barrier while the others block in its all_gather. Resolve BOTH the
+    sm-major gate and the needs flag (min/all == common denominator) over the
+    TP group, reached unconditionally, so every rank agrees.
+    """
+    local = (torch.cuda.get_device_capability()[0], local_needs)
+    tp_group = model_runner.tp_group
+    if tp_group is None or tp_group.world_size <= 1:
+        return local[0] >= 9 and local_needs
+    group = tp_group.cpu_group
+    gathered = [None] * tp_group.world_size
+    torch.distributed.all_gather_object(gathered, local, group=group)
+    return min(m for m, _ in gathered) >= 9 and all(n for _, n in gathered)
+
+
 def should_run_flashinfer_autotune(
     model_runner: ModelRunner, *, for_speculative_draft: bool = False
 ) -> bool:
@@ -83,12 +106,11 @@ def should_run_flashinfer_autotune(
     # the configured backends -- the draft leaves (`get_spec()`) or the target
     # leaves (`get_exec().moe`) above. CuteDSL v1 bypasses MoeRunner, and its
     # dummy dispatch can exceed DeepEP low-latency's token limit.
-    if backend_str == "flashinfer_cutedsl" and a2a_backend_str == "deepep":
-        return False
+    needs_local = not (backend_str == "flashinfer_cutedsl" and a2a_backend_str == "deepep")
 
     # TODO smor- support other cases for flashinfer autotune, such as, mamba backend
 
-    moe_needs_autotune = backend_str in [
+    moe_needs_autotune = needs_local and backend_str in [
         "flashinfer_trtllm",
         "flashinfer_trtllm_routed",
         "flashinfer_mxfp4",
@@ -105,9 +127,13 @@ def should_run_flashinfer_autotune(
         "modelopt_fp4",
         "modelopt_mixed",
     )
-    fp4_gemm_needs_autotune = model_uses_fp4 and (
-        get_fp4_gemm_runner_backend().is_flashinfer_cutlass()
-        or get_fp4_gemm_runner_backend().is_flashinfer_cutedsl()
+    fp4_gemm_needs_autotune = (
+        needs_local
+        and model_uses_fp4
+        and (
+            get_fp4_gemm_runner_backend().is_flashinfer_cutlass()
+            or get_fp4_gemm_runner_backend().is_flashinfer_cutedsl()
+        )
     )
 
     from sglang.srt.layers.quantization.fp8_utils import (
@@ -115,17 +141,22 @@ def should_run_flashinfer_autotune(
         resolve_mxfp8_dense_gemm_backend,
     )
 
-    if model_quantization == "mxfp8":
+    if needs_local and model_quantization == "mxfp8":
         fp8_gemm_needs_autotune = resolve_mxfp8_dense_gemm_backend().is_flashinfer()
-    elif model_quantization in ("modelopt", "modelopt_fp8", "modelopt_mixed"):
+    elif (
+        needs_local
+        and model_quantization in ("modelopt", "modelopt_fp8", "modelopt_mixed")
+    ):
         fp8_gemm_needs_autotune = flashinfer_per_tensor_fp8_supported()
     else:
         fp8_gemm_needs_autotune = False
 
-    if not (moe_needs_autotune or fp4_gemm_needs_autotune or fp8_gemm_needs_autotune):
-        return False
+    needs_local = moe_needs_autotune or fp4_gemm_needs_autotune or fp8_gemm_needs_autotune
 
-    if torch.cuda.get_device_capability()[0] < 9:
+    # NOTE: the local predicates above (hardware probes, hardware-auto-selected
+    # gemm backends) can diverge across ranks on heterogeneous TP hosts, so
+    # every rank must reach this group gate regardless of its local answer.
+    if not _tp_group_autotune_gate(model_runner, needs_local):
         return False
 
     if mr.spec_algorithm.is_speculative():
