@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+export LOG=${LOG:-/tmp/opencode/serve_logs/$(basename "$0" .sh)_$(date +%m%d_%H%M%S).log}
+mkdir -p /tmp/opencode/serve_logs
+exec > >(tee -a "$LOG") 2>&1
+# DeepSeek-V4-Flash-0731 · 2× RTX 3090 (SM86), TP2, plain decode.
+
+CUDA_DEVICE_ORDER=PCI_BUS_ID \
+GLOO_SOCKET_IFNAME=lo NCCL_SOCKET_IFNAME=lo \
+CUDA_VISIBLE_DEVICES=0,3 \
+LK_MOE_HYBRID_ENABLED=1 \
+LK_THREADS=48 \
+OMP_NUM_THREADS=1 \
+LK_THREAD_BINDING=CPU_CORE \
+LK_GPU_PREFETCH_WINDOW=1 \
+GLIBC_TUNABLES=glibc.malloc.thp_enabled=0 \
+LK_GPU_PREFILL_MIN_TOKENS=1024 \
+LK_GPU_PREFILL_SUB_M=16384 \
+LK_NUMA_INTERLEAVE=1 \
+LK_POWER_SAVING=1 \
+LK_GPU_RESIDENT_MOE_LAYERS="" \
+LK_POOL_SLOTS=0 \
+SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0 \
+SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE=1 \
+SGLANG_SKIP_P2P_CHECK=1 \
+FLASHINFER_DISABLE_VERSION_CHECK=1 \
+sglang serve \
+  --model ~/Downloads/DeepSeek-V4-Flash-0731 \
+  --served-model-name DeepSeek-V4-Flash-0731 \
+  --host 0.0.0.0 \
+  --port 8070 \
+  --trust-remote-code \
+  --tensor-parallel-size 2 \
+  --max-running-requests 2 \
+  --disable-shared-experts-fusion \
+  --disable-custom-all-reduce \
+  --chunked-prefill-size 8192 \
+  --max-total-tokens 262144 \
+  --mem-fraction-static 0.86 \
+  --cuda-graph-backend-prefill disabled \
