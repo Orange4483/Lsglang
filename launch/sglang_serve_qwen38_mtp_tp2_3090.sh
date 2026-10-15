@@ -21,9 +21,7 @@ LK_NUMA_INTERLEAVE=1 \
 LK_POWER_SAVING=1 \
 LK_GPU_RESIDENT_MOE_LAYERS="" \
 LK_GPU_RESIDENT_MOE_LAYERS_SPEC="" \
-LK_POOL_SLOTS=32 \
-LK_POOL_WINDOW=32 \
-LK_POOL_INFLIGHT=16 \
+LK_POOL_SLOTS=96 \
 LK_POOL_LOG=0 \
 FLASHINFER_DISABLE_VERSION_CHECK=1 \
 sglang serve \
@@ -38,9 +36,9 @@ sglang serve \
   --disable-custom-all-reduce \
   --ple-offload-embedding \
   --ple-offload-backend pinned \
-  --chunked-prefill-size 16384 \
+  --chunked-prefill-size 1024 \
   --max-total-tokens 262144 \
-  --mem-fraction-static 0.90 \
+  --mem-fraction-static 0.95 \
   --warmups prefill_shapes \
   --mm-feature-transport=cpu \
   --mm-attention-backend flashinfer_cudnn \
