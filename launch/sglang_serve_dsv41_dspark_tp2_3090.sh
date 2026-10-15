@@ -32,8 +32,6 @@ sglang serve \
   --max-running-requests 2 \
   --disable-shared-experts-fusion \
   --disable-custom-all-reduce \
-  --ple-offload-embedding \
-  --ple-offload-backend pinned \
   --chunked-prefill-size 4096 \
   --max-total-tokens 40000 \
   --mem-fraction-static 0.90 \
