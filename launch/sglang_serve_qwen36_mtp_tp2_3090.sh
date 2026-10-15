@@ -6,13 +6,13 @@ CUDA_VISIBLE_DEVICES=0,3 \
 SGLANG_SKIP_P2P_CHECK=1 \
 SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0 \
 LK_MOE_HYBRID_ENABLED=1 \
-LK_THREAD_BINDING=NUMA_NODE \
+LK_THREAD_BINDING=CPU_CORE \
 LK_THREADS=48 \
 OMP_NUM_THREADS=1 \
 LK_POWER_SAVING=1 \
 LK_NUMA_INTERLEAVE=1 \
 LK_GPU_PREFILL_MIN_TOKENS=1024 \
-LK_GPU_PREFILL_SUB_M=65536 \
+LK_GPU_PREFILL_SUB_M=32768 \
 LK_GPU_RESIDENT_MOE_LAYERS=0-1,33-34 \
 LK_POOL_SLOTS=128 \
 sglang serve \
@@ -23,9 +23,9 @@ sglang serve \
     --trust-remote-code \
     --tensor-parallel-size 2 \
     --max-running-requests 2 \
-    --chunked-prefill-size 32768 \
-    --max-total-tokens 26000 \
-    --mem-fraction-static 0.90 \
+    --chunked-prefill-size 1024 \
+    --max-total-tokens 262144 \
+    --mem-fraction-static 0.95 \
     --tool-call-parser auto \
     --reasoning-parser auto \
     --disable-shared-experts-fusion \
