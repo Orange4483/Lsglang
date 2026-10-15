@@ -4141,6 +4141,28 @@ class DeepseekV4AttnBackend(
             and get_parallel().attn_cp_size == 1
             and self.token_to_kv_pool.request_window is None
         )
+        if not getattr(DeepseekV4AttnBackend, "_pages_warmed", False):
+            DeepseekV4AttnBackend._pages_warmed = True
+            BuildPageTablePositions.execute(
+                req_to_token=req_to_token[:2, :8],
+                req_pool_indices_repeated=req_pool_indices_repeated[:2],
+                seq_lens_casual=seq_lens_casual[:2],
+                max_seq_len=max_seq_len,
+                page_size=self.page_size,
+                swa_window=SWA_WINDOW,
+            )
+            # +17 = the OTHER int-arg divisibility class of the same kernel
+            # (div-by-16 vs not); loading a fresh specialization later under
+            # live pump H2D stalls the ctx (GSP RPC family) -- pay both here,
+            # boot-time idle. Bounds stay >= seq_len, so no read hazard.
+            BuildPageTablePositions.execute(
+                req_to_token=req_to_token[:2, :8],
+                req_pool_indices_repeated=req_pool_indices_repeated[:2],
+                seq_lens_casual=seq_lens_casual[:2],
+                max_seq_len=max_seq_len + 17,
+                page_size=self.page_size,
+                swa_window=SWA_WINDOW,
+            )
         build_pages = BuildPageTablePositions.execute
         if small_metadata:
             from sglang.kernels.ops.attention.dsv4.metadata_kernel import (

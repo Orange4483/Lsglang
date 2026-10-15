@@ -38,6 +38,7 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 from typing import Optional, Sequence
 
+import numpy as np
 import torch
 
 from sglang.srt.environ import envs
@@ -48,7 +49,7 @@ _LIBC: Optional[ctypes.CDLL] = None
 _SMAPS_HEADER = re.compile(r"^([0-9a-f]+)-([0-9a-f]+) ")
 _SMAPS_RSS = re.compile(r"^Rss:\s+(\d+) kB")
 
-PLE_OFFLOAD_BACKENDS = ("pinned", "file")
+PLE_OFFLOAD_BACKENDS = ("pinned", "file", "nvme")
 
 # cudaDeviceAttr enum values (cuda_runtime_api.h).
 _CUDA_DEV_ATTR_PAGEABLE_MEMORY_ACCESS_USES_HOST_PAGE_TABLES = 100
@@ -222,6 +223,81 @@ class PleFileRssTrimmer:
         self._stop.set()
 
 
+class PleNvmeReader:
+    """NVMe-resident table reads for the nvme backend (harness level).
+
+    The table bytes live on disk: after the loader's write pass the mapping
+    is purged (MADV_DONTNEED, chunked like the trimmer) and every later
+    host-side row read goes through pread -- buffered reads of 160B rows,
+    page faults never enter the access path. The VRAM hot cache in front of
+    it is mandatory; steady-state disk traffic is ~10 MB/hour (measured
+    trace: ple_sim small-ram). Production form moves this into lk_moe's
+    fill thread (sorted ring -> batch read -> pinned staging -> H2D).
+    """
+
+    def __init__(self, path: str, nbytes: int, row_bytes: int,
+                 map_addr: int = 0) -> None:
+        self._fd = os.open(path, os.O_RDONLY)
+        self.path = path
+        self._nbytes = int(nbytes)
+        self._map_addr = int(map_addr)
+        self.row_bytes = int(row_bytes)
+        self._purged = False
+
+    def purge_after_load(self) -> None:
+        if self._purged or self._map_addr == 0:
+            return
+        for offset in range(0, self._nbytes, PLE_FILE_RSS_TRIM_CHUNK_BYTES):
+            _madvise(
+                self._map_addr + offset,
+                min(PLE_FILE_RSS_TRIM_CHUNK_BYTES, self._nbytes - offset),
+                _MADV_DONTNEED,
+            )
+        self._purged = True
+        logger.info(
+            "PLE table: nvme purge released the loader mapping (%.1f GiB of "
+            "page cache no longer attributed to this process)",
+            self._nbytes / 2**30,
+        )
+
+    def read_rows(self, rows_np, out_np) -> None:
+        """rows_np: sorted+unique local row indices; out_np:
+        [n, row_bytes] uint8 destination. Contiguous runs share one pread."""
+        fd, rb = self._fd, self.row_bytes
+        n = len(rows_np)
+        i = 0
+        while i < n:
+            run_start = int(rows_np[i])
+            k = i
+            while k < n and int(rows_np[k]) == run_start + (k - i):
+                k += 1
+            m = k - i
+            buf = np.frombuffer(os.pread(fd, m * rb, run_start * rb), dtype=np.uint8)
+            out_np[i:k] = buf.reshape(m, rb)
+            i = k
+
+    def close(self) -> None:
+        try:
+            os.close(self._fd)
+        except OSError:
+            pass
+
+
+def ple_backend(table: torch.Tensor) -> Optional[str]:
+    """Offload backend of a PLE host table: "file", "nvme", or None."""
+    return getattr(table, "_sglang_ple_backend", None)
+
+
+def make_ple_nvme_reader(table: torch.Tensor) -> Optional[PleNvmeReader]:
+    if ple_backend(table) != "nvme":
+        return None
+    path = getattr(table, "_sglang_ple_file_path", None)
+    if path is None:
+        return None
+    row_bytes = int(torch.empty(0, dtype=table.dtype).element_size()) * int(table.shape[-1])
+    return PleNvmeReader(path, int(table._sglang_ple_nbytes), row_bytes, int(table._sglang_ple_addr))
+
+
 def allocate_ple_host_table(
     shape: Sequence[int],
     dtype: torch.dtype,
@@ -254,20 +330,73 @@ def allocate_ple_host_table(
         # Sparse: only pages that get written take disk space.
         with open(path, "wb") as f:
             f.truncate(nbytes)
-    logger.info(
-        "PLE table: file-backed mmap %s (%.1f GiB, %s)", path, nbytes / 2**30, dtype
-    )
     storage = torch.from_file(path, shared=True, size=nbytes, dtype=torch.uint8)
-    _madvise_random(storage, nbytes)
+    if backend != "nvme":
+        _madvise_random(storage, nbytes)
     table = storage.view(dtype).view(*[int(d) for d in shape])
     table._sglang_ple_file_path = path  # consumed by PleFilePrefetcher
+    table._sglang_ple_backend = backend  # switched on by ple_backend()
+    if backend == "nvme":
+        # The loader writes through this mapping once; later reads go through
+        # pread and the mapping is purged (PleNvmeReader).
+        table._sglang_ple_nbytes = int(nbytes)
+        table._sglang_ple_addr = int(storage.data_ptr())
+        logger.info(
+            "PLE table: nvme-resident %s (%.1f GiB, %s)", path, nbytes / 2**30, dtype
+        )
+    else:
+        logger.info(
+            "PLE table: file-backed mmap %s (%.1f GiB, %s)", path, nbytes / 2**30, dtype
+        )
     return table
+
+
+def ple_nvme_matches_checkpoint(
+    path: str, row_bytes: int, row_start: int, row_end: int,
+    ckpt_rows: torch.Tensor, probes: int = 64,
+) -> bool:
+    """Spot-check that an on-disk nvme table still matches this checkpoint.
+
+    Reads `probes` deterministic rows of [row_start, row_end) straight from
+    the file and compares them against the checkpoint shard. An all-zero
+    probe row fails: an interrupted first boot leaves sparse zeros exactly
+    where this shard did not get copied, so a zero row must not be trusted.
+    Rows of the checkpoint itself that are all zero only cost a (harmless)
+    full rewrite.
+    """
+    try:
+        import torch
+        fd = os.open(path, os.O_RDONLY)
+    except OSError:
+        return False
+    try:
+        n = row_end - row_start
+        if n <= 0 or ckpt_rows.numel() == 0:
+            return False
+        step = max(1, n // probes)
+        rows = list(range(row_start, row_end, step))[:probes]
+        for r in rows:
+            got = os.pread(fd, row_bytes, r * row_bytes)
+            if len(got) != row_bytes:
+                return False
+            row = ckpt_rows[r - row_start].contiguous()
+            if row.dtype != torch.uint8:
+                row = row.view(torch.uint8)
+            if got != row.numpy().tobytes():
+                return False
+        return True
+    except Exception:
+        return False
+    finally:
+        os.close(fd)
 
 
 def make_ple_file_prefetcher(table: torch.Tensor) -> Optional[PleFilePrefetcher]:
     """A prefetcher for a table returned by ``allocate_ple_host_table(..., "file")``."""
     path = getattr(table, "_sglang_ple_file_path", None)
-    if path is None or not envs.SGLANG_QWEN4_PLE_FILE_PREFETCH.get():
+    if path is None or ple_backend(table) != "file":
+        return None  # nvme reads via pread, never through the mapping
+    if not envs.SGLANG_QWEN4_PLE_FILE_PREFETCH.get():
         return None
     row_bytes = (
         int(table.shape[-1]) * table.element_size()
@@ -290,8 +419,8 @@ def make_ple_file_rss_trimmer(table: torch.Tensor) -> Optional[PleFileRssTrimmer
     where the resident set cannot be read (no ``/proc/self/smaps``).
     """
     path = getattr(table, "_sglang_ple_file_path", None)
-    if path is None:
-        return None
+    if path is None or ple_backend(table) == "nvme":
+        return None  # nvme purges the loader mapping once instead
     budget_gb = float(envs.SGLANG_QWEN4_PLE_FILE_RSS_BUDGET_GB.get())
     if budget_gb <= 0:
         return None

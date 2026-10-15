@@ -77,12 +77,145 @@ from sglang.srt.models.qwen4_exp_ple_table import (
 )
 from sglang.srt.runtime_context import get_parallel, get_schedule
 from sglang.srt.utils import get_bool_env_var, get_int_env_var, get_super_chunk_size, is_hip, logger
+from sglang.srt.utils.common import lk_nvme_cache_bytes, lk_nvme_direct
 
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
 
 # Decode/verify-sized batches only: at prefill sizes both chains are compute
 # bound and serializing them on one stream is faster than contending.
 _QSA_INDEXER_OVERLAP_TOKEN_THRESHOLD = 1024
+
+
+class _PleProbe:
+    """LK_PLE_PROBE=1: PLE ngram-row temporal locality + traffic probe.
+
+    Samples gather row ids (every 4th) and reports, per 512K-sample window:
+    window unique %, per-mode (P/D/V) look, reuse@{64K,256K,2048K} (hit@N
+    style reuse-distance window), 2t@1K (same row within 1K positions),
+    TP ownership %, and fetched-bytes rate. Run with --disable-cuda-graph:
+    inside a captured graph the gather never re-runs on replay, so decode
+    samples would silently vanish.
+    """
+
+    _GRID = (65536, 262144, 2097152)
+    _TWO = 1024
+    _RING = 1 << 23
+    _WINDOW = 1 << 19
+
+    def __init__(self):
+        import array
+        import os
+        import time
+
+        self.time = time
+        self.t0 = time.time()
+        self.last = {}
+        self.ring = array.array("q", [-1]) * self._RING
+        self.mask = self._RING - 1
+        self.pos = 0
+        self.modes = ("P", "D", "V")
+        self.look = dict.fromkeys(self.modes, 0)
+        self.lookw = dict.fromkeys(self.modes, 0)
+        self.reuse = {m: [0] * len(self._GRID) for m in self.modes}
+        self.two = dict.fromkeys(self.modes, 0)
+        self.tp = dict.fromkeys(self.modes, 0)
+        self.uniq = set()
+        self.nsamp = 0
+        self.row_bytes = 0
+        self.mode = "P"
+        self.tlast = time.time()
+        from sglang.srt.utils.common import get_lk_ple_probe_dump_path
+        self.dump = get_lk_ple_probe_dump_path()
+        self.pending = []
+        self.win = 0
+
+    def set_mode(self, mode):
+        self.mode = "V" if mode.is_target_verify() else "D" if mode.is_decode() else "P"
+
+    def record(self, flat_ids, emb):
+        if not self.row_bytes:
+            self.row_bytes = emb.weight.nbytes // max(1, emb.weight.shape[0])
+        s = flat_ids[: (1 << 22)][0::4]
+        if s.numel() > (1 << 19):
+            s = s[: (1 << 19)]
+        if self.dump:
+            self.pending.append((self.mode, s.cpu().numpy()))
+        vs = emb.shard_indices.org_vocab_start_index
+        ve = emb.shard_indices.org_vocab_end_index
+        m = self.mode
+        last = self.last
+        ring = self.ring
+        mask = self.mask
+        uniq = self.uniq
+        grid = self._GRID
+        reuse = self.reuse[m]
+        pos = self.pos
+        self.look[m] += s.numel()
+        self.lookw[m] += s.numel()
+        self.nsamp += s.numel()
+        for r in s.tolist():
+            uniq.add(r)
+            p = last.get(r)
+            if p is not None:
+                d = pos - p
+                for gi in range(len(grid)):
+                    if d < grid[gi]:
+                        reuse[gi] += 1
+                if d <= self._TWO:
+                    self.two[m] += 1
+            last[r] = pos
+            old = ring[pos & mask]
+            if old != -1:
+                last.pop(old, None)
+            ring[pos & mask] = r
+            if vs <= r < ve:
+                self.tp[m] += 1
+            pos += 1
+        self.pos = pos
+        if self.nsamp >= self._WINDOW or (
+            self.nsamp and self.time.time() - self.tlast > 20
+        ):
+            self.log()
+
+    def log(self):
+        if self.dump and self.pending:
+            import numpy as np
+
+            np.savez(
+                f"{self.dump}/w{self.win}.npz",
+                **{
+                    m: np.concatenate([a for mm, a in self.pending if mm == m])
+                    for m in self.modes
+                    if any(mm == m for mm, _ in self.pending)
+                },
+            )
+            self.pending = []
+            self.win += 1
+        tot = self.nsamp or 1
+        parts = [f"[ple] t={self.time.time() - self.t0:.0f}s samp={self.nsamp} uniq={len(self.uniq) * 100 // tot}%"]
+        for m in self.modes:
+            lk = self.lookw[m]
+            if lk:
+                rs = " ".join(
+                    f"@{g // 1024}K={c * 100 // lk}%" for g, c in zip(self._GRID, self.reuse[m])
+                )
+                parts.append(
+                    f"{m}:look={lk} reuse{rs} 2t={self.two[m] * 100 // lk}% tp={self.tp[m] * 100 // lk}%"
+                )
+        parts.append(f"fetch={self.nsamp * self.row_bytes // 1048576}MB/w")
+        logger.info(" ".join(parts))
+        self.tlast = self.time.time()
+        self.nsamp = 0
+        self.uniq.clear()
+        for m in self.modes:
+            self.lookw[m] = 0
+            self.reuse[m] = [0] * len(self._GRID)
+            self.two[m] = 0
+            self.tp[m] = 0
+
+
+from sglang.srt.utils.common import is_lk_ple_probe_enabled as _lk_ple_probe_enabled
+_PLE_PROBE = _PleProbe() if _lk_ple_probe_enabled() else None
 
 
 def _ple_table_is_fp8(
@@ -161,6 +294,8 @@ def _prepare_ple_batch(
         raise NotImplementedError("Qwen4 PLE speculative decoding supports only topk=1")
 
     mode = _get_ple_forward_mode(forward_batch)
+    if _PLE_PROBE is not None:
+        _PLE_PROBE.set_mode(mode)
     get_req_to_token_pool().ple_window_cache = None
     if mode.is_idle():
         return None
@@ -387,7 +522,7 @@ def _ple_track_targets(
     return dst, aligned[:rows].clamp(min=0).minimum(batch.lengths)
 
 
-def _ple_conv_block_tokens() -> int:
+def _ple_conv_block_tokens(conv_channels: int) -> int:
     """Token budget for one padded-conv pass. A super-chunk forward keeps the
     dense [rows, row_width, C] intermediates at the inner chunk size instead
     of the full CAP; matches the attention backend's inner loop knob.
@@ -395,10 +530,13 @@ def _ple_conv_block_tokens() -> int:
     The shell's per-block temporaries (projections, norms, gated value) are
     the last block-scale peak inside the loop, so this one knob may go below
     the attention inner size without touching any other component (the pass
-    is row-parallel; bit-parity is block-size independent)."""
-    override = get_int_env_var("SGLANG_PLE_BLOCK_TOKENS")
-    if override > 0:
-        return override
+    is row-parallel; bit-parity is block-size independent).
+
+    LK_PLE_BLOCK_MB overrides with a TEMPORARY-MEMORY budget (bf16 temporaries
+    are ~6 bytes per token per channel: padded_seq + conv_input + conv_output)."""
+    mb = get_int_env_var("LK_PLE_BLOCK_MB")
+    if mb > 0:
+        return max(1, (mb << 20) // (6 * max(1, conv_channels)))
     size = get_schedule().chunked_prefill_size or 0
     return size if size > 0 else 8192
 
@@ -819,6 +957,92 @@ def _gather_ple_embedding_from_pinned_kernel(
     )
 
 
+
+@triton.jit
+def _ple_nvme_lookup(ids_ptr, out_ptr, tag_ptr, rows_ptr, d_ticket_ptr,
+                     h_ring_ptr, h_cnt_ptr, stat_ptr,
+                     S, rb, ring_mask, vlo, vhi, dim,
+                     is_fp8: tl.constexpr, BLOCK_D: tl.constexpr):
+    r = tl.program_id(0)
+    id = tl.load(ids_ptr + r)
+    offs = tl.arange(0, BLOCK_D)
+    mask = offs < dim
+    h_cnt = h_cnt_ptr.to(tl.pointer_type(tl.int64))
+    h_ring = h_ring_ptr.to(tl.pointer_type(tl.int64))
+    tl.atomic_add(stat_ptr, 1)
+    owned = (id >= vlo) & (id < vhi)
+    if owned:
+        slot = id % S
+        t = tl.load(tag_ptr + slot)
+        if t == id:
+            tl.atomic_add(stat_ptr + 1, 1)
+            if is_fp8:
+                raw = tl.load(rows_ptr + slot * rb + offs, mask=mask, other=0)
+                vals = e4m3fn_u8_to_f32(raw).to(tl.bfloat16)
+            else:
+                bp = rows_ptr.to(tl.int64).to(tl.pointer_type(tl.bfloat16))
+                vals = tl.load(bp + slot * (rb // 2) + offs, mask=mask)
+            tl.store(out_ptr + r * dim + offs, vals, mask=mask)
+        else:
+            tl.store(tag_ptr + slot, id | -(1 << 63))
+            pos = tl.atomic_add(h_cnt, 1)
+            tl.store(h_ring + (pos & ring_mask), id)
+            tl.store(d_ticket_ptr + r, pos)
+            tl.store(out_ptr + r * dim + offs, tl.zeros([BLOCK_D], tl.bfloat16),
+                     mask=mask)
+    else:
+        tl.store(out_ptr + r * dim + offs, tl.zeros([BLOCK_D], tl.bfloat16),
+                 mask=mask)
+
+
+@triton.jit
+def _ple_nvme_merge(ids_ptr, out_ptr, tag_ptr, rows_ptr, d_ticket_ptr,
+                    h_stage_ptr, stat_ptr,
+                    S, rb, stage_mask, vlo, vhi, dim,
+                    is_fp8: tl.constexpr, BLOCK_D: tl.constexpr,
+                    BAD: tl.constexpr):
+    r = tl.program_id(0)
+    id = tl.load(ids_ptr + r)
+    offs = tl.arange(0, BLOCK_D)
+    mask = offs < dim
+    owned = (id >= vlo) & (id < vhi)
+    if owned:
+        slot = id % S
+        t = tl.load(tag_ptr + slot)
+        if t == id:
+            if is_fp8:
+                raw = tl.load(rows_ptr + slot * rb + offs, mask=mask, other=0)
+                vals = e4m3fn_u8_to_f32(raw).to(tl.bfloat16)
+            else:
+                bp = rows_ptr.to(tl.int64).to(tl.pointer_type(tl.bfloat16))
+                vals = tl.load(bp + slot * (rb // 2) + offs, mask=mask)
+            tl.store(out_ptr + r * dim + offs, vals, mask=mask)
+        else:
+            h_stg = h_stage_ptr.to(tl.pointer_type(tl.uint8))
+            tk = tl.load(d_ticket_ptr + r)
+            raw = tl.load(h_stg + (tk & stage_mask) * rb + offs, mask=mask,
+                          other=0)
+            if BAD:
+                if tl.min(tl.where(mask, (raw == 255).to(tl.int32), 1)) == 1:
+                    tl.atomic_add(stat_ptr + 2, 1)
+            if is_fp8:
+                vals = e4m3fn_u8_to_f32(raw).to(tl.bfloat16)
+                rp = rows_ptr.to(tl.int64).to(tl.pointer_type(tl.uint8))
+                tl.store(rp + slot * rb + offs, raw, mask=mask)
+            else:
+                bp = h_stage_ptr.to(tl.int64).to(tl.pointer_type(tl.bfloat16))
+                vals = tl.load(bp + (tk & stage_mask) * (rb // 2) + offs,
+                               mask=mask)
+                rp = rows_ptr.to(tl.int64).to(tl.pointer_type(tl.bfloat16))
+                tl.store(rp + slot * (rb // 2) + offs, vals, mask=mask)
+            tl.store(tag_ptr + slot, id)
+            tl.store(out_ptr + r * dim + offs, vals, mask=mask)
+    else:
+        tl.store(out_ptr + r * dim + offs, tl.zeros([BLOCK_D], tl.bfloat16),
+                 mask=mask)
+
+
+
 class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
     """PLE table read directly from host memory (pinned, or a file-backed mmap).
 
@@ -891,6 +1115,12 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
         # ... and only it needs its resident set bounded: a fault maps a whole
         # folio, so the mapping would otherwise creep towards the full table.
         self._file_rss_trimmer = make_ple_file_rss_trimmer(host_table)
+        from sglang.srt.models.qwen4_exp_ple_table import make_ple_nvme_reader
+        self._nvme_reader = make_ple_nvme_reader(host_table)
+        self._nvme = self._nvme_reader is not None
+        self._nvme_purged = False
+        # None = not checked yet; True/False = verified against checkpoint disk.
+        self._nvme_skip_verified: Optional[bool] = None
         cpu_weight = nn.Parameter(host_table, requires_grad=False)
         for name, value in vars(source_weight).items():
             setattr(cpu_weight, name, value)
@@ -901,6 +1131,19 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
         self.register_buffer("weight_scale", embedding.weight_scale, persistent=True)
         del embedding.weight
         self._block_d = triton.next_power_of_2(self.embedding_dim)
+        # V0 VRAM bypass cache (measurement harness; the production engine
+        # belongs in lk_moe). Decode-path only, eager only. NOTE (design
+        # principles): the V0 gather path pays two per-step syncs that the
+        # production kernel must not have — ids .cpu() (host tag lookup) and
+        # the inline host->VRAM fill copy. The cache is not a standalone knob:
+        # it is intrinsic to the nvme backend (the table lives on disk; the
+        # VRAM tag cache + fill is the access path). pinned/file stay as-is.
+        # N1 device-side hot cache (nvme backend): raw rows + tags + miss ring
+        # + gate counters. Kernels close the loop on-device; lk_moe's fill
+        # thread turns need into done. Graph-safe: pure device work per step.
+        self._nvme_state = None
+        if self._nvme:
+            self._nvme_init_state()
 
     def allocate_output(
         self, shape: Tuple[int, ...], device: torch.device
@@ -933,6 +1176,8 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
             output = out
 
         flat_ids = input_ids.reshape(-1).long()
+        if _PLE_PROBE is not None and flat_ids.numel() and not torch.cuda.is_current_stream_capturing():
+            _PLE_PROBE.record(flat_ids, self)
         if flat_ids.numel():
             if self._file_prefetcher is not None:
                 self._file_prefetcher.enqueue(
@@ -940,6 +1185,9 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
                     vocab_start=self.shard_indices.org_vocab_start_index,
                     vocab_end=self.shard_indices.org_vocab_end_index,
                 )
+            if self._nvme:
+                self._nvme_gather(flat_ids, output)
+                return output
             _gather_ple_embedding_from_pinned_kernel[(flat_ids.numel(),)](
                 self.weight.data_ptr(),
                 flat_ids,
@@ -952,6 +1200,104 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
                 BLOCK_D=self._block_d,
             )
         return output
+
+    def _nvme_init_state(self):
+        import os as _os
+        import lk_moe
+
+        dev = torch.device("cuda")
+        S = 1 << 20
+        RING = 1 << 20
+        STAGE = 1 << 20
+        rb = self.embedding_dim * (
+            1 if self.weight.dtype == torch.float8_e4m3fn else 2
+        )
+        tag = torch.empty(S, dtype=torch.int64, device=dev).fill_(-1)
+        rows = torch.zeros((S, rb), dtype=torch.uint8, device=dev)
+        stat = torch.zeros(3, dtype=torch.int64, device=dev)
+        err = torch.zeros(1, dtype=torch.int64, device=dev)
+        h_ring = torch.full((RING,), -1, dtype=torch.int64, device="cpu").pin_memory()
+        h_cnt = torch.zeros(2, dtype=torch.int64, device="cpu").pin_memory()
+        d_ticket = torch.zeros(1 << 20, dtype=torch.int64, device=dev)
+        h_stage = torch.full((STAGE, rb), 255, dtype=torch.uint8, device="cpu").pin_memory()
+        fd = _os.open(self._nvme_reader.path, _os.O_RDONLY)
+        direct_fd = 0
+        if lk_nvme_direct(self._nvme):
+            direct_fd = _os.open(self._nvme_reader.path,
+                                 _os.O_RDONLY | _os.O_DIRECT)
+        cache_bytes = lk_nvme_cache_bytes(self._nvme)
+        ok = lk_moe.nvme_filler_attach(
+            fd, rb, S,
+            self.shard_indices.org_vocab_start_index,
+            self.shard_indices.org_vocab_end_index,
+            RING - 1,
+            h_ring.data_ptr(), h_cnt.data_ptr(),
+            [h_stage.data_ptr()], STAGE,
+            direct_fd, cache_bytes,
+        )
+        if not ok:
+            raise RuntimeError("PLE nvme filler attach failed")
+        self._nvme_state = {
+            "tag": tag, "rows": rows, "stat": stat, "err": err,
+            "h_ring": h_ring, "h_cnt": h_cnt, "d_ticket": d_ticket,
+            "h_stage": h_stage, "S": S, "rb": rb,
+            "pin": torch.zeros(3, dtype=torch.int64, device="cpu").pin_memory(),
+            "evt": torch.cuda.Event(), "n": 0,
+        }
+
+    def _nvme_gather(self, flat_ids, output):
+        import lk_moe
+        st = self._nvme_state
+        if st is None:
+            raise RuntimeError("PLE nvme gather before init")
+        if not self._nvme_purged:
+            self._nvme_reader.purge_after_load()
+            self._nvme_purged = True
+        n = flat_ids.numel()
+        vlo, vhi = (
+            self.shard_indices.org_vocab_start_index,
+            self.shard_indices.org_vocab_end_index,
+        )
+        is_fp8 = self.weight.dtype == torch.float8_e4m3fn
+        blk = self._block_d
+        gate = lambda: lk_moe.nvme_gate(
+            st["h_cnt"].data_ptr(), st["err"].data_ptr(), 300000,
+            torch.cuda.current_stream().cuda_stream,
+        )
+        _ple_nvme_lookup[(n,)](
+            flat_ids, output, st["tag"], st["rows"], st["d_ticket"],
+            st["h_ring"].data_ptr(), st["h_cnt"].data_ptr(), st["stat"],
+            S=st["S"], rb=st["rb"], ring_mask=(1 << 20) - 1,
+            vlo=vlo, vhi=vhi, dim=self.embedding_dim,
+            is_fp8=is_fp8, BLOCK_D=blk,
+        )
+        gate()
+        _ple_nvme_merge[(n,)](
+            flat_ids, output, st["tag"], st["rows"], st["d_ticket"],
+            st["h_stage"].data_ptr(), st["stat"],
+            S=st["S"], rb=st["rb"], stage_mask=(1 << 20) - 1,
+            vlo=vlo, vhi=vhi, dim=self.embedding_dim,
+            is_fp8=is_fp8, BLOCK_D=blk, BAD=True,
+        )
+        gate()
+        st["n"] += 1
+        if st["n"] % 64 == 0 and not torch.cuda.is_current_stream_capturing():
+            st["pin"].copy_(st["stat"], non_blocking=True)
+            st["evt"].record()
+            if st["evt"].query():
+                lk, ht, bd = st["pin"].tolist()
+                if st["n"] % 1024 == 0:
+                    fs = lk_moe.nvme_filler_stats()
+                    logger.info(
+                        "[ple-nvme] look=%d hit=%.1f%% bad=%d filler(cyc=%d"
+                        " rows=%d MB=%d)", lk, ht * 100 / max(1, lk), bd,
+                        fs["cycles"], fs["rows"], fs["bytes"] >> 20,
+                    )
+                    if bd:
+                        raise RuntimeError(
+                            "PLE nvme gather fault: bad=%d gate_err=%d"
+                            % (bd, int(st["err"].sum().item())))
+                st["stat"].zero_()
 
     def reduce(self, output: torch.Tensor) -> torch.Tensor:
         if self.tp_size > 1 and not get_attn_tp_context().input_scattered:
@@ -1092,7 +1438,7 @@ class Qwen4ExpPLELayer(nn.Module):
                 conv_state[track_indices] = next_state.to(dtype=conv_state.dtype)
             return F.silu(conv_output)
 
-        block = _ple_conv_block_tokens()
+        block = _ple_conv_block_tokens(self.conv_channels)
         if batch.row_width > block and not batch.mode.is_target_verify():
             return self._short_conv_blocked(x, forward_batch, batch, conv_state, block)
 
@@ -1356,7 +1702,7 @@ class Qwen4ExpPLELayer(nn.Module):
         accumulate_into: Optional[torch.Tensor] = None,
     ) -> Optional[torch.Tensor]:
         hidden_states = hidden_states[: batch.processed_tokens]
-        block = _ple_conv_block_tokens()
+        block = _ple_conv_block_tokens(self.conv_channels)
         if (
             not batch.use_decode_fast_path
             and not batch.mode.is_target_verify()
@@ -2553,6 +2899,36 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
             shard_start = shard_idx * shard_size
             actual_rows = loaded_weight.shape[0]
             shard_end = shard_start + actual_rows
+            if (isinstance(emb, Qwen4ExpPinnedHostEmbedding) and emb._nvme):
+                skip = emb._nvme_skip_verified
+                if skip is None:
+                    skip = False
+                    reader = emb._nvme_reader
+                    tp_start = emb.shard_indices.org_vocab_start_index
+                    tp_end = emb.shard_indices.org_vocab_end_index
+                    ov_start = max(shard_start, tp_start)
+                    ov_end = min(shard_end, tp_end)
+                    if reader is not None and ov_start < ov_end:
+                        from sglang.srt.models.qwen4_exp_ple_table import (
+                            ple_nvme_matches_checkpoint,
+                        )
+                        skip = ple_nvme_matches_checkpoint(
+                            reader.path,
+                            reader.row_bytes,
+                            ov_start - tp_start,
+                            ov_end - tp_start,
+                            loaded_weight[ov_start - shard_start : ov_end - shard_start],
+                        )
+                        if skip:
+                            logger.info(
+                                "PLE nvme table verified against this checkpoint "
+                                "on disk (%.1f GiB) - skipping load-time rewrite "
+                                "for %s",
+                                emb._nvme_reader._nbytes / 2**30, mod_prefix)
+                    emb._nvme_skip_verified = skip
+                if skip:
+                    loaded_shard_params.add(f"{mod_prefix}.ngram_embedding.weight")
+                    return True
             copy_ple_rows_to_tp_embedding(emb, loaded_weight, shard_start, shard_end)
             loaded_shard_params.add(f"{mod_prefix}.ngram_embedding.weight")
             return True

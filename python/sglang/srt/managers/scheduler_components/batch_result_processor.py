@@ -92,6 +92,7 @@ def _get_speculative_output_stride(result: GenerationBatchResult) -> int:
     return stride
 
 
+
 @dataclass(kw_only=True, slots=True, frozen=True)
 class SchedulerBatchResultProcessor:
     is_generation: bool
@@ -947,7 +948,6 @@ class SchedulerBatchResultProcessor:
             logits_output=logits_output,
             next_token_ids=next_token_ids,
         )
-
         batch_size = batch.batch_size()
         num_generated_tokens = result.get_num_generated_tokens(batch_size)
         self.metrics_reporter.num_generated_tokens += num_generated_tokens

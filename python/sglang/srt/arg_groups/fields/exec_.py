@@ -943,11 +943,14 @@ class ExecOffload(msgspec.Struct):
             help="Host storage for the offloaded Qwen4 PLE n-gram table. "
             "'pinned' (default) uses CPU pinned memory. 'file' maps a sparse "
             "file under --ple-offload-dir and lets the gather kernel read it "
-            "directly; use it on unified-memory devices (e.g. GB10 / DGX Spark) "
-            "where pinned host memory comes out of the same pool as the model "
-            "weights. Requires a device that reports "
-            "cudaDevAttrPageableMemoryAccessUsesHostPageTables.",
-            choices=["pinned", "file"],
+            "directly (needs a device reporting "
+            "cudaDevAttrPageableMemoryAccessUsesHostPageTables; e.g. GB10 / "
+            "DGX Spark, where pinned memory shares the pool with model "
+            "weights). 'nvme' keeps the table on storage: the loader writes "
+            "it once under --ple-offload-dir, the mapping is dropped right "
+            "after (no pinned table in RAM), and gathers go through a VRAM "
+            "tag hot cache with pread fill on the eager path.",
+            choices=["pinned", "file", "nvme"],
         ),
     ] = "pinned"
     ple_offload_dir: A[

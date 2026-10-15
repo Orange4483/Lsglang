@@ -1,37 +1,52 @@
-"""Opt-in exact NVMe Engram lookup for single-worker CUDA inference.
+"""Opt-in exact NVMe Engram lookup on the lk_moe N1 async filler.
 
-The checkpoint must remain immutable for the worker's lifetime. Captured CUDA
-graphs contain raw host pointers, so captured stores are retained until process
-exit. They cannot be closed or hot-reloaded independently of their graphs.
+The Engram table lives in its immutable local safetensors shard; rows are
+gathered with the same capture-clean doorbell protocol as the PLE NVMe cache:
+a lookup kernel publishes missed rows into a pinned ring and bumps the
+doorbell, the lk_moe filler thread drains, sort/run-merges, and preads rows
+into pinned stage slots, and a merge kernel reads the staged bytes over PCIe
+and dequantizes (fp8 e4m3 payload, e8m0 block scales) to bf16. Nothing here
+touches CUDA from the host side: no host callbacks, so CUDA-graph capture and
+replay are exact, and no table copy exists anywhere (RAM peak at load is
+zero). Cache and staging knobs from the pre-N1 implementation are accepted
+and ignored: the N1 path stores nothing but the pinned stage.
+
+Backend precedence for the Engram table (LK_ENGRAM_NVME
+(host-table flag SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE, upstream):
+NVMe set means host-table mode is rejected; unset falls through to host
+table when requested.
 """
 
 from __future__ import annotations
 
-import ctypes
-import functools
 import json
 import os
 import struct
 import sys
-import weakref
 from pathlib import Path
 
 import torch
+import triton
+import triton.language as tl
 
+from sglang.kernels.ops.quantization.fp8_emulate import (
+    e4m3fn_u8_to_f32,
+    fp8_native_supported,
+)
+from sglang.srt.utils import logger
+from sglang.srt.utils.common import lk_nvme_cache_bytes, lk_nvme_direct, is_lk_engram_nvme_enabled
+from sglang.srt.environ import envs
 
-class _Work(ctypes.Structure):
-    _fields_ = [
-        ("store", ctypes.c_void_p),
-        ("ids", ctypes.c_void_p),
-        ("weights", ctypes.c_void_p),
-        ("scales", ctypes.c_void_p),
-        ("count", ctypes.c_uint64),
-    ]
-
-
-# CUDA graph replay bypasses Python; a Python finalizer alone cannot establish
-# that all graph references are gone. Process ownership makes that explicit.
-_CAPTURED_STORES: set[NvmeEngramStore] = set()
+# e8m0 has no zero: the exponent byte 0 encodes 2**-127.
+_E8M0_ZERO = 2.0**-127
+# Per Engram layer: the ring bounds the in-flight depth (a wrap-over-unserved
+# id trips the gate), so 64K slots = 16MB pinned stage per layer across every
+# plausible prefill/DP-replicate batch. Larger gathers walk in chunks.
+_RING = 1 << 16
+_DTK_MASK = _RING - 1
+_STAGE = _RING
+_CHUNK = _RING // 2
+_GATE_LIMIT_US = 300000
 
 
 def checkpoint_table(model_path, layer_id, rows, dim):
@@ -85,14 +100,8 @@ def checkpoint_table(model_path, layer_id, rows, dim):
 def validate_configuration(parallel, schedule, spec, graph, host_table):
     if sys.platform != "linux" or torch.version.cuda is None:
         raise ValueError("NVMe Engram requires Linux and CUDA")
-    if any(
-        getattr(parallel, field) != 1 for field in ("tp_size", "pp_size", "world_size")
-    ):
-        raise ValueError("NVMe Engram currently supports a single worker (TP=PP=1)")
-    if schedule.max_running_requests != 1 or not schedule.disable_overlap_schedule:
-        raise ValueError(
-            "NVMe Engram requires --max-running-requests 1 --disable-overlap-schedule"
-        )
+    if parallel.pp_size != 1:
+        raise ValueError("NVMe Engram requires pipeline parallelism = 1")
     if graph.enable_torch_compile:
         raise ValueError("NVMe Engram does not support torch.compile")
     if spec.speculative_algorithm not in (None, "DSPARK"):
@@ -117,100 +126,112 @@ def validate_configuration(parallel, schedule, spec, graph, host_table):
         raise ValueError("NVMe Engram and host-table mode are mutually exclusive")
 
 
-@functools.lru_cache(maxsize=1)
-def _native_library():
-    from torch.utils.cpp_extension import load
-
-    path = load(
-        name="sglang_engram_nvme",
-        sources=[str(Path(__file__).with_suffix(".cpp"))],
-        extra_cflags=["-O3", "-std=c++17", "-pthread"],
-        extra_ldflags=["-pthread"],
-        with_cuda=False,
-        is_python_module=False,
-    )
-    lib = ctypes.CDLL(path, use_errno=True)
-    lib.row_store_open.argtypes = [ctypes.c_char_p] + [ctypes.c_uint64] * 4
-    lib.row_store_open.restype = ctypes.c_void_p
-    lib.row_store_close.argtypes = [ctypes.c_void_p]
-    lib.row_store_close.restype = None
-    lib.row_store_lookup.argtypes = [ctypes.c_void_p]
-    lib.row_store_lookup.restype = None
-    lib.row_store_stats.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint64)]
-    lib.row_store_stats.restype = None
-    return lib
+@triton.jit
+def _nvme_lookup(ids_ptr, d_tk_ptr, h_ring_ptr, h_cnt_ptr, stat_ptr,
+                 row_hi, ring_mask):
+    r = tl.program_id(0)
+    id = tl.load(ids_ptr + r)
+    h_cnt = h_cnt_ptr.to(tl.pointer_type(tl.int64))
+    h_ring = h_ring_ptr.to(tl.pointer_type(tl.int64))
+    tl.atomic_add(stat_ptr, 1)
+    if (id >= 0) & (id < row_hi):
+        pos = tl.atomic_add(h_cnt, 1)
+        tl.store(h_ring + (pos & ring_mask), id)
+        tl.store(d_tk_ptr + (r & 65535), pos)
+    else:
+        tl.store(d_tk_ptr + (r & 65535), 0)
+        tl.atomic_add(stat_ptr + 2, 1)
 
 
-@functools.lru_cache(maxsize=1)
-def _cuda_library():
-    # Use the runtime already loaded by torch, rather than guessing wheel paths
-    # and potentially loading a different CUDA runtime into the process.
-    paths = {
-        line.split()[-1]
-        for line in Path("/proc/self/maps").read_text().splitlines()
-        if "/libcudart.so" in line and line.split()[-1].startswith("/")
-    }
-    if len(paths) != 1:
-        raise RuntimeError(f"Expected one loaded CUDA runtime; found {len(paths)}")
-    lib = ctypes.CDLL(paths.pop())
-    lib.cudaLaunchHostFunc.argtypes = [ctypes.c_void_p] * 3
-    lib.cudaLaunchHostFunc.restype = ctypes.c_int
-    return lib
-
-
-def _release(lib, store, staging, works, device):
-    if staging:
-        with torch.cuda.device(device):
-            torch.cuda.synchronize()
-    lib.row_store_close(store)
-    staging.clear()
-    works.clear()
+@triton.jit
+def _nvme_merge(ids_ptr, out_ptr, d_tk_ptr, h_stamp_ptr, h_stage_ptr, stat_ptr,
+                row_hi, stage_mask,
+                DIM: tl.constexpr, BLK: tl.constexpr,
+                E8M0_ZERO: tl.constexpr, FP8_PTR: tl.constexpr):
+    r = tl.program_id(0)
+    id = tl.load(ids_ptr + r)
+    owned = (id >= 0) & (id < row_hi)
+    tk = tl.load(d_tk_ptr + (r & 65535))
+    slot = tk & stage_mask
+    # Exact staging-fault detection: the filler stamps slot with ticket+1
+    # after the row lands; any other value means the row never arrived.
+    if tl.load(h_stamp_ptr.to(tl.pointer_type(tl.int64)) + slot) != tk + 1:
+        if owned:
+            tl.atomic_add(stat_ptr + 1, 1)
+    base = h_stage_ptr.to(tl.int64) + slot.to(tl.int64) * (DIM + DIM // BLK)
+    offs = tl.arange(0, DIM)
+    if FP8_PTR:
+        vals = tl.load(base.to(tl.pointer_type(tl.float8e4nv)) + offs,
+                       mask=owned, other=0.0).to(tl.float32)
+    else:
+        b = tl.load(base.to(tl.pointer_type(tl.uint8)) + offs, mask=owned,
+                    other=0)
+        vals = e4m3fn_u8_to_f32(b)
+    exps = tl.load((base + DIM).to(tl.pointer_type(tl.uint8)) + offs // BLK,
+                   mask=owned, other=0).to(tl.int32)
+    scale = (exps << 23).to(tl.float32, bitcast=True)
+    scale = tl.where(exps == 0, E8M0_ZERO, scale)
+    out = tl.where(owned, vals * scale, 0.0)
+    tl.store(out_ptr + r * DIM + offs, out.to(tl.bfloat16))
 
 
 class NvmeEngramStore:
+    """One Engram layer's rows served by the lk_moe N1 filler (one slot each)."""
+
     def __init__(self, model_path, layer_id, rows, dim, cache_bytes, staging_bytes):
-        if type(cache_bytes) is not int or not 0 <= cache_bytes < 2**63:
-            raise ValueError("NVMe Engram cache bytes must be a nonnegative int64")
-        if type(staging_bytes) is not int or not 0 < staging_bytes < 2**63:
-            raise ValueError("NVMe Engram staging bytes must be a positive int64")
-        shard, offsets = checkpoint_table(model_path, layer_id, rows, dim)
+        import lk_moe
+        from sglang.srt.runtime_context import get_parallel
+
         self.rows = rows
         self._loaded = set()
-        self._staging = {}
-        self._works = {}
-        self._staging_bytes = 0
-        self._staging_limit = staging_bytes
-        self._device = torch.cuda.current_device()
-        self._lib = _native_library()
-        self._cuda = _cuda_library()
-        self._store = self._lib.row_store_open(
-            os.fsencode(shard), rows, *offsets, cache_bytes
+        try:
+            from sglang.srt.runtime_context import get_parallel
+
+            parallel = get_parallel()
+            tp_size, tp_rank = parallel.tp_size, parallel.tp_rank
+        except Exception:  # unit tests / offline harnesses: no published context
+            tp_size, tp_rank = 1, 0
+        row_start = rows * tp_rank // tp_size
+        row_end = rows * (tp_rank + 1) // tp_size
+        self.row_hi = row_end - row_start
+        shard, (w_off, s_off) = checkpoint_table(model_path, layer_id, rows, dim)
+        dev = torch.device("cuda")
+        self._h_ring = torch.full((_RING,), -1, dtype=torch.int64,
+                                  device="cpu").pin_memory()
+        self._h_cnt = torch.zeros(2, dtype=torch.int64, device="cpu").pin_memory()
+        self._h_stamp = torch.zeros(_STAGE, dtype=torch.int64,
+                                    device="cpu").pin_memory()
+        self._h_stage = torch.zeros((_STAGE, 264), dtype=torch.uint8,
+                                    device="cpu").pin_memory()
+        self._d_tk = torch.zeros(_RING, dtype=torch.int64, device=dev)
+        self._err = torch.zeros(1, dtype=torch.int64, device=dev)
+        self._stat = torch.zeros(3, dtype=torch.int64, device=dev)
+        self._pin = torch.zeros(3, dtype=torch.int64, device="cpu").pin_memory()
+        self._evt = torch.cuda.Event()
+        self._n = 0
+        fd = os.open(str(shard), os.O_RDONLY)
+        direct_fd = 0
+        if lk_nvme_direct(is_lk_engram_nvme_enabled()):
+            direct_fd = os.open(str(shard), os.O_RDONLY | os.O_DIRECT)
+        self._slot = lk_moe.nvme_filler_attach_gather(
+            fd, w_off, s_off, 256, 8, self.row_hi, _DTK_MASK,
+            self._h_ring.data_ptr(), self._h_cnt.data_ptr(),
+            [self._h_stage.data_ptr()], _STAGE, self._h_stamp.data_ptr(),
+            direct_fd, lk_nvme_cache_bytes(is_lk_engram_nvme_enabled()),
         )
-        if not self._store:
-            error = ctypes.get_errno()
-            raise OSError(
-                error,
-                f"Cannot open NVMe Engram shard: {os.strerror(error)}",
-                str(shard),
-            )
-        self._finalizer = weakref.finalize(
-            self,
-            _release,
-            self._lib,
-            self._store,
-            self._staging,
-            self._works,
-            self._device,
-        )
-        # CUDA may already be torn down during interpreter exit. The OS reclaims
-        # process-owned mappings and descriptors, including captured stores.
-        self._finalizer.atexit = False
+        if self._slot < 0:
+            os.close(fd)
+            raise RuntimeError("NVMe Engram N1 filler attach failed")
+        # The worker preads through this descriptor for the process lifetime;
+        # captured graphs reference the pinned buffers, so neither is released.
+        self._fd = fd
+        _register(self)
 
     def validate_weight(self, kind, source):
         if kind in self._loaded:
             raise RuntimeError(
-                "NVMe Engram checkpoints are immutable; restart to reload"
-            )
+            "NVMe Engram checkpoints are immutable; restart to reload"
+        )
         width, dtype = (
             (256, torch.float8_e4m3fn)
             if kind == "weight"
@@ -221,92 +242,95 @@ class NvmeEngramStore:
         self._loaded.add(kind)
 
     def close(self):
-        if self in _CAPTURED_STORES:
-            raise RuntimeError(
-                "Captured NVMe Engram storage is owned by the worker until exit"
-            )
-        self._finalizer()
-        self._works.clear()
+        raise RuntimeError(
+            "Captured NVMe Engram storage is owned by the worker until exit"
+        )
 
     def finish_load(self):
         if self._loaded != {"weight", "scale"}:
             raise ValueError(
-                "NVMe Engram checkpoint did not load both weight and scale"
-            )
+            "NVMe Engram checkpoint did not load both weight and scale"
+        )
 
     def stats(self):
-        if not self._finalizer.alive:
-            raise RuntimeError("NVMe Engram store is closed")
-        values = (ctypes.c_uint64 * 4)()
-        self._lib.row_store_stats(self._store, values)
-        return dict(zip(("hits", "misses", "read_pages", "cache_bytes"), values))
+        import lk_moe
+
+        out = dict(lk_moe.nvme_filler_stats(self._slot))
+        self._pin.copy_(self._stat, non_blocking=True)
+        torch.cuda.synchronize()
+        look, bad, bad_id = (int(x) for x in self._pin.tolist())
+        out["lookups"] = look
+        out["bad"] = bad
+        out["bad_ids"] = bad_id
+        return out
 
     def lookup(self, indices):
-        from sglang.kernels.ops.embeddings.engram_gather import engram_gather
+        import lk_moe
 
-        if not self._finalizer.alive:
-            raise RuntimeError("NVMe Engram store is closed")
-        if (
-            not indices.is_cuda
-            or indices.device.index != self._device
-            or indices.dtype != torch.int64
-        ):
-            raise ValueError("Engram IDs must be int64 on the store's CUDA device")
         count = indices.numel()
-        out = torch.empty(
-            (*indices.shape, 256), dtype=torch.bfloat16, device=indices.device
-        )
+        out = torch.empty((*indices.shape, 256), dtype=torch.bfloat16,
+                          device=indices.device)
         if not count:
             return out
-        capacity = 1 << (count - 1).bit_length()
-        stream = torch.cuda.current_stream(self._device)
-        key = (stream.cuda_stream, capacity)
-        capturing = torch.cuda.is_current_stream_capturing()
-        if key not in self._staging:
-            if capturing:
-                raise RuntimeError(
-                    "Warm NVMe Engram staging on the capture stream before capture"
-                )
-            size = capacity * (8 + 256 + 8 + 256 + 8 + 8)
-            if self._staging_bytes + size > self._staging_limit:
-                raise RuntimeError(
-                    "NVMe Engram staging budget exceeded; reduce prefill chunk size or increase SGLANG_DSV41_ENGRAM_NVME_STAGING_BYTES"
-                )
-            ids = torch.empty(capacity, dtype=torch.int64, pin_memory=True)
-            w = torch.empty((capacity, 256), dtype=torch.uint8, pin_memory=True)
-            s = torch.empty((capacity, 8), dtype=torch.uint8, pin_memory=True)
-            dw, ds = (
-                torch.empty_like(w, device=indices.device),
-                torch.empty_like(s, device=indices.device),
+        if indices.dtype != torch.int64 or not indices.is_cuda:
+            raise ValueError("Engram ids must be int64 CUDA ids")
+        stream = torch.cuda.current_stream().cuda_stream
+        flat = indices.reshape(-1)
+        rows = out.view(-1, 256)
+        for off in range(0, count, _CHUNK):
+            n = min(_CHUNK, count - off)
+            _nvme_lookup[(n,)](
+                flat[off:], self._d_tk, self._h_ring.data_ptr(),
+                self._h_cnt.data_ptr(), self._stat, self.row_hi, _DTK_MASK,
+                num_warps=1,
             )
-            sequential = torch.arange(
-                capacity, dtype=torch.int64, device=indices.device
+            lk_moe.nvme_gate(self._h_cnt.data_ptr(), self._err.data_ptr(),
+                             _GATE_LIMIT_US, stream)
+            _nvme_merge[(n,)](
+                flat[off:], rows[off:], self._d_tk,
+                self._h_stamp.data_ptr(), self._h_stage.data_ptr(),
+                self._stat, self.row_hi, _DTK_MASK,
+                DIM=256, BLK=32, E8M0_ZERO=_E8M0_ZERO,
+                FP8_PTR=fp8_native_supported(),
             )
-            self._staging[key] = ids, w, s, dw, ds, sequential
-            self._staging_bytes += size
-        ids, w, s, dw, ds, sequential = self._staging[key]
-        work_key = (stream.cuda_stream, count)
-        if work_key not in self._works:
-            if len(self._works) >= 4096:
-                raise RuntimeError(
-                    "NVMe Engram work metadata budget exceeded; restart the worker"
-                )
-            self._works[work_key] = _Work(
-                self._store, ids.data_ptr(), w.data_ptr(), s.data_ptr(), count
-            )
-        if capturing:
-            _CAPTURED_STORES.add(self)
-        ids[:count].copy_(indices.reshape(-1), non_blocking=True)
-        error = self._cuda.cudaLaunchHostFunc(
-            stream.cuda_stream,
-            ctypes.cast(self._lib.row_store_lookup, ctypes.c_void_p),
-            ctypes.addressof(self._works[work_key]),
-        )
-        if error:
-            raise RuntimeError(f"CUDA Engram host callback failed: {error}")
-        dw[:count].copy_(w[:count], non_blocking=True)
-        ds[:count].copy_(s[:count], non_blocking=True)
-        engram_gather(
-            dw.data_ptr(), ds.data_ptr(), sequential[:count], out.view(-1, 256), 256, 32
-        )
+        self._tick()
         return out
+
+    def _tick(self):
+        import lk_moe
+
+        self._n += 1
+        if self._n % 64 == 0 and not torch.cuda.is_current_stream_capturing():
+            self._pin.copy_(self._stat, non_blocking=True)
+            self._evt.record()
+            if self._evt.query():
+                look, bad, bad_id = (int(x) for x in self._pin.tolist())
+                if self._n % 1024 == 0:
+                    fs = lk_moe.nvme_filler_stats(self._slot)
+                    logger.info(
+                        "[engram-nvme] layer-lookups=%d bad=%d bad_ids=%d"
+                        " filler(cycles=%d rows=%d preads=%d dedup=%d MB=%d)",
+                        look, bad, bad_id, fs["cycles"], fs["rows"],
+                        fs["preads"], fs["dedup"], fs["bytes"] >> 20,
+                    )
+                    if bad or bad_id:
+                        raise RuntimeError(
+                            "NVMe Engram gather fault: bad=%d bad_ids=%d"
+                            " gate_err=%d" % (bad, bad_id,
+                                             int(self._err.sum().item())))
+                self._stat.zero_()
+
+
+_INSTANCES: list[NvmeEngramStore] = []
+
+
+def _register(store):
+    _INSTANCES.append(store)
+
+
+def shutdown():
+    """Tear down every filler worker (process exit; captured graphs gone)."""
+    import lk_moe
+
+    lk_moe.nvme_filler_detach_all()
+    _INSTANCES.clear()

@@ -381,6 +381,7 @@ else:
 logger = logging.getLogger(__name__)
 
 
+
 def _prewarm_hccl_group(device, group, device_module):
     warmup_tensor = torch.zeros(1, dtype=torch.int32, device=device)
     torch.distributed.all_reduce(warmup_tensor, group=group)

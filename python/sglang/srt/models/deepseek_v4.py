@@ -199,7 +199,7 @@ from sglang.srt.utils import (
     log_info_on_rank0,
     make_layers,
 )
-from sglang.srt.utils.common import is_sm80_supported, is_sm120_supported
+from sglang.srt.utils.common import is_sm80_supported, is_sm120_supported, is_lk_engram_nvme_enabled
 from sglang.srt.utils.custom_op import register_custom_op
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
@@ -302,7 +302,17 @@ def _super_chunk_hc_bounds(forward_batch, rows: int):
 
     plan = super_chunk_token_plan(forward_batch)
     if plan is None or len(plan) < 2 or plan[-1][1] != rows:
+        if rows > 1024 and not getattr(_super_chunk_hc_bounds, "_dbg", False):
+            _super_chunk_hc_bounds._dbg = True
+            logger.info(
+                "[sc-dbg] hc FALLBACK plan=%s rows=%d",
+                None if plan is None else len(plan),
+                rows,
+            )
         return None
+    if rows > 1024 and not getattr(_super_chunk_hc_bounds, "_dbg", False):
+        _super_chunk_hc_bounds._dbg = True
+        logger.info("[sc-dbg] hc LOOP active plan=%d rows=%d", len(plan), rows)
     return [(lo, hi) for lo, hi, _ in plan]
 
 
@@ -331,13 +341,30 @@ def _super_chunk_attn_plan(forward_batch, rows: int, x_quant=None):
 
     plan = super_chunk_token_plan(forward_batch)
     if plan is None or len(plan) < 2 or plan[-1][1] != rows:
+        if rows > 1024 and not getattr(_super_chunk_attn_plan, "_dbg", False):
+            _super_chunk_attn_plan._dbg = True
+            logger.info(
+                "[sc-dbg] attn-plan FALLBACK(plan) plan=%s rows=%d",
+                None if plan is None else len(plan),
+                rows,
+            )
         return None
     if x_quant is not None:
         values = x_quant if isinstance(x_quant, tuple) else (x_quant,)
         if any(
             not torch.is_tensor(v) or v.shape[0] != rows for v in values
         ):
+            if rows > 1024 and not getattr(_super_chunk_attn_plan, "_dbg", False):
+                _super_chunk_attn_plan._dbg = True
+                logger.info(
+                    "[sc-dbg] attn-plan FALLBACK(x_quant) shapes=%s rows=%d",
+                    [tuple(v.shape) if torch.is_tensor(v) else type(v) for v in values],
+                    rows,
+                )
             return None
+    if rows > 1024 and not getattr(_super_chunk_attn_plan, "_dbg", False):
+        _super_chunk_attn_plan._dbg = True
+        logger.info("[sc-dbg] attn-plan LOOP active plan=%d rows=%d", len(plan), rows)
     return plan
 
 
@@ -348,6 +375,7 @@ def _super_chunk_slice_token_arg(value, tok):
     if value is None or torch.is_tensor(value):
         return None if value is None else value[tok]
     return tuple(v[tok] for v in value)
+
 
 DEEPSEEK_V4_STACKED_PARAMS_MAPPING: List[Tuple[str, str, int]] = [
     ("gate_up_proj", "gate_proj", 0),
@@ -4930,6 +4958,14 @@ class DeepseekV4Model(nn.Module):
         input_embeds: Optional[torch.Tensor],
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[torch.Tensor, PPProxyTensors]:
+        if input_ids is not None and input_ids.shape[0] > 8192:
+            logger.info(
+                "[memprobe] peak_alloc=%.2fG peak_resv=%.2fG cur=%.2fG rows=%d",
+                torch.cuda.max_memory_allocated() / 2**30,
+                torch.cuda.max_memory_reserved() / 2**30,
+                torch.cuda.memory_allocated() / 2**30,
+                input_ids.shape[0],
+            )
         if self.pp_group.is_first_rank:
             if input_embeds is None:
                 hidden_states = self.embed_tokens(input_ids)
@@ -6401,7 +6437,7 @@ class DeepseekV4ForCausalLM(nn.Module):
             for i, layer in enumerate(self.model.layers):
                 if getattr(layer, "engram", None) is not None:
                     layer.engram.embed.finish_load(label=f"layer {i}")
-            self._nvme_engram_loaded = envs.SGLANG_ENABLE_DSV41_ENGRAM_NVME.get()
+            self._nvme_engram_loaded = is_lk_engram_nvme_enabled()
             self._prewarm_mhc_kernels()
 
     def get_embed_and_head(self):

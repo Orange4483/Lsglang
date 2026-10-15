@@ -2340,6 +2340,24 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
     def __init__(self, quant_config: ModelOptFp4Config):
         self.quant_config = quant_config
+        if get_moe_runner_backend().is_auto() and is_cuda():
+            from sglang.srt.runtime_context import get_flags
+
+            capability = get_device_capability()
+            if capability >= (12, 0):
+                # Port of sgl-project/sglang#35617: trtllm-gen FP4 MoE cubins
+                # ship sm100/103/107 only -- consumer Blackwell (sm120/121)
+                # has no runnable kernel and the shuffled weight layout is
+                # misread silently. Resolve auto -> FlashInfer CUTLASS here,
+                # BEFORE weight preparation, so no weight-prep or apply site
+                # falls through to the TRT-LLM runner on SM12x.
+                fl = get_flags().moe
+                if get_moe_runner_backend().is_auto():
+                    fl.runner_backend = MoeRunnerBackend.FLASHINFER_CUTLASS
+                    logger.info(
+                        "Resolved MoE runner backend auto -> flashinfer_cutlass "
+                        "on SM12x for NVFP4 MoE (sglang#35617 port)"
+                    )
         moe_runner_backend = get_moe_runner_backend()
         if moe_runner_backend.is_auto() and is_cuda():
             capability = get_device_capability()
@@ -2693,8 +2711,16 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             prepare_moe_nvfp4_layer_for_marlin(layer)
             return
 
-        # Calculate input scales based on strategy
-        if self.enable_flashinfer_cutlass_moe or self.enable_flashinfer_trtllm_moe:
+        # Calculate input scales based on strategy. NOTE: the gate attrs are
+        # resolved at quant-init (backend still Auto under deferred/autopick);
+        # consult the resolved runner backend here so a trtllm-picked layer
+        # gets the scalar input scale the activation quant kernel requires.
+        trtllm_resolved = (
+            moe_runner_backend.is_flashinfer_trtllm()
+            or moe_runner_backend.is_flashinfer_trtllm_routed()
+        )
+        if (self.enable_flashinfer_cutlass_moe or self.enable_flashinfer_trtllm_moe
+                or trtllm_resolved):
             w13_input_scale = layer.w13_input_scale.max().to(torch.float32)
             w2_input_scale = layer.w2_input_scale.max().to(torch.float32)
         elif moe_runner_backend.is_flashinfer_megamoe():
@@ -2774,6 +2800,12 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             "w2_input_scale_quant",
             (1 / w2_input_scale).to(torch.float32),
         )
+        if trtllm_resolved:
+            copy_or_rebind_param(
+                layer,
+                "g1_scale_c",
+                (layer.w2_input_scale_quant * layer.g1_alphas).to(torch.float32),
+            )
 
         if layer.moe_runner_config.is_gated and self.enable_flashinfer_trtllm_moe:
             runner_config = layer.moe_runner_config
@@ -2811,7 +2843,10 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 )
                 copy_or_rebind_param(layer, "gemm1_beta", gemm1_beta)
 
-        if self.enable_flashinfer_cutlass_moe:
+        if self.enable_flashinfer_cutlass_moe or (
+            getattr(self, "_moe_runner_backend", None)
+            is MoeRunnerBackend.FLASHINFER_CUTLASS
+        ):
             from sglang.srt.layers.moe.moe_runner.flashinfer_cutlass import (
                 materialize_swiglu_params_for_cutlass,
             )
@@ -3031,6 +3066,11 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         if moe_runner_backend.is_auto():
             if is_cuda() and (8, 0) <= get_device_capability() < (10, 0):
                 moe_runner_backend = MoeRunnerBackend.MARLIN
+            elif is_cuda() and get_device_capability() >= (12, 0):
+                # trtllm-gen ships cubins for sm100/103/107 only: consumer
+                # Blackwell (sm120/121) has no runnable kernel there and the
+                # cubin check dies at first call. CUTLASS covers SM120.
+                moe_runner_backend = MoeRunnerBackend.FLASHINFER_CUTLASS
             else:
                 # TRTLLM is currently the most performant and tested FP4 MoE
                 # backend, so use it as the default.
@@ -3159,7 +3199,10 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 w2_weight=layer.w2_weight.data,
                 w13_weight_scale=layer.w13_weight_scale.data,
                 w2_weight_scale=layer.w2_weight_scale.data,
-                g1_scale_c=layer.g1_scale_c.data,
+                g1_scale_c=(layer.g1_scale_c.data
+                           if hasattr(layer, "g1_scale_c")
+                           else _diag_missing_g1_scale_c(layer)),
+
                 g1_alphas=layer.g1_alphas.data,
                 g2_alphas=layer.g2_alphas.data,
                 w13_input_scale_quant=layer.w13_input_scale_quant,
@@ -3269,3 +3312,10 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             f"Unsupported moe_runner_backend for NVFP4 MoE: {moe_runner_backend}. "
             "Use --moe-runner-backend flashinfer_cutlass instead."
         )
+
+
+def _diag_missing_g1_scale_c(layer):
+    sc = layer.w2_input_scale_quant * layer.g1_alphas
+    from sglang.srt.layers.utils import copy_or_rebind_param
+    copy_or_rebind_param(layer, "g1_scale_c", sc.to(torch.float32))
+    return layer.g1_scale_c.data

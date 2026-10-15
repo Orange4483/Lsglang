@@ -48,6 +48,11 @@ from sglang.srt.managers.schedule_batch import MM_PAD_SHIFT_VALUE
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.runtime_context import get_model, get_parallel, get_serving
 from sglang.srt.utils import add_prefix, is_cuda
+from sglang.srt.utils.common import (
+    is_lk_engram_nvme_enabled,
+    get_lk_engram_nvme_cache_bytes,
+    get_lk_engram_nvme_staging_bytes,
+)
 from sglang.srt.utils.hf_transformers.tokenizer import get_tokenizer
 
 logger = logging.getLogger(__name__)
@@ -758,7 +763,7 @@ class EngramEmbedding(nn.Module):
         self.rows = row_end - self.row_start
         self.host_table: Optional[_HostTable] = None
         self.nvme_table = None
-        if envs.SGLANG_ENABLE_DSV41_ENGRAM_NVME.get():
+        if is_lk_engram_nvme_enabled():
             from sglang.srt.layers.engram_nvme import (
                 NvmeEngramStore,
                 validate_configuration,
@@ -777,8 +782,8 @@ class EngramEmbedding(nn.Module):
                 layer_id,
                 num_embeddings,
                 dim,
-                envs.SGLANG_DSV41_ENGRAM_NVME_CACHE_BYTES.get(),
-                envs.SGLANG_DSV41_ENGRAM_NVME_STAGING_BYTES.get(),
+                get_lk_engram_nvme_cache_bytes(),
+                get_lk_engram_nvme_staging_bytes(),
             )
             self.weight = nn.Parameter(
                 torch.empty(0, dtype=torch.float8_e4m3fn), requires_grad=False
@@ -897,6 +902,14 @@ class EngramEmbedding(nn.Module):
     def _owned_rows(self, indices: torch.Tensor) -> torch.Tensor:
         """Rows of `indices` this rank's shard holds, zero for the rest."""
         if self.nvme_table is not None:
+            if self.tp_size > 1:
+                # TP contract (see _lookup): each rank serves only its row
+                # shard; unowned rows must read zero so the all-reduce
+                # reassembles exactly once.
+                local = indices - self.row_start
+                owned = (local >= 0) & (local < self.rows)
+                rows = self.nvme_table.lookup(local.masked_fill(~owned, 0))
+                return rows.masked_fill(~owned.unsqueeze(-1), 0)
             return self.nvme_table.lookup(indices)
         if self.rows == 0:
             return self._empty(indices).zero_()

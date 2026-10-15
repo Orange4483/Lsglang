@@ -278,7 +278,8 @@ def load_model_with_memory_saver(
             model_config.hf_text_config.ple_offload_backend = (
                 get_exec().offload.ple_offload_backend
             )
-            if get_exec().offload.ple_offload_backend != "file":
+            if get_exec().offload.ple_offload_backend not in ("file", "nvme"):
+                model_config.hyf_text_config = model_config.hf_text_config
                 model_config.hf_text_config.ple_offload_dir = (
                     get_exec().offload.ple_offload_dir
                 )
@@ -292,7 +293,13 @@ def load_model_with_memory_saver(
                     get_exec().offload.ple_offload_dir
                     or default_ple_table_dir(get_model().model_path)
                 )
-                if ple_offload_embedding and device == "cuda":
+                if (
+                    ple_offload_embedding
+                    and get_exec().offload.ple_offload_backend == "file"
+                    and device == "cuda"
+                ):
+                    # only the file backend GPU-reads host page tables;
+                    # the nvme backend never maps the table for reads.
                     check_file_backend_supported(
                         torch.cuda.current_device() if torch.cuda.is_available() else 0
                     )

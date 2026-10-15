@@ -106,7 +106,7 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 logger = logging.getLogger(__name__)
 
-from sglang.srt.utils.common import is_lk_moe_feature_enabled, get_pool_log, get_pool_inflight, is_lk_prefill_debug, is_lk_moe_gpu_resident_layer, get_gpu_prefetch_window, get_gpu_prefill_min_tokens, get_pool_window, get_super_chunk_size, get_bool_env_var, get_int_env_var, is_lk_gpu_prefill_enabled, get_model_type_from_layer_name, is_lk_pool_layer, get_pool_slots, is_lk_pool_decode_enabled, lk_route_probe_enabled
+from sglang.srt.utils.common import is_lk_moe_feature_enabled, get_pool_log, get_verify_resident, get_verify_skip_miss, get_hf_mbox, get_pool_inflight, is_lk_prefill_debug, is_lk_moe_gpu_resident_layer, get_gpu_prefetch_window, get_gpu_prefill_min_tokens, get_pool_window, get_super_chunk_size, get_bool_env_var, get_int_env_var, is_lk_gpu_prefill_enabled, get_model_type_from_layer_name, is_lk_pool_layer, get_pool_slots, is_lk_pool_decode_enabled, lk_route_probe_enabled
 from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import CompressedTensorsFusedMoEMethod
 from sglang.srt.model_executor.runner import get_is_capture_mode
 if is_lk_moe_feature_enabled():
@@ -313,6 +313,9 @@ def _validate_deepep_v2_quant_method(quant_method) -> None:
         )
 
 
+_DSPP = [0]
+
+
 class FusedMoE(torch.nn.Module):
     """FusedMoE layer for MoE models.
 
@@ -345,6 +348,10 @@ class FusedMoE(torch.nn.Module):
     scheme = None
 
     _skip_aiter_moe_shuffle: bool = False
+
+    # Verify-batch row multiplier (NEXTN draft rows per real token) agreed
+    # across pool layers at init; single source of truth for decode sizing.
+    _pool_verify_rows_mult = 1
 
     def __init__(
         self,
@@ -2046,6 +2053,9 @@ class FusedMoE(torch.nn.Module):
         cfg.role_draft = self.model_type != "main"
         cfg.pool_decode = self.pool_decode
         cfg.pool_slots = get_pool_slots()
+        cfg.verify_resident = get_verify_resident()
+        cfg.verify_skip_miss = get_verify_skip_miss()
+        cfg.hf_mbox = get_hf_mbox()
         num_processes, process_id, gpu_id = self._get_processes_info()
         cfg.num_processes = num_processes
         cfg.process_id = process_id
@@ -2389,6 +2399,7 @@ class FusedMoE(torch.nn.Module):
         H, I, k = cfg.hidden_size, cfg.intermediate_size, cfg.top_k
         SB = caps["stride_n"]
         PK = caps["packed_k_per_iter"]
+        SSZ = int(caps.get("scale_size", 1))
         ITERS = 16
         NB_GATEUP, NB_DOWN = I // SB, H // SB
         total_iters = (H // PK) // ITERS
@@ -2399,13 +2410,21 @@ class FusedMoE(torch.nn.Module):
         # Sized ONCE from the concurrency limit: every decode batch is
         # covered by construction, no runtime growth path.
         cap = max(1, self.max_running_requests)
-        rows = cap * k
+        # LK_VERIFY_RESIDENT: verify batches cover the DRAFT rows' resident
+        # experts on the GPU too (row-major slot space of bs*k), so the CPU
+        # side computes only misses on every row, not just real rows.
+        rpt0 = self.speculative_num_draft_tokens or 1
+        mult = rpt0 if (get_verify_resident()
+                        and rpt0 > 1) else 1
+        FusedMoE._pool_verify_rows_mult = max(FusedMoE._pool_verify_rows_mult, mult)
+        rows = cap * k * FusedMoE._pool_verify_rows_mult
         dev = torch.cuda.current_device()
         if not hasattr(FusedMoE, "pool_hbuf"):
             FusedMoE._pool_k = k
             FusedMoE._pool_decode_cap = cap
             FusedMoE.pool_hbuf = torch.zeros((rows, 2 * I), dtype=torch.float32, device=dev)
-            FusedMoE.pool_gout = torch.zeros((cap, H), dtype=torch.float32, device=dev)
+            FusedMoE.pool_gout = torch.zeros(
+                (cap * FusedMoE._pool_verify_rows_mult, H), dtype=torch.float32, device=dev)
             FusedMoE.pool_slot_tab = torch.full((rows,), -1, dtype=torch.int32, device=dev)
             FusedMoE.pool_gathered_ids = torch.zeros((rows,), dtype=torch.int32, device=dev)
             FusedMoE.pool_gathered_weights = torch.zeros((rows,), dtype=torch.float32, device=dev)
@@ -2434,15 +2453,25 @@ class FusedMoE(torch.nn.Module):
         geo = self._pool_layer_info
         H, I, k = geo["H"], geo["I"], geo["k"]
         SG, SGB, PK = geo["scale_group"], geo["scale_groups_blk"], geo["packed_k_per_iter"]
+        SSZ = int(geo.get("scale_size", 1))
         real_tokens = hidden_states.size(0) if real_tokens is None else real_tokens
         n_slots = real_tokens * k
         hpart, hbuf, gout = FusedMoE.pool_hpart, FusedMoE.pool_hbuf, FusedMoE.pool_gout
         gout_part = FusedMoE.pool_gout_part
         slot_tab = FusedMoE.pool_slot_tab
         side_stream = FusedMoE.pool_stream
-        if rows_per_token > 1:
+        all_rows = (rows_per_token > 1
+                    and FusedMoE._pool_verify_rows_mult > 1)
+        if rows_per_token > 1 and not all_rows:
             gathered_ids = FusedMoE.pool_gathered_ids[:n_slots]
             gathered_weights = FusedMoE.pool_gathered_weights[:n_slots]
+        elif all_rows:
+            # row-major slot space: every batch row (real AND draft) gets its
+            # own k slots; kernels see rows_per_token == 1 addressing.
+            n_slots = real_tokens * rows_per_token * k
+            gathered_ids, gathered_weights = topk_ids, topk_weights
+            real_tokens = real_tokens * rows_per_token   # reduce works per row
+            rows_per_token = 1
         else:
             gathered_ids, gathered_weights = topk_ids, topk_weights
         side_stream.wait_stream(torch.cuda.current_stream())
@@ -2469,7 +2498,7 @@ class FusedMoE(torch.nn.Module):
                 SLOT_BYTES=geo["slot_bytes"][0],
                 SLOT_SCALE_BYTES=geo["slot_scale_bytes"][0],
                 HIDDEN=H, ITERS=geo["ITERS"], SCALE_GROUP=SG,
-                FORMAT=geo["format"], FORMAT_PACKED_K=PK,
+                FORMAT=geo["format"], FORMAT_PACKED_K=PK, SCALE_SIZE=SSZ,
                 HAS_GATE=geo["has_gate"], ACTIVATION=geo["activation"],
                 ALPHA=geo["swiglu_alpha"], LIMIT=geo["swiglu_limit"],
                 KS=geo["KS"], NGK=geo["NGK"])
@@ -2484,7 +2513,7 @@ class FusedMoE(torch.nn.Module):
                 SLOT_BYTES=geo["slot_bytes"][2],
                 SLOT_SCALE_BYTES=geo["slot_scale_bytes"][2],
                 ITERS=geo["ITERS"], SCALE_GROUP=SG,
-                FORMAT=geo["format"], FORMAT_PACKED_K=PK,
+                FORMAT=geo["format"], FORMAT_PACKED_K=PK, SCALE_SIZE=SSZ,
                 HAS_GATE=geo["has_gate"], ACTIVATION=geo["activation"],
                 ALPHA=geo["swiglu_alpha"], LIMIT=geo["swiglu_limit"])
             reduce_down[(triton.cdiv(H, 1024),)](
@@ -2529,6 +2558,9 @@ class FusedMoE(torch.nn.Module):
             if rows_per_token == 1:
                 FusedMoE.output_gpu[:real_tokens].add_(
                     FusedMoE.pool_gout[:real_tokens])
+            elif FusedMoE._pool_verify_rows_mult > 1:
+                n_rows = real_tokens * rows_per_token
+                FusedMoE.output_gpu[:n_rows].add_(FusedMoE.pool_gout[:n_rows])
             else:
                 for tok in range(real_tokens):
                     real_row = tok * rows_per_token
@@ -2542,7 +2574,6 @@ class FusedMoE(torch.nn.Module):
  
 
     def _cpu_prefill(self, hidden_states, topk_weights, topk_ids): 
-        
         expert_ids_cpu = topk_ids.to(dtype=torch.int32, device='cpu', non_blocking=True)
         weights_cpu = topk_weights.to(dtype=torch.float32, device='cpu', non_blocking=True)
         hidden_states_cpu = hidden_states.to(device='cpu', non_blocking=True)

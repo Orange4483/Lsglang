@@ -1592,9 +1592,6 @@ class Envs:
     SGLANG_SM120_MXFP8_B12X_SMALL_BATCH = EnvBool(False)
     # Exact, bounded-memory lookup from an immutable local safetensors shard.
     # Cache and staging limits are per Engram layer, in bytes.
-    SGLANG_ENABLE_DSV41_ENGRAM_NVME = EnvBool(False)
-    SGLANG_DSV41_ENGRAM_NVME_CACHE_BYTES = EnvInt(1 << 30)
-    SGLANG_DSV41_ENGRAM_NVME_STAGING_BYTES = EnvInt(128 << 20)
     # Diagnostic: disable the decode-only side streams (early compress/indexer
     # sources on Blackwell, hc-mix stats stream, engram KV prefetch) so a plain
     # decode step matches the SM80/86 single-stream structure for A/B.

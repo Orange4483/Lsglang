@@ -74,8 +74,18 @@ def _super_chunk_unsupported_reason(
             return "speculative decoding"
     if getattr(fb, "global_num_tokens_cpu", None) is not None:
         return "dp-attention mlp sync"
-    if getattr(fb, "out_cache_loc_dsv4", None) is not None:
-        return "dsv4 packed out_cache_loc"
+    dsv4_loc = fb.out_cache_loc_dsv4
+    if dsv4_loc is not None:
+        # Every packed pool loc is a per-extend-token row; the child builder
+        # slices all four on the token axis. Anything else-shaped (e.g. an
+        # allocator variant that packs per-page) stays monolithic.
+        num_tok = fb.extend_num_tokens
+        if num_tok is None or any(
+            not torch.is_tensor(getattr(dsv4_loc, f))
+            or getattr(dsv4_loc, f).shape[0] != num_tok
+            for f in ("out_full_loc", "out_swa_loc", "out_c4_loc", "out_c128_loc")
+        ):
+            return "dsv4 packed out_cache_loc (unshapable)"
     num = fb.extend_num_tokens
     if num is None or num <= inner_size:
         return "single sub-chunk"
@@ -141,6 +151,20 @@ def build_super_chunk_children(
         child.out_cache_loc = fb.out_cache_loc[tok]
         if fb.out_cache_loc_virtual is not None:
             child.out_cache_loc_virtual = fb.out_cache_loc_virtual[tok]
+        dsv4_loc = fb.out_cache_loc_dsv4
+        if dsv4_loc is not None:
+            # The four packed pool locs are per-extend-token rows (the gate
+            # in _super_chunk_unsupported_reason checked the shape); each
+            # child writes exactly its own [lo, hi) slice of every pool.
+            import dataclasses
+
+            child.out_cache_loc_dsv4 = dataclasses.replace(
+                dsv4_loc,
+                out_full_loc=dsv4_loc.out_full_loc[tok],
+                out_swa_loc=dsv4_loc.out_swa_loc[tok],
+                out_c4_loc=dsv4_loc.out_c4_loc[tok],
+                out_c128_loc=dsv4_loc.out_c128_loc[tok],
+            )
 
         req = slice(r1, r_end)
         child.batch_size = r_end - r1
@@ -354,6 +378,18 @@ class SuperChunkAttnBackend(AttentionBackend):
         # Primary metadata too: the per-call safe-side fallback replays the
         # whole forward on primary and must find its metadata in place.
         self.primary.init_forward_metadata(forward_batch=forward_batch)
+        tail_md = getattr(self.primary, "tail_forward_metadata", None)
+        if getattr(getattr(tail_md, "late_layer_tail", None), "token_indices",
+                   None) is not None:
+            # dsv4 late-layer tail: the model swaps full-row metadata onto the
+            # primary at late_layer_start; the late layers' q is gathered to
+            # tail rows, which no token-axis child slice can reproduce
+            # (sparse prefill would mix sub-chunk q rows with full cache
+            # rows). Fall back to the whole-forward primary path.
+            self._active = False
+            self._child_batches = None
+            self._child_bounds = None
+            return
         self._active = True
 
     def forward(

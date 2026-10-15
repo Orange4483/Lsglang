@@ -138,6 +138,26 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         else:
             self._swa_ring_cost = 0
 
+        # Pre-launch (compile + cuModuleLoad) the release-path kernel here, at
+        # init, while the context is idle: a cold module load from
+        # free_swa_segment during serving can stall tens of seconds in the GSP
+        # RPC path (bugs/2026-10-13_gsp_double_death). Fully isolated dummy
+        # buffers below, so no allocator state is touched or observed.
+        _warm_map = torch.zeros(2 * self.page_size, dtype=self.full_to_swa_index_mapping.dtype, device=device)
+        # int32 matches req_to_token (free_index[::ps] is what the release
+        # path really passes); reps dtype is part of the triton cache key.
+        _warm_buf = torch.zeros(2 * self.page_size, dtype=torch.int32, device=device)
+        logger.info("[swa-warm] preloading release kernel at init (ps=%d)", self.page_size)
+        get_and_clear_swa_pages(
+            _warm_buf[:: self.page_size],
+            _warm_map,
+            self.page_size,
+            check_page_mappings=self.swa_attn_allocator.debug_mode
+            if self.page_size > 1
+            else False,
+        )
+        torch.cuda.synchronize(device)
+
         self.clear()
         self._kvcache.register_mapping(self.full_to_swa_index_mapping)
 

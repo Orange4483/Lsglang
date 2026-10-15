@@ -1383,12 +1383,45 @@ def set_int_env_var(name: str, value: int):
     os.environ[name] = str(value)
 
 
+# ---------------------------------------------------------------- lk_moe
+# NVMe filler direct-mode knobs (single registration point for every
+# consumer: engram / PLE / future vllm backend). LK_NVME_DIRECT switches the
+# row filler from page-cache pread to O_DIRECT + a pinned direct-mapped
+# cache (LK_NVME_CACHE_MB); it only takes effect under the feature's own master
+# switch (env master or a resolved runtime backend flag), so turning that
+# off makes these inert again.
+def lk_nvme_direct(master_enabled: bool) -> bool:
+    return bool(master_enabled) and get_bool_env_var("LK_NVME_DIRECT", "false")
+
+
+# Engram-on-NVMe knobs (our feature, PR #28): single registration point,
+# legacy committed names are read side-by-side in the helpers (no
+# rename-table entries: the bool reads both spellings, the budgets BYTES != MB).
+def is_lk_engram_nvme_enabled() -> bool:
+    # Single spelling, single point (the old committed name is not read).
+    return get_bool_env_var("LK_ENGRAM_NVME")
+
+
+def get_lk_engram_nvme_cache_bytes() -> int:
+    # Budget in MB (byte-conversion lives here; env UI never speaks bytes).
+    return get_int_env_var("LK_ENGRAM_NVME_CACHE_MB", 1024) << 20
+
+
+def get_lk_engram_nvme_staging_bytes() -> int:
+    return get_int_env_var("LK_ENGRAM_NVME_STAGING_MB", 128) << 20
+
+
+def lk_nvme_cache_bytes(master_enabled: bool) -> int:
+    if not master_enabled:
+        return 0
+    return get_int_env_var("LK_NVME_CACHE_MB", 1024) << 20
+
+
 # Historical LVLLM_* env names are auto-renamed to the unified LK_* names once
 # at import, so existing scripts keep working (both set -> LK_* wins).
 _LK_ENV_RENAMES = {
     "LVLLM_MOE_NUMA_ENABLED": "LK_MOE_HYBRID_ENABLED",
     "LVLLM_ENABLE_NUMA_INTERLEAVE": "LK_NUMA_INTERLEAVE",
-    "LVLLM_EMBEDDING_NUMA_ENABLED": "LK_EMBEDDING_NUMA",
     "LVLLM_GPU_PREFILL_MIN_BATCH_SIZE": "LK_GPU_PREFILL_MIN_TOKENS",
     "LVLLM_GPU_PREFETCH_WINDOW": "LK_GPU_PREFETCH_WINDOW",
     "LVLLM_GPU_RESIDENT_MOE_LAYERS": "LK_GPU_RESIDENT_MOE_LAYERS",
@@ -5046,15 +5079,14 @@ def is_lk_moe_feature_enabled() -> bool:
     return get_bool_env_var("LK_MOE_HYBRID_ENABLED")
 
 def is_numa_interleave_enabled() -> bool:
-    return get_bool_env_var("LK_NUMA_INTERLEAVE")
-
-def is_lk_embedding_cpu_enabled() -> bool:
-    return get_bool_env_var("LK_EMBEDDING_NUMA")
+    # Doctrine: tier power follows the master switch - default on; 0 opts out.
+    return get_bool_env_var("LK_NUMA_INTERLEAVE", default="true")
 
 def get_gpu_prefill_min_tokens() -> int:
-    # Sole GPU-prefill gate: >0 enables the tier, 0 = pure CPU prefill.
+    # Dual knob (designs/lk_switch_doctrine.md rule 2): default 0 = tier off,
+    # pure CPU prefill; >0 both enables the tier and sets the batch gate.
     # Forwarded to lk_moe via cfg; lk_moe itself never reads the env.
-    return get_int_env_var("LK_GPU_PREFILL_MIN_TOKENS", 256)
+    return get_int_env_var("LK_GPU_PREFILL_MIN_TOKENS", 0)
 
 def get_pool_window() -> int:
     # Tuned default (hit ~81%). The ONLY pool switch is LK_POOL_SLOTS: any
@@ -5075,6 +5107,22 @@ def get_pool_inflight() -> int:
     # backpressure cap is 8x this -- 12 false-positives at small batch.
     return get_int_env_var("LK_POOL_INFLIGHT", 16)
 
+def get_verify_resident() -> int:
+    # VR: draft-row pool-resident experts computed GPU-side; has an acceptance
+    # fidelity tradeoff -> python-owned cfg value (LK_* env is the script UI).
+    return get_int_env_var("LK_VERIFY_RESIDENT", 0)
+
+
+def get_verify_skip_miss() -> int:
+    # verify rows drop CPU-side misses (distribution declaration, not bitwise).
+    return get_int_env_var("LK_VERIFY_SKIP_MISS", 0)
+
+
+def get_hf_mbox() -> int:
+    # mailbox early-start decode path (default on; 0 = pure host-node path).
+    return get_int_env_var("LK_HF_MBOX", 1)
+
+
 def get_pool_log() -> int:
     # dstep interval of the C++ [pool] stats line (0 = silent).
     return get_int_env_var("LK_POOL_LOG")
@@ -5084,8 +5132,9 @@ def is_lk_prefill_debug() -> bool:
     return get_bool_env_var("LK_PP_DEBUG")
 
 def get_gpu_prefetch_window() -> int:
-    # 2 = ping-pong rings (copy overlaps gemm); 1 serializes the two halves.
-    return get_int_env_var("LK_GPU_PREFETCH_WINDOW", 2)
+    # Dual-semantics perf knob: 1 (default) = serialized halves; 2 = ping-pong
+    # rings (copy overlaps gemm) - only worth it with fast PCIe.
+    return get_int_env_var("LK_GPU_PREFETCH_WINDOW", 1)
 
 
 def get_model_type_from_layer_name(layer_name: str) -> str:
@@ -5114,6 +5163,14 @@ def get_gpu_resident_env_var(model_type: str = "main") -> Optional[str]:
             return env_value
 
     return get_str_env_var("LK_GPU_RESIDENT_MOE_LAYERS", None)
+
+def is_lk_ple_probe_enabled() -> bool:
+    """PLE ngram-row locality/traffic probe master switch."""
+    return get_bool_env_var("LK_PLE_PROBE")
+
+def get_lk_ple_probe_dump_path() -> Optional[str]:
+    """Probe row-dump path, or None (empty string means off)."""
+    return get_str_env_var("LK_PLE_PROBE_DUMP", None) or None
 
 def is_lk_moe_gpu_resident_layer(layer_id: str, model_type: str = "main") -> bool:
     if not is_lk_moe_feature_enabled():
