@@ -32,11 +32,13 @@ sglang serve \
   --trust-remote-code \
   --tensor-parallel-size 2 \
   --max-running-requests 2 \
+  --reasoning-parser auto \
+  --tool-call-parser auto \
   --disable-shared-experts-fusion \
   --disable-custom-all-reduce \
-  --chunked-prefill-size 8192 \
+  --chunked-prefill-size 1024 \
   --max-total-tokens 262144 \
-  --mem-fraction-static 0.86 \
+  --mem-fraction-static 0.85 \
   --cuda-graph-backend-prefill disabled \
   --speculative-algorithm DSPARK \
   --speculative-dspark-block-size 5 \

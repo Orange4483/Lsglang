@@ -23,7 +23,7 @@ sglang serve \
     --trust-remote-code \
     --tensor-parallel-size 2 \
     --max-running-requests 2 \
-    --chunked-prefill-size 1024 \
+    --chunked-prefill-size 8192 \
     --max-total-tokens 262144 \
     --mem-fraction-static 0.95 \
     --tool-call-parser auto \

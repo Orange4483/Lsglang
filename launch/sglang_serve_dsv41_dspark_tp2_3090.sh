@@ -16,7 +16,7 @@ LK_NUMA_INTERLEAVE=1 \
 LK_POWER_SAVING=1 \
 LK_GPU_RESIDENT_MOE_LAYERS="" \
 LK_GPU_RESIDENT_MOE_LAYERS_SPEC="" \
-LK_POOL_SLOTS=18 \
+LK_POOL_SLOTS=0 \
 SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0 \
 SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE=1 \
 SGLANG_SKIP_P2P_CHECK=1 \
@@ -30,11 +30,14 @@ sglang serve \
   --enable-decoder-swa-bounded-replay \
   --tensor-parallel-size 2 \
   --max-running-requests 2 \
+  --reasoning-parser auto \
+  --tool-call-parser auto \
   --disable-shared-experts-fusion \
   --disable-custom-all-reduce \
-  --chunked-prefill-size 4096 \
-  --max-total-tokens 40000 \
-  --mem-fraction-static 0.90 \
+  --chunked-prefill-size 1024 \
+  --max-total-tokens 262144 \
+  --mem-fraction-static 0.80 \
+  --swa-full-tokens-ratio 0.1 \
   --cuda-graph-backend-prefill disabled \
   --speculative-algorithm DSPARK \
   --speculative-dspark-block-size 5 \

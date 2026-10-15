@@ -80,35 +80,58 @@ pip install -e "python" --no-build-isolation -vvv
 Full launch script: [`launch/sglang_serve_qwen38_mtp_tp2_3090.sh`](launch/sglang_serve_qwen38_mtp_tp2_3090.sh) · [ple on nvme](launch/sglang_serve_qwen38_mtp_tp2_3090_nvme.sh).
 
 ```bash
+
 CUDA_DEVICE_ORDER=PCI_BUS_ID \
+GLIBC_TUNABLES=glibc.malloc.thp_enabled=0 \
+GLOO_SOCKET_IFNAME=lo NCCL_SOCKET_IFNAME=lo \
 CUDA_VISIBLE_DEVICES=0,3 \
+SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0 \
 LK_MOE_HYBRID_ENABLED=1 \
-LK_THREAD_BINDING=CPU_CORE \
 LK_THREADS=48 \
 OMP_NUM_THREADS=1 \
-LK_NUMA_INTERLEAVE=1 \
-LK_POWER_SAVING=1 \
+LK_THREAD_BINDING=CPU_CORE \
 LK_GPU_PREFETCH_WINDOW=1 \
 LK_GPU_PREFILL_MIN_TOKENS=1024 \
 LK_GPU_PREFILL_SUB_M=32768 \
-LK_POOL_SLOTS=32 \
-python -m sglang.launch_server \
-    --model /data/models/Qwen3.8-Flash-Next-NVFP4-W4A16-4o6-FP8 \
-    --served-model-name Qwen3.8-Flash-Next-NVFP4 \
-    --host 0.0.0.0 --port 8070 \
-    --trust-remote-code \
-    --tensor-parallel-size 2 \
-    --max-running-requests 2 \
-    --disable-shared-experts-fusion \
-    --disable-custom-all-reduce \
-    --ple-offload-embedding --ple-offload-backend pinned \
-    --chunked-prefill-size 16384 --max-total-tokens 262144 \
-    --mem-fraction-static 0.90 \
-    --mamba-radix-cache-strategy extra_buffer_lazy \
-    --max-mamba-cache-size 11 \
-    --reasoning-parser auto --tool-call-parser auto \
-    --speculative-algorithm NEXTN \
-    --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4
+LK_NUMA_INTERLEAVE=1 \
+LK_POWER_SAVING=1 \
+LK_GPU_RESIDENT_MOE_LAYERS="" \
+LK_GPU_RESIDENT_MOE_LAYERS_SPEC="" \
+LK_POOL_SLOTS=96 \
+LK_POOL_LOG=0 \
+FLASHINFER_DISABLE_VERSION_CHECK=1 \
+sglang serve \
+  --model ~/Models/Qwen3.8-Flash-Next-NVFP4-W4A16-4o6-FP8 \
+  --served-model-name Qwen3.8-Flash-Next-NVFP4 \
+  --host 0.0.0.0 \
+  --port 8070 \
+  --trust-remote-code \
+  --tensor-parallel-size 2 \
+  --max-running-requests 2 \
+  --disable-shared-experts-fusion \
+  --disable-custom-all-reduce \
+  --ple-offload-embedding \
+  --ple-offload-backend pinned \
+  --chunked-prefill-size 1024 \
+  --max-total-tokens 262144 \
+  --mem-fraction-static 0.95 \
+  --warmups prefill_shapes \
+  --mm-feature-transport=cpu \
+  --mm-attention-backend flashinfer_cudnn \
+  --image-processor-backend pil \
+  --mm-process-config '{"image":{"max_pixels":3686400,"min_pixels":200704}}' \
+  --mamba-radix-cache-strategy extra_buffer_lazy \
+  --mamba-max-states-per-path 2 \
+  --mamba-track-interval 256 \
+  --max-mamba-cache-size 11 \
+  --reasoning-parser auto \
+  --tool-call-parser auto \
+  --speculative-algorithm NEXTN \
+  --speculative-num-steps 3 \
+  --speculative-eagle-topk 1 \
+  --speculative-num-draft-tokens 4 \
+  --default-chat-template-kwargs '{"thinking":true,"reasoning_effort":"medium"}' \
+  --moe-runner-backend marlin
 ```
 
 ---
@@ -266,8 +289,8 @@ Legend: ✅ tested · `ok` supported, not yet tested · blank = to be filled.
 
 | Model | sm80 | sm86 | sm89 | sm90 | sm100 | sm120+ | Launch |
 |-------|:----:|:----:|:----:|:----:|:-----:|:------:|--------|
-| [Qwen3.8-Flash-Next](https://huggingface.co/lovedheart/Qwen3.8-Flash-Next-NVFP4-W4A16-4-Over-6-FP8) | ok | ✅ | ok | ok | ok | ✅ | [launch](launch/sglang_serve_qwen38_mtp_tp2_3090.sh) · [ple on nvme](launch/sglang_serve_qwen38_mtp_tp2_3090_nvme.sh) |
-| [DeepSeek-V4.1-Flash](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash) | ok | ✅ | ok | ok | ok | ✅ | [launch](launch/sglang_serve_dsv41_dspark_tp2_3090.sh) · [engram on nvme](launch/sglang_serve_dsv41_tp2_3090_nvme.sh) |
+| [Qwen3.8-Flash-Next](https://huggingface.co/lovedheart/Qwen3.8-Flash-Next-NVFP4-W4A16-4-Over-6-FP8) | ok | ✅ | ok | ok | ok | ✅ | [launch](launch/sglang_serve_qwen38_mtp_tp2_3090.sh)  |
+| [DeepSeek-V4.1-Flash](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash) | ok | ✅ | ok | ok | ok | ✅ | [launch](launch/sglang_serve_dsv41_dspark_tp2_3090.sh) · |
 | [DeepSeek-V4-Flash-0731](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-0731) | ok | ✅ | ok | ok | ok | ✅ | [launch](launch/sglang_serve_0731_dspark_tp2_3090.sh) |
 | [GLM-5.3-Flash-NVFP4](https://huggingface.co/nvidia/GLM-5.3-Flash-NVFP4) | ok | ✅ | ok | ok | ok | ✅ | [launch](launch/sglang_serve_glm53_mtp_tp2_3090.sh) |
 | [Qwen3.6-35B-A3B](https://huggingface.co/nvidia/Qwen3.6-35B-A3B-NVFP4) | ok | ✅ | ok | ok | ok | ✅ | [launch](launch/sglang_serve_qwen36_mtp_tp2_3090.sh) |

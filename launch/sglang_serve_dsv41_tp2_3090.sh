@@ -32,9 +32,12 @@ sglang serve \
   --enable-decoder-swa-bounded-replay \
   --tensor-parallel-size 2 \
   --max-running-requests 2 \
+  --reasoning-parser auto \
+  --tool-call-parser auto \
   --disable-shared-experts-fusion \
   --disable-custom-all-reduce \
   --chunked-prefill-size 1024 \
-  --max-total-tokens 131072 \
-  --mem-fraction-static 0.80 \
+  --max-total-tokens 262144 \
+  --mem-fraction-static 0.78 \
+  --swa-full-tokens-ratio 0.1 \
   --cuda-graph-backend-prefill disabled \

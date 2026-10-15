@@ -19,7 +19,7 @@ LK_GPU_PREFILL_SUB_M=8192 \
 LK_NUMA_INTERLEAVE=1 \
 LK_POWER_SAVING=1 \
 LK_GPU_RESIDENT_MOE_LAYERS="" \
-LK_POOL_SLOTS=16 \
+LK_POOL_SLOTS=12 \
 FLASHINFER_DISABLE_VERSION_CHECK=1 \
 /home/guqiong/.conda/envs/Lsglang/bin/python /home/guqiong/Downloads/sglang/python/sglang/launch_server.py \
   --model ~/Models/GLM-5.3-Flash-NVFP4 \
@@ -29,9 +29,10 @@ FLASHINFER_DISABLE_VERSION_CHECK=1 \
   --trust-remote-code \
   --tensor-parallel-size 2 \
   --max-running-requests 2 \
+  --max-mamba-cache-size 11 \
   --disable-shared-experts-fusion \
   --disable-custom-all-reduce \
-  --chunked-prefill-size 4096 \
-  --max-total-tokens 140000 \
-  --mem-fraction-static 0.85 \
-  --cuda-graph-backend-prefill disabled \
+  --chunked-prefill-size 1024 \
+  --max-total-tokens 262144 \
+  --mem-fraction-static 0.80 \
+  --cuda-graph-backend-prefill disabled

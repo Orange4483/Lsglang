@@ -18,7 +18,7 @@ LK_GPU_PREFILL_SUB_M=16384 \
 LK_NUMA_INTERLEAVE=1 \
 LK_POWER_SAVING=1 \
 LK_GPU_RESIDENT_MOE_LAYERS="" \
-LK_POOL_SLOTS=0 \
+LK_POOL_SLOTS=32 \
 SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0 \
 SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE=1 \
 SGLANG_SKIP_P2P_CHECK=1 \
@@ -31,9 +31,11 @@ sglang serve \
   --trust-remote-code \
   --tensor-parallel-size 2 \
   --max-running-requests 2 \
+  --reasoning-parser auto \
+  --tool-call-parser auto \
   --disable-shared-experts-fusion \
   --disable-custom-all-reduce \
-  --chunked-prefill-size 8192 \
+  --chunked-prefill-size 1024 \
   --max-total-tokens 262144 \
-  --mem-fraction-static 0.86 \
-  --cuda-graph-backend-prefill disabled \
+  --mem-fraction-static 0.85 \
+  --cuda-graph-backend-prefill disabled
