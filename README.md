@@ -89,7 +89,7 @@ SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0 \
 LK_MOE_HYBRID_ENABLED=1 \
 LK_THREADS=48 \
 OMP_NUM_THREADS=1 \
-LK_THREAD_BINDING=CPU_CORE \
+LK_THREAD_BINDING=NUMA_NODE \
 LK_GPU_PREFETCH_WINDOW=1 \
 LK_GPU_PREFILL_MIN_TOKENS=1024 \
 LK_GPU_PREFILL_SUB_M=32768 \
@@ -101,7 +101,7 @@ LK_POOL_SLOTS=96 \
 LK_POOL_LOG=0 \
 FLASHINFER_DISABLE_VERSION_CHECK=1 \
 sglang serve \
-  --model ~/Models/Qwen3.8-Flash-Next-NVFP4-W4A16-4o6-FP8 \
+  --model ~/Models/Qwen3.8-Flash-Next-NVFP4-W4A16-ATTN-FP8-MTP-NVFP4 \
   --served-model-name Qwen3.8-Flash-Next-NVFP4 \
   --host 0.0.0.0 \
   --port 8070 \
@@ -289,7 +289,7 @@ Legend: ✅ tested · `ok` supported, not yet tested · blank = to be filled.
 
 | Model | sm80 | sm86 | sm89 | sm90 | sm100 | sm120+ | Launch |
 |-------|:----:|:----:|:----:|:----:|:-----:|:------:|--------|
-| [Qwen3.8-Flash-Next](https://huggingface.co/lovedheart/Qwen3.8-Flash-Next-NVFP4-W4A16-4-Over-6-FP8) | ok | ✅ | ok | ok | ok | ✅ | [launch](launch/sglang_serve_qwen38_mtp_tp2_3090.sh)  |
+| [Qwen3.8-Flash-Next](https://huggingface.co/lovedheart/Qwen3.8-Flash-Next-NVFP4-W4A16-ATTN-FP8-MTP-NVFP4) | ok | ✅ | ok | ok | ok | ✅ | [launch](launch/sglang_serve_qwen38_mtp_tp2_3090.sh)  |
 | [DeepSeek-V4.1-Flash](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash) | ok | ✅ | ok | ok | ok | ✅ | [launch](launch/sglang_serve_dsv41_dspark_tp2_3090.sh) · |
 | [DeepSeek-V4-Flash-0731](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-0731) | ok | ✅ | ok | ok | ok | ✅ | [launch](launch/sglang_serve_0731_dspark_tp2_3090.sh) |
 | [GLM-5.3-Flash-NVFP4](https://huggingface.co/nvidia/GLM-5.3-Flash-NVFP4) | ok | ✅ | ok | ok | ok | ✅ | [launch](launch/sglang_serve_glm53_mtp_tp2_3090.sh) |
