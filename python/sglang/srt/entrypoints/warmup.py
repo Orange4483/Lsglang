@@ -145,6 +145,7 @@ async def prefill_shapes(disaggregation_mode: str, tokenizer_manager: TokenizerM
             sizes.add(mid)
         base *= 2
     sizes.add(17)   # non-16-multiple: covers triton "other" int specialization class
+    sizes.add(33)   # crosses the 32-token attention-config bucket boundary
     sizes = sorted(sizes)
 
     for size in tqdm.tqdm(sizes, desc="Warmup prefill shapes (up to 32K)"):
@@ -159,4 +160,19 @@ async def prefill_shapes(disaggregation_mode: str, tokenizer_manager: TokenizerM
             generate_req_input.bootstrap_room = 0
             generate_req_input.bootstrap_host = FAKE_BOOTSTRAP_HOST
 
+        await tokenizer_manager.generate_request(generate_req_input, None).__anext__()
+
+    # NOTE(bs2-warmup): batched bs=2 warmup trips a device-side assert in
+    # the hybrid-linear child backend (see the bs2 case file in bugs/);
+    # until fixed, bs=2 kernel variants load on the first concurrent
+    # request.
+
+    for size in (65, 2049):
+        generate_req_input = GenerateReqInput(
+            input_ids=(np.random.randint(2**16, size=[size])).tolist(),
+            sampling_params={
+                "max_new_tokens": 8,
+                "temperature": 0.0,
+            },
+        )
         await tokenizer_manager.generate_request(generate_req_input, None).__anext__()
