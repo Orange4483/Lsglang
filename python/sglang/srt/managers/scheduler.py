@@ -6043,6 +6043,17 @@ def run_scheduler_process(
 ):
     # Load plugins so hooks can override Scheduler and its dependencies.
     load_plugins()
+    # Bind the rank's GPU before any arch probe runs (restores the pre-#39671
+    # binding lost in the refactor); mixed-TP (SM86+SM120) mis-dispatches
+    # without it since bare get_device_capability() reads current_device.
+    if gpu_id is not None and torch.cuda.is_available():
+        torch.cuda.set_device(gpu_id)
+        _cap = torch.cuda.get_device_capability(gpu_id)
+        print(
+            f"[scheduler] rank bound to cuda:{gpu_id} "
+            f"({torch.cuda.get_device_name(gpu_id)}, sm{_cap[0]}{_cap[1]})",
+            flush=True,
+        )
     dp_rank = resolve_spawn_dp_rank(dp_rank)
     # Placement is needed before publish(): TP/PP select a WORLD rank;
     # ordinary DP replicas have separate WORLDs and need an explicit DP rank.

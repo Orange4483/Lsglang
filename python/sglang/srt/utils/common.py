@@ -686,6 +686,10 @@ def _get_device_sm_via_nvml() -> Optional[int]:
         return None
     # Private torch API, read defensively: it maps the torch ordinal to the NVML
     # index under CUDA_VISIBLE_DEVICES / MIG; absent or failing -> fall back.
+    # Ordinal 0 is forced here: torch.cuda.current_device()/set_device both run
+    # _lazy_init (a real context) which this probe exists to avoid; pre-init,
+    # device 0 IS the current device. Per-rank correctness must come from
+    # callers deferring evaluation until the model worker binds the device.
     getter = getattr(torch.cuda, "_get_nvml_device_index", None)
     if getter is None:
         logger.debug(

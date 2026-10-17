@@ -567,7 +567,7 @@ def get_w8a8_block_fp8_configs(
 
     # First look up if an optimized configuration is available in the configs
     # directory
-    device_name = get_device_name().replace(" ", "_")
+    device_name = get_device_name(torch.cuda.current_device()).replace(" ", "_")
     json_file_name = f"N={N},K={K},device_name={device_name},dtype=fp8_w8a8,block_shape=[{block_n}, {block_k}].json"
 
     config_file_path = os.path.join(
@@ -632,7 +632,7 @@ def get_w8a8_channelwise_fp8_configs(N: int, K: int) -> Optional[Dict[int, Any]]
     if torch._dynamo.is_compiling():
         return None
 
-    device_name = get_device_name().replace(" ", "_")
+    device_name = get_device_name(torch.cuda.current_device()).replace(" ", "_")
     json_file_name = (
         f"N={N},K={K},device_name={device_name},dtype=fp8_w8a8_channelwise.json"
     )

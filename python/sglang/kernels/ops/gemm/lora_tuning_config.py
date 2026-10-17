@@ -35,6 +35,7 @@ import os
 from typing import Any, Dict, Optional
 
 import triton
+import torch
 
 from sglang.srt.utils import get_device_name
 
@@ -55,7 +56,7 @@ def get_lora_config_file_name(
         R: The max LoRA rank
         S: num_slices (qkv=3, gate_up=2, others=1)
     """
-    device_name = get_device_name().replace(" ", "_")
+    device_name = get_device_name(torch.cuda.current_device()).replace(" ", "_")
     return f"lora_{kernel},K={K},R={R},S={S},device={device_name}.json"
 
 
