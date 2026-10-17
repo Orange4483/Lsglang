@@ -3,6 +3,7 @@ DeepGEMM on SM100, torch elsewhere."""
 
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING
 
 import torch
@@ -24,6 +25,8 @@ from .scoring import (
     write_decode,
     write_prefill,
 )
+logger = logging.getLogger(__name__)
+
 from .types import (
     CapturedPrefillInputs,
     DecodeInputs,
@@ -115,6 +118,31 @@ class FullTopKIndexer:
                     ),
                 )
             return
+        if any(
+            v is None
+            for v in (
+                data.q_fp4,
+                data.q_sf,
+                data.k_cache,
+                data.weights,
+                metadata.compressed_seq_lens,
+                metadata.page_table,
+                metadata.deep_gemm_metadata,
+            )
+        ):
+            logger.error(
+                "deepgemm decode args: q_fp4=%s q_sf=%s k_cache=%s weights=%s "
+                "seq_lens=%s page_table=%s dg_meta=%s cps=%s ratio=%s",
+                type(data.q_fp4).__name__,
+                type(data.q_sf).__name__,
+                type(data.k_cache).__name__,
+                type(data.weights).__name__,
+                type(metadata.compressed_seq_lens).__name__,
+                type(metadata.page_table).__name__,
+                type(metadata.deep_gemm_metadata).__name__,
+                metadata.compressed_page_size,
+                inputs.compress_ratio,
+            )
         logits = deep_gemm_fp4_paged_mqa_logits(
             (data.q_fp4, data.q_sf),
             data.k_cache,

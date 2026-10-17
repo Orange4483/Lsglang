@@ -56,6 +56,19 @@ def has_dense_fp4_indexer() -> bool:
     return hasattr(deep_gemm, "fp8_fp4_mqa_logits")
 
 
+def _paged_mqa_torch_fallback() -> bool:
+    """ONE home for the torch paged-MQA family switch, mirroring
+    metadata.__post_init__ (which nulls deep_gemm_metadata under
+    SGLANG_FP8_PAGED_MQA_LOGITS_TORCH): decode must follow this
+    unconditionally or the kernel gets schedule_meta=None; prefill and the
+    candidate backend only diverge under CP, where rank-local rows force
+    DeepGEMM. The arg hooks set the env from the main process's cuda:0
+    arch, so on SM86+SM120 TP every rank honors it identically."""
+    from sglang.srt.environ import envs
+
+    return envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get()
+
+
 @functools.cache
 def _use_deep_gemm_prefill() -> bool:
     # A CP rank scores rank-local rows, which only DeepGEMM serves, so CP ignores the env.
@@ -69,6 +82,7 @@ def _use_deep_gemm_prefill() -> bool:
             get_parallel().attn_cp_size > 1
             or not envs.SGLANG_DSV41_TORCH_PREFILL_INDEXER.get()
         )
+        and (get_parallel().attn_cp_size > 1 or not _paged_mqa_torch_fallback())
     )
 
 
@@ -81,7 +95,8 @@ def make_full_topk_indexer(
         token_to_kv_pool=token_to_kv_pool,
         req_to_token=req_to_token,
         use_deep_gemm_prefill=_use_deep_gemm_prefill(),
-        use_deep_gemm_decode=is_sm100_or_newer(),
+        use_deep_gemm_decode=is_sm100_or_newer()
+        and not _paged_mqa_torch_fallback(),
     )
 
 
@@ -106,7 +121,17 @@ def make_candidate_indexer(
         use_deep_gemm_prefill=use_deep_gemm_prefill,
     )
     # Without candidate blocks no layer is a candidate source or consumer.
-    if not is_sm100_or_newer() or candidate_topk_blocks <= 0:
+    # The torch fallback must force the dense backend on every rank: a mixed
+    # dense/sparse fleet runs divergent op streams and CUDA-graph capture
+    # deadlocks on mismatched collectives.
+    if (
+        not is_sm100_or_newer()
+        or candidate_topk_blocks <= 0
+        or (
+            get_parallel().attn_cp_size <= 1
+            and _paged_mqa_torch_fallback()
+        )
+    ):
         return dense_blocks, dense_blocks
 
     from sglang.srt.layers.deep_gemm_wrapper.configurer import (
@@ -114,9 +139,12 @@ def make_candidate_indexer(
     )
 
     if not DEEPGEMM_PAGED_SPARSE_MQA_LOGITS:
+        from sglang.srt.layers.deep_gemm_wrapper import configurer as _cfg
+
         raise RuntimeError(
             "the candidate indexer needs DeepGEMM's paged sparse MQA logits "
             "(sgl-deep-gemm >= 0.2.0 with SGLANG_ENABLE_JIT_DEEPGEMM on)"
+            f" [off reason: {_cfg._PAGED_SPARSE_OFF_REASON}]"
         )
     from .sparse_table import SparseTableBackend
 

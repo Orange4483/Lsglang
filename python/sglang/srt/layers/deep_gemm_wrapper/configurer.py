@@ -1,5 +1,7 @@
 import logging
 
+import torch
+
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_platform
 from sglang.srt.utils import (
@@ -61,18 +63,51 @@ DEEPGEMM_SCALE_UE8M0 = ENABLE_JIT_DEEPGEMM and (
 DEEPGEMM_NEED_TMA_ALIGNED_SCALES = not (DEEPGEMM_SCALE_UE8M0 or _is_musa)
 
 
-def _supports_paged_sparse_mqa_logits() -> bool:
-    if not DEEPGEMM_BLACKWELL:
-        return False
-    import deep_gemm
+_PAGED_SPARSE_OFF_REASON = ""
 
-    return all(
+
+def _supports_paged_sparse_mqa_logits() -> bool:
+    # Call-time (not import-time) evaluation: heterogeneous TP mixes SM86 and
+    # SM120 ranks, and import happens before torch.cuda.set_device(rank), so an
+    # import-time probe would pin cuda:0's SM onto every rank. The SM120/121
+    # paged-sparse APIs landed in DeepGEMM#324 (same kernels as SM100 here).
+    global _PAGED_SPARSE_OFF_REASON
+    if not envs.SGLANG_ENABLE_JIT_DEEPGEMM.get():
+        _PAGED_SPARSE_OFF_REASON = "env SGLANG_ENABLE_JIT_DEEPGEMM=0"
+        return False
+    sm = get_device_sm()
+    if not (sm // 10 == 10 or sm in (120, 121)):
+        _PAGED_SPARSE_OFF_REASON = (
+            f"sm={sm} dev={torch.cuda.current_device() if torch.cuda.is_initialized() else 'pre-init(=0)'}"
+        )
+        return False
+    try:
+        import deep_gemm
+    except (ImportError, OSError, RuntimeError) as e:
+        _PAGED_SPARSE_OFF_REASON = f"deep_gemm import failed: {type(e).__name__}: {e}"
+        return False
+    ok = all(
         callable(getattr(deep_gemm, name, None))
         for name in (
             "get_paged_sparse_mqa_logits_metadata",
             "fp8_fp4_paged_sparse_mqa_logits",
         )
     )
+    if not ok:
+        _PAGED_SPARSE_OFF_REASON = (
+            f"deep_gemm {getattr(deep_gemm, '__version__', '?')} lacks paged APIs"
+        )
+    else:
+        _PAGED_SPARSE_OFF_REASON = ""
+    return ok
 
 
-DEEPGEMM_PAGED_SPARSE_MQA_LOGITS = _supports_paged_sparse_mqa_logits()
+def __getattr__(name):
+    # PEP 562: compute on EVERY access, never cache into module globals.
+    # Caching (even post-init) poisons heterogeneous TP: the import storm can
+    # initialize CUDA with current_device()==0 before any rank binds, so a
+    # cached first read pins cuda:0's SM onto every rank. The flag is read only
+    # at backend/pool init, long after run_scheduler_process bound the rank.
+    if name == "DEEPGEMM_PAGED_SPARSE_MQA_LOGITS":
+        return _supports_paged_sparse_mqa_logits()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
