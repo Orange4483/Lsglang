@@ -11,6 +11,7 @@ from sglang.kernels.ops.memory.common import (
 )
 from sglang.kernels.ops.memory.common import get_last_loc_kernel as get_last_loc_kernel
 from sglang.srt.mem_cache.allocator.page_interleave import page_interleave_shard_size
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, EvictParams
 from sglang.srt.mem_cache.hicache_storage import PoolTransfer
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
@@ -169,8 +170,42 @@ def free_kv_row_segments(
         allocator.free_segments(swa_alive)
 
 
+_CHUNKED_RADIX_INSERT_DISABLED: Optional[bool] = None
+
+
+def configure_chunked_radix_insert(model_config) -> bool:
+    """Resolve once: the chunked-prefill per-chunk radix insert is a race
+    surface (retract/abort can free pages the tree already references; the
+    QSA compressed slot full_slot // ratio then reads another request's
+    data -> persistently poisoned prefixes, upstream issue #38319). Auto-on
+    for QSA compressed models; the env only overrides the auto decision."""
+    global _CHUNKED_RADIX_INSERT_DISABLED
+    if _CHUNKED_RADIX_INSERT_DISABLED is None:
+        explicit = envs.SGLANG_DISABLE_CHUNKED_RADIX_INSERT.get()
+        if explicit is None:
+            from sglang.srt.layers.attention.qsa.config import is_qwen_qsa
+
+            _CHUNKED_RADIX_INSERT_DISABLED = is_qwen_qsa(
+                getattr(model_config, "hf_text_config", None)
+            )
+            if _CHUNKED_RADIX_INSERT_DISABLED:
+                logger.info(
+                    "chunked-prefill radix insert disabled for this QSA "
+                    "compressed model (upstream issue #38319); the insert is "
+                    "deferred to request completion"
+                )
+        else:
+            _CHUNKED_RADIX_INSERT_DISABLED = explicit
+    return _CHUNKED_RADIX_INSERT_DISABLED
+
+
 def maybe_cache_unfinished_req(req: Req, tree_cache: BasePrefixCache, **kwargs):
     if req.skip_radix_cache_insert:
+        return
+    if kwargs.get("chunked") and _CHUNKED_RADIX_INSERT_DISABLED:
+        # Publish deferred to cache_finished_req's insert_req; the request
+        # keeps sole ownership of its pages, so a retraction can never leave
+        # the tree dangling a reference (#38319).
         return
 
     tree_cache.cache_unfinished_req(req, **kwargs)

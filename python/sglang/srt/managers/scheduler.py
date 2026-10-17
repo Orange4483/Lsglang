@@ -520,6 +520,7 @@ class Scheduler(
 
         # Init model configs
         self.init_model_config()
+        self._configure_chunked_radix_insert()
 
         # Init ZBAL, switch allocator should before any torch alloc action
         self.init_zbal_on_npu()
@@ -767,6 +768,11 @@ class Scheduler(
             init_zbal(
                 get_parallel().tp_size, get_device().gpu_id, get_parallel().tp_rank
             )  # only switch allocator if is mix mode
+
+    def _configure_chunked_radix_insert(self):
+        from sglang.srt.mem_cache.common import configure_chunked_radix_insert
+
+        configure_chunked_radix_insert(self.model_config)
 
     def init_model_config(self):
         self.model_config = ModelConfig.from_server_args(self.server_args)

@@ -1574,6 +1574,8 @@ class Envs:
     # Run the DeepSeek-V4.1 ratio-1/2 prefill indexer on the torch path instead
     # of the DeepGEMM dense fp4 logits kernel (test oracle / fallback).
     SGLANG_DSV41_TORCH_PREFILL_INDEXER = EnvBool(False)
+    # None = auto (on for QSA compressed models, issue #38319).
+    SGLANG_DISABLE_CHUNKED_RADIX_INSERT = EnvBool(None)
     SGLANG_FP8_PAGED_MQA_LOGITS_TORCH = EnvBool(False)
     SGLANG_OPT_FLASHMLA_SPARSE_PREFILL = EnvBool(True)
     # SM8x bmm+finish decode attention: heads fused per finish-kernel CTA
