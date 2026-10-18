@@ -4602,7 +4602,13 @@ class DeepseekV4Model(nn.Module):
             # ROCm starts the tail after the source layer: the gfx950 fused boundary
             # runs a whole layer in one call, and the ROCm backend carries the source
             # layer's top-k and candidates into the tail itself.
-            self.tail_writes_source_kv = not _is_hip
+            self.tail_writes_source_kv = False
+            # Upstream #42901's source-KV tail writer is wired only on the
+            # upstream (non-hc-pre) model path; this tree's dsv4.1 config is
+            # hc_pre_from_prev_sublayer=True, whose loop has no single
+            # whole-row combine at the tail boundary. Until that hand-off is
+            # ported, keep the ROCm-style tail-after-source placement, which
+            # is behaviorally correct (compressors run in-tail as before).
             self.late_layer_start = (
                 last_source if self.tail_writes_source_kv else last_source + 1
             )
@@ -4745,14 +4751,6 @@ class DeepseekV4Model(nn.Module):
         normalized_attn = None
         for i in range(self.start_layer, self.end_layer):
             if tail is not None and i == self.late_layer_start:
-                if self.tail_writes_source_kv:
-                    source = self.layers[i]
-                    attn_backend.write_tail_source_kv(
-                        layer=source.self_attn,
-                        x=mhc.combine(source.attn_hc, state),
-                        positions=positions,
-                        forward_batch=forward_batch,
-                    )
                 combined_attn = None
                 normalized_attn = None
                 # Decode reaches back at most SWA_WINDOW positions.
