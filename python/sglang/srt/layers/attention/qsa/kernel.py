@@ -46,9 +46,12 @@ def qsa_fast_topk(
 ) -> torch.Tensor:
     """Select compressed blocks, with a compatibility fallback for top-k 512.
 
-    The CUDA kernels select the correct SET of blocks but emit it in atomic
-    (run-varying) slot order; see ``_sort_qsa_topk_indices`` for the
-    determinism fix applied on every CUDA return path.
+    ``_sort_qsa_topk_indices`` normalises the atomic (run-varying) slot order
+    on every CUDA return path. Note that sorting only fixes ORDER, not the
+    selected SET: the JIT kernel's set is run-invariant only while its tie bin
+    fits smem, and the sgl_kernel ``fast_topk_v2`` path used for top-k 2048 is
+    itself arrival-order. Treat the output as order-deterministic, not
+    set-deterministic, off the top-k 512 JIT path.
     """
 
     lengths = (row_ends - row_starts).to(device=logits.device, dtype=torch.int32)

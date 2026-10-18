@@ -291,6 +291,8 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
 
         self.backend = resolve_decode_backend(self)
 
+        self.prewarm_copy_kernels()
+
         try:
             with model_capture_mode():
                 self.capture()
@@ -307,6 +309,40 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
 
     def _make_graph_key(self, bs, stream_idx=None, variant_label=None):
         return ShapeKey(size=bs)
+
+    def prewarm_copy_kernels(self) -> None:
+        """Cold-load the staging-copy specializations here, during init, where
+        free device memory is still in GBs: on the first real step the same
+        launch would cuModuleLoad ``_small_copy_kernel`` under the ~0.6 GiB
+        serve headroom, and a boot has been observed wedging both TP ranks
+        inside that load (same class as the conv-scatter and rope-tail
+        cold-loads). Replay the exact per-step copy list of ``execute`` --
+        same buffers, shapes and list lengths per capture bucket -- with
+        clone sources, so the warmed cubins are the ones serving reuses."""
+        from sglang.srt.model_executor.runner_utils.buffers import (
+            _grouped_foreach_copy_,
+        )
+
+        buffers = self.buffers
+        for bs in self.capture_bs:
+            num_tokens = bs * self.captured_req_width
+            dsts = [
+                buffers.input_ids[:num_tokens],
+                buffers.seq_lens[:bs],
+                buffers.out_cache_loc[:num_tokens],
+                buffers.positions[:num_tokens],
+                buffers.req_pool_indices[:bs],
+            ]
+            if self.model_runner.model_config.model_is_mrope:
+                dsts.append(buffers.mrope_positions[:, :num_tokens])
+            dsts += [
+                buffers.extend_seq_lens[:bs],
+                buffers.num_correct_drafts[:bs],
+                buffers.num_accept_tokens[:bs],
+                buffers.select_index[:bs],
+            ]
+            srcs = [torch.empty_like(d) for d in dsts]
+            _grouped_foreach_copy_(dsts, srcs)
 
     def can_run_graph(self, forward_batch: ForwardBatch):
         # Uniform-width replay invariant: the batch's actual per-request width

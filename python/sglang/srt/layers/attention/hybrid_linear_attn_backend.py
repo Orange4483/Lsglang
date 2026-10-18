@@ -10,6 +10,8 @@ from sglang.kernels.ops.mamba.mamba_state_indices_triton import (
     fused_replay_state_indices,
 )
 from sglang.kernels.ops.mamba.mamba_state_scatter_triton import (
+    _conv_multi_eligible,
+    fused_conv_window_scatter_multi,
     fused_conv_window_scatter_with_mask,
     fused_mamba_state_scatter_with_mask,
     scatter_mamba_states_after_mtp_verify,
@@ -107,6 +109,74 @@ class MambaAttnBackendBase(AttentionBackend):
         # Constant (== 1) for mamba-like backends; hoisted so the replay path
         # skips the per-cycle method dispatch.
         self._graph_seq_len_fill_value = self.get_cuda_graph_seq_len_fill_value()
+
+    def prewarm_mtp_verify_scatter_kernels(self) -> None:
+        """Cold-load the MTP-verify conv-window scatter kernel here, during init
+        (pool built, before CUDA graph capture and serving, where free memory is
+        ~GBs) so the first serve-time verify commit does not lazy cuModuleLoad it
+        under the ~0.2 GiB serve headroom -- that load has wedged cold boots on
+        both ranks pinned in ``load_binary`` with the GPU idle (seen on SM120
+        and SM86 alike), turning the first verify into a TP lockstep deadlock.
+
+        Driven through the real production entry with the pool's own conv pairs,
+        so the warmed cubin is the exact specialization serving reuses. Step
+        indices are all -1: the kernel early-returns on a negative step, so every
+        launch compiles and loads the module but writes nothing.
+
+        The conv kernel takes n1 (verify rows = bs) and n2 (track-crossing rows)
+        as plain int args, so Triton emits up to three modules per axis: value 1
+        is const-folded, a multiple of 16 (incl. 0, the no-track call) gets the
+        aligned variant, anything else (2..15, 17..) is generic. Both the n1 tier
+        (bs) and the n2 tier (track count, capped by bs) are walked across the
+        buckets reachable within max_running_requests, so no serve step cold-loads
+        a missing variant under the tight serve-time headroom."""
+        if self.is_draft_worker:
+            return
+        if get_spec().speculative_num_draft_tokens in (None, 0):
+            return
+        mamba_caches = self.req_to_token_pool.get_speculative_mamba2_params_all_layers()
+        conv, conv_window = mamba_caches.conv, mamba_caches.intermediate_conv_window
+        if conv is None or conv_window is None:
+            # --enable-linear-replayssm-spec: the spec ring owns rollback and
+            # commit goes through the ReplaySSM kernel, not this scatter.
+            logger.info(
+                "MTP-verify conv scatter prewarm skipped: no conv window on pool"
+            )
+            return
+        pairs = list(zip(conv, conv_window))
+        if not _conv_multi_eligible(pairs):
+            logger.info(
+                "MTP-verify conv scatter prewarm skipped: pairs not multi-eligible"
+            )
+            return
+
+        def buckets(upto: int) -> set:
+            # one probe per Triton int-specialization bucket within [1, upto]
+            tiers = {1}
+            if upto >= 2:
+                tiers.add(2)  # generic (2..15)
+            if upto >= 16:
+                tiers.add(16)  # divisible-by-16
+            tiers.add(upto)  # the largest real value this host can reach
+            return {t for t in tiers if 1 <= t <= upto}
+
+        device = self.device
+        mrr = max(1, int(self._model_runner.max_running_requests))
+        for bs in sorted(buckets(mrr)):
+            step = torch.full((bs,), -1, dtype=torch.int64, device=device)
+            dst = torch.zeros((bs,), dtype=torch.int32, device=device)
+            fused_conv_window_scatter_multi(pairs, dst, step, None, None)  # n2 = 0
+            for n2 in sorted(buckets(bs)):
+                track = torch.zeros((n2,), dtype=torch.int64, device=device)
+                track_step = torch.full((n2,), -1, dtype=torch.int64, device=device)
+                fused_conv_window_scatter_multi(
+                    pairs, dst, step, track, track_step
+                )
+        torch.cuda.synchronize(device)
+        logger.info(
+            "Preloaded MTP-verify conv-window scatter kernels over bs=%s at init",
+            sorted(buckets(mrr)),
+        )
 
     @property
     def mamba_chunk_size(self) -> int:

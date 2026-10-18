@@ -37,6 +37,7 @@ from sglang.srt.model_executor.runner_utils.pool import (
     graph_pool_replay_scope,
 )
 from sglang.srt.utils import get_bool_env_var
+from sglang.srt.utils import lockstep
 from sglang.srt.utils.common import is_lk_moe_feature_enabled
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
@@ -173,6 +174,7 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
         del warmup_output
 
         graph = torch.cuda.CUDAGraph()
+        captured_ar_base = lockstep.captured_count()
 
         graph_ctx: Callable[..., AbstractContextManager]
         if (
@@ -208,6 +210,9 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
 
         self._graphs[shape_key] = graph
         self._outputs[shape_key] = out
+        lockstep.note_graph_ar_calls(
+            shape_key, lockstep.captured_count() - captured_ar_base
+        )
 
     def can_run(self, forward_batch: ForwardBatch, shape_key: ShapeKey) -> bool:
         return shape_key in self._graphs
@@ -222,6 +227,7 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
         static_forward_batch: ForwardBatch,
         **kwargs,
     ) -> Any:
+        lockstep.note_graph_replay(shape_key)
         with graph_pool_replay_scope():
             self._graphs[shape_key].replay()
         return self._outputs[shape_key]

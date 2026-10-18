@@ -146,14 +146,23 @@ class WatchdogRaw:
                     watchdog_last_time = current
             time.sleep(self.watchdog_timeout / 2)
 
-        if self.dump_info is not None and (info_msg := self.dump_info()):
-            logger.error(f"{self.debug_name} debug info:\n{info_msg}")
-
-        pyspy_dump_schedulers()
         logger.error(
             f"{self.debug_name} watchdog timeout "
             f"({self.watchdog_timeout=}, {self.soft=})"
         )
+        # Order matters: dump_info touches the device pool (GPU copies), and on
+        # a wedged engine those copies block on the same driver lock as the
+        # stuck main thread -- last time it hung there and the stacks below
+        # never ran. So report everything that cannot hang FIRST.
+        try:
+            from sglang.srt.utils import lockstep
+
+            logger.error(f"{self.debug_name} lockstep AR tally: {lockstep.snapshot()}")
+        except Exception as e:
+            logger.error(f"{self.debug_name} lockstep tally failed: {e}")
+        pyspy_dump_schedulers()
+        if self.dump_info is not None and (info_msg := self.dump_info()):
+            logger.error(f"{self.debug_name} debug info:\n{info_msg}")
         print(file=sys.stderr, flush=True)
         print(file=sys.stdout, flush=True)
 

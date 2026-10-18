@@ -2,8 +2,8 @@
 
 One persistent kernel replaces the five-kernel `GatedResidual._mix_compute` chain.
 One CTA per SM keeps every CTA resident, so the software grid barrier cannot deadlock;
-the last CTA to finish resets the barrier counters,
-so a captured CUDA graph replays with them in their initial state.
+the barrier is a monotonic round-ticket counter that is never reset, so a captured
+CUDA graph replays cleanly without any reset-vs-arrive race.
 Row counts beyond ``_FUSED_MIX_MAX_ROWS`` stay on the torch.compile path.
 """
 
@@ -18,9 +18,17 @@ _FUSED_MIX_MAX_ROWS = 16
 
 @triton.jit
 def _grid_barrier(counter_ptr, num_ctas):
-    tl.atomic_add(counter_ptr, 1, sem="acq_rel", scope="gpu")
-    while tl.atomic_add(counter_ptr, 0, sem="acq_rel", scope="gpu") < num_ctas:
+    # Round-ticket barrier: arrivals number themselves globally; a CTA waits
+    # for its own round [base, base+num_ctas) to fill. The counter only ever
+    # increases, so NOTHING needs resetting -- graph replay, back-to-back
+    # launches and the old reset-vs-arrive races all disappear. int64 keeps
+    # overflow at arm's length. Volatile-load spin; closing acq_rel RMW gives
+    # the acquire edge.
+    t = tl.atomic_add(counter_ptr, 1, sem="acq_rel", scope="gpu")
+    target = t - t % num_ctas + num_ctas
+    while tl.load(counter_ptr, volatile=True) < target:
         pass
+    tl.atomic_add(counter_ptr, 0, sem="acq_rel", scope="gpu")
 
 
 @triton.jit
@@ -53,22 +61,6 @@ def _hc_mix_persistent_kernel(
     offs_m = tl.arange(0, ROWS)
     mask_m = offs_m < num_rows
 
-    zero_span = ROWS * LOWRANK
-    offs_z = tl.arange(0, 256)
-    for z0 in range(pid * 256, zero_span, num_ctas * 256):
-        idx = z0 + offs_z
-        tl.store(t_raw_ptr + idx, 0.0, mask=idx < zero_span)
-    _grid_barrier(counters_ptr + 0, num_ctas)
-    # Self-reset after barrier 0: every CTA has now passed the acquire edge,
-    # so the last ticket holder knows no peer can still be counting on any
-    # counter. (Resetting before the barrier can zero a counter mid-barrier
-    # and strand the remaining CTAs forever.) One ticket atomic per launch,
-    # not per iteration — the tail-placement cost ~13% decode throughput.
-    ticket = tl.atomic_add(counters_ptr + 2, 1, sem="acq_rel", scope="gpu")
-    if ticket == num_ctas - 1:
-        for c in tl.static_range(4):
-            tl.store(counters_ptr + c, 0)
-
     offs_k = tl.arange(0, BLOCK_K)
     offs_n = tl.arange(0, BLOCK_N)
     n_blocks = tl.cdiv(LOWRANK, BLOCK_N)
@@ -98,29 +90,31 @@ def _hc_mix_persistent_kernel(
             acc,
             mask=mask_m[:, None] & mask_n[None, :],
         )
-    _grid_barrier(counters_ptr + 1, num_ctas)
+    _grid_barrier(counters_ptr, num_ctas)
 
-    # Fixed-order reduction into t_raw by a single owner: for each column
-    # block, sum the k-chunk slots ascending (slot id = kc*n_blocks + nb,
-    # matching phase 2's tile = kc*n_blocks + nb enumeration).
-    if pid == 0:
-        offs_n0 = tl.arange(0, BLOCK_N)
-        for nb in range(0, n_blocks):
-            acc_n = tl.zeros((ROWS, BLOCK_N), dtype=tl.float32)
-            for kc in range(0, k_chunks):
-                acc_n += tl.load(
-                    t_part_ptr
-                    + (kc * n_blocks + nb) * ROWS * BLOCK_N
-                    + offs_m[:, None] * BLOCK_N
-                    + offs_n0[None, :]
-                )
-            n0 = nb * BLOCK_N + offs_n0
-            tl.store(
-                t_raw_ptr + offs_m[:, None] * LOWRANK + n0[None, :],
-                acc_n,
-                mask=(n0 < LOWRANK)[None, :],
+    # Fixed-order reduction into t_raw, one owner per column block: CTA nb%
+    # num_ctas sums the k-chunk slots ascending (slot id = kc*n_blocks + nb,
+    # matching phase 2's tile = kc*n_blocks + nb enumeration). Determinism
+    # comes from the fixed LOAD order per tile, not from a serial pid-0 loop;
+    # the previous pid-0-only walk serialized the whole grid on its latency
+    # chain (~hundreds of dependent loads) and cost decode ~one barrier's
+    # worth of idle SMs per step.
+    for nb in range(pid, n_blocks, num_ctas):
+        acc_n = tl.zeros((ROWS, BLOCK_N), dtype=tl.float32)
+        for kc in range(0, k_chunks):
+            acc_n += tl.load(
+                t_part_ptr
+                + (kc * n_blocks + nb) * ROWS * BLOCK_N
+                + offs_m[:, None] * BLOCK_N
+                + offs_n[None, :]
             )
-    _grid_barrier(counters_ptr + 3, num_ctas)
+        n0 = nb * BLOCK_N + offs_n
+        tl.store(
+            t_raw_ptr + offs_m[:, None] * LOWRANK + n0[None, :],
+            acc_n,
+            mask=(n0 < LOWRANK)[None, :],
+        )
+    _grid_barrier(counters_ptr + 1, num_ctas)
 
     offs_j = tl.arange(0, BLOCK_J)
     offs_r = tl.arange(0, BLOCK_R)
@@ -173,7 +167,7 @@ _counters_cache = {}
 def _get_counters(device: torch.device) -> torch.Tensor:
     buf = _counters_cache.get(device)
     if buf is None:
-        buf = torch.zeros(4, dtype=torch.int32, device=device)
+        buf = torch.zeros(2, dtype=torch.int64, device=device)
         _counters_cache[device] = buf
     return buf
 
@@ -195,8 +189,8 @@ def _get_t_part(device, tiles: int, rows_pad: int, block_n: int) -> torch.Tensor
 def fused_hc_mix_supported(
     hyper_input_normed: torch.Tensor, w_down: torch.Tensor, w_up: torch.Tensor
 ) -> bool:
-    # The persistent kernel accumulates the down projection with
-    # device-scope atomics, so summation order varies across replays.
+    # The persistent kernel sums the down projection through private per-tile
+    # slots in fixed (ascending k-chunk) order, so replays are bit-identical.
     return (
         hyper_input_normed.is_cuda
         and hyper_input_normed.dtype in (torch.bfloat16, torch.float16)

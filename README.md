@@ -77,7 +77,7 @@ pip install -e "python" --no-build-isolation -vvv
 
 ### Quick start (Qwen3.8-Flash-Next [RTX 3090 *2])
 
-Full launch script: [`launch/sglang_serve_qwen38_mtp_tp2_3090.sh`](launch/sglang_serve_qwen38_mtp_tp2_3090.sh) · [ple on nvme](launch/sglang_serve_qwen38_mtp_tp2_3090_nvme.sh).
+Full launch script: [`launch/sglang_serve_qwen38_tp2_3090.sh`](launch/sglang_serve_qwen38_tp2_3090.sh) (plain decode, no speculation).
 
 ```bash
 
@@ -126,10 +126,6 @@ sglang serve \
   --max-mamba-cache-size 11 \
   --reasoning-parser auto \
   --tool-call-parser auto \
-  --speculative-algorithm NEXTN \
-  --speculative-num-steps 3 \
-  --speculative-eagle-topk 1 \
-  --speculative-num-draft-tokens 4 \
   --default-chat-template-kwargs '{"thinking":true,"reasoning_effort":"medium"}' \
   --moe-runner-backend marlin
 ```
@@ -289,11 +285,11 @@ Legend: ✅ tested · `ok` supported, not yet tested · blank = to be filled.
 
 | Model | sm80 | sm86 | sm89 | sm90 | sm100 | sm120+ | Launch |
 |-------|:----:|:----:|:----:|:----:|:-----:|:------:|--------|
-| [Qwen3.8-Flash-Next](https://huggingface.co/lovedheart/Qwen3.8-Flash-Next-NVFP4-W4A16-ATTN-FP8-MTP-NVFP4) | ok | ✅ | ok | ok | ok | ✅ | [launch](launch/sglang_serve_qwen38_mtp_tp2_3090.sh)  |
-| [DeepSeek-V4.1-Flash](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash) | ok | ✅ | ok | ok | ok | ✅ | [launch](launch/sglang_serve_dsv41_dspark_tp2_3090.sh) · |
-| [DeepSeek-V4-Flash-0731](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-0731) | ok | ✅ | ok | ok | ok | ✅ | [launch](launch/sglang_serve_0731_dspark_tp2_3090.sh) |
-| [GLM-5.3-Flash-NVFP4](https://huggingface.co/nvidia/GLM-5.3-Flash-NVFP4) | ok | ✅ | ok | ok | ok | ✅ | [launch](launch/sglang_serve_glm53_mtp_tp2_3090.sh) |
-| [Qwen3.6-35B-A3B](https://huggingface.co/nvidia/Qwen3.6-35B-A3B-NVFP4) | ok | ✅ | ok | ok | ok | ✅ | [launch](launch/sglang_serve_qwen36_mtp_tp2_3090.sh) |
+| [Qwen3.8-Flash-Next](https://huggingface.co/lovedheart/Qwen3.8-Flash-Next-NVFP4-W4A16-ATTN-FP8-MTP-NVFP4) | ok | ✅ | ok | ok | ok | ✅ | [launch](launch/sglang_serve_qwen38_tp2_3090.sh)  |
+| [DeepSeek-V4.1-Flash](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash) | ok | ✅ | ok | ok | ok | ✅ | [launch](launch/sglang_serve_dsv41_tp2_3090.sh) · |
+| [DeepSeek-V4-Flash-0731](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-0731) | ok | ✅ | ok | ok | ok | ✅ | [launch](launch/sglang_serve_0731_tp2_3090.sh) |
+| [GLM-5.3-Flash-NVFP4](https://huggingface.co/nvidia/GLM-5.3-Flash-NVFP4) | ok | ✅ | ok | ok | ok | ✅ | [launch](launch/sglang_serve_glm53_tp2_3090.sh) |
+| [Qwen3.6-35B-A3B](https://huggingface.co/nvidia/Qwen3.6-35B-A3B-NVFP4) | ok | ✅ | ok | ok | ok | ✅ | [launch](launch/sglang_serve_qwen36_tp2_3090.sh) |
 | Qwen3-Coder-Next / 30B-A3B | | | | | | | |
 | gemma-4-26B-A4B-it | | | | | | | |
 | NVIDIA-Nemotron-3-Super-120B-A12B-BF16 | | | | | | | |

@@ -1368,6 +1368,12 @@ class SchedulerBatchResultProcessor:
         ):
             return True
 
+        # A stop/EOS/length finish can truncate tokens the speculative verify
+        # already produced (finished_len < produced), so the committed mamba
+        # checkpoint no longer aligns with the cacheable key: refuse to cache.
+        if req.finished_len is not None and req.finished_len != len(req.output_ids):
+            return False
+
         # no_buffer donates the live state, which cannot be shortened with the key.
         if req.owned_kv_len() != req.kv.kv_committed_len:
             return False
@@ -1546,6 +1552,21 @@ class SchedulerBatchResultProcessor:
             lookahead = req.decode_batch_idx - batch.mamba_decode_batch_idx_cpu[i]
             committed_len = req.kv.kv_committed_len - lookahead
             if committed_len % interval == 0:
+                from sglang.srt.mem_cache.memory_pool import _MAMBA_DEBUG_ASSERTS
+
+                if _MAMBA_DEBUG_ASSERTS:
+                    self._mamba_assert_committed_len_lookahead(req)
+                    forward_saw = (
+                        batch.mamba_track_mask_cpu is not None
+                        and batch.mamba_track_mask_cpu[i]
+                    )
+                    assert forward_saw, (
+                        "mamba boundary: scheduler recomputation says "
+                        f"boundary at {committed_len} but the forward mask "
+                        "denies it: "
+                        f"req {req.rid} committed={req.kv.kv_committed_len} "
+                        f"lookahead={lookahead}"
+                    )
                 return True, committed_len
         elif result.num_correct_drafts_per_req_cpu is not None:
             cur = req.seqlen - 1

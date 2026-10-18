@@ -2460,6 +2460,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # Lazy + spec: this iteration's per-req scatter positions
     # (see mamba_lazy_spec_prepare).
     mamba_lazy_spec_track_positions_cpu: Optional[List[int]] = None  # shape: [b]
+    # Rows whose lazy boundary write was masked off (no dedicated 2nd slot);
+    # forensic only. shape: [b]
+    mamba_lazy_track_gated_cpu: Optional[List[bool]] = None
     # Deferred mamba init ops: COW pairs and clear indices (performed on forward stream)
     mamba_cow_src_indices: torch.Tensor = None
     mamba_cow_dst_indices: torch.Tensor = None
@@ -3479,7 +3482,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.model_config.vocab_size,
         )
 
-    def mamba_lazy_prealloc_at_boundary(self, mamba_track_interval: int):
+    def mamba_lazy_prealloc_at_boundary(self, mamba_track_interval: int) -> List[bool]:
         """Allocate a temporary second ping-pong slot for reqs at a track boundary.
 
         In lazy mode each request normally holds only 1 ping-pong slot.
@@ -3487,28 +3490,44 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         second slot so the forward pass can write the new tracked state
         there. The old slot is freed after the forward in
         mamba_lazy_post_decode_at_boundary.
+
+        Returns a per-req list: False on rows that reached a boundary but
+        got no dedicated second slot. The boundary write then scatters in
+        place into buf[mamba_next_track_idx] = the keep slot, keeping the
+        checkpoint current (same as the spec path). Callers must NOT mask
+        those rows out -- a skipped write leaves the keep slot stale, and
+        donating a stale checkpoint poisons radix reuse.
         """
         pool = self.req_to_token_pool
+        can_write: List[bool] = []
         for i, req in enumerate(self.reqs):
             buf = req.kv.mamba_ping_pong_track_buffer
             assert buf is not None
             # Skip reqs not at a track boundary
             if self.seq_lens_cpu[i].item() % mamba_track_interval != 0:
+                can_write.append(True)
                 continue
             other_idx = 1 - req.kv.mamba_next_track_idx
             if buf[other_idx].item() != -1:
                 # With overlap the previous forward's post-processing
-                # (which frees this slot) hasn't run yet. Skip.
+                # (which frees this slot) hasn't run yet. Skip; next was
+                # already swapped to the dedicated pending slot, safe.
+                can_write.append(True)
                 continue
             if envs.SGLANG_TEST_MAMBA_LAZY_ALLOC_FAIL.get():
                 new_slot = None
             else:
                 # No evict-retry: a transient slot is not worth evicting a
-                # cached checkpoint for; on failure tracking degrades in place.
+                # cached checkpoint for. On failure the boundary write
+                # falls back in place into the keep slot (same as spec).
                 new_slot = pool.mamba_allocator.alloc(1)
             if new_slot is not None:
                 pool.set_mamba_ping_pong_slot(req, other_idx, new_slot[0])
                 req.kv.mamba_next_track_idx = other_idx
+                can_write.append(True)
+            else:
+                can_write.append(False)
+        return can_write
 
     def mamba_lazy_spec_prepare(self, mamba_track_interval: int, max_draft_tokens: int):
         """Lazy-mode spec counterpart of mamba_lazy_prealloc_at_boundary.
@@ -3582,7 +3601,16 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         self.mamba_cow_src_indices = None
         self.mamba_cow_dst_indices = None
-        self.mamba_clear_indices = None
+        # Carry clears queued by donations during the previous step's result
+        # processing (decode-time boundary commit donates the keep slot and
+        # swaps in a recycled one). Decode-only streams never reach the
+        # extend-side collector, so without this the swapped-in slot's
+        # residue waits for an extend that may never come before a
+        # boundary write donates it onward.
+        if any(req.kv.holds_mamba for req in self.reqs):
+            self._collect_deferred_mamba_cow_and_clear(self.reqs)
+        else:
+            self.mamba_clear_indices = None
 
         # Clear context parallel metadata - CP is only for prefill, not decode
         if hasattr(self, "attn_cp_metadata") and self.attn_cp_metadata is not None:
@@ -3651,6 +3679,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
             track_remainders_cpu = self.seq_lens_cpu % mamba_track_interval
             track_mask_cpu = track_remainders_cpu == 0
+            # Do NOT mask rows that failed to prealloc a second slot. The
+            # boundary write then scatters in place into the keep slot
+            # (the spec path's behaviour), which keeps the checkpoint at
+            # the current boundary. Masking it out instead skips the write
+            # and leaves the keep slot at the PREVIOUS boundary's state;
+            # that stale checkpoint is then donated to the radix tree and
+            # reused -> wrong mamba state -> degenerate/infinite output.
+            self.mamba_lazy_track_gated_cpu = None
             self.mamba_track_mask_cpu = track_mask_cpu.tolist()
             self.mamba_track_mask_next_cpu = (
                 (track_remainders_cpu == mamba_track_interval - 1).tolist()
@@ -3738,9 +3774,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.mamba_track_mask_next_cpu = None
         self.mamba_decode_batch_idx_cpu = None
         self.mamba_lazy_spec_track_positions_cpu = None
+        self.mamba_lazy_track_gated_cpu = None
         self.mamba_cow_src_indices = None
         self.mamba_cow_dst_indices = None
-        self.mamba_clear_indices = None
+        # mamba_clear_indices are pool-slot ids (not per-row); dropping them
+        # here would strand the queued zeroing forever (the req's queue was
+        # already drained at collect). Keep them; a repeat clear is a no-op.
         self.return_logprob = any(req.return_logprob for req in self.reqs)
         if self.return_logprob:
             self.top_logprobs_nums = [self.top_logprobs_nums[i] for i in keep_indices]
@@ -3806,6 +3845,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.mamba_track_mask_next_cpu = None
         self.mamba_decode_batch_idx_cpu = None
         self.mamba_lazy_spec_track_positions_cpu = None
+        self.mamba_lazy_track_gated_cpu = None
         if self.return_logprob and other.return_logprob:
             self.top_logprobs_nums = self.top_logprobs_nums + other.top_logprobs_nums
             self.token_ids_logprobs = self.token_ids_logprobs + other.token_ids_logprobs

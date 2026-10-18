@@ -327,8 +327,8 @@ class TestFinishedMambaSpecCheckpoint(CustomTestCase):
             processor._handle_finish_state_updated_req(req, batch, result, 0, None)
             self.assertTrue(req.skip_radix_cache_insert)
             self.assertFalse(req.kv.is_kv_released)
-            release_kv_cache(req, tree, checkpoint=True)
-            tree.checkpoint.assert_not_called()
+            release_kv_cache(req, tree, is_insert=True)
+            tree.insert_req.assert_not_called()
             self.assertTrue(req.kv.is_kv_released)
 
 

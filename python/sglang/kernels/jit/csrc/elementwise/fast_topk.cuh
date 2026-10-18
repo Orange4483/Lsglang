@@ -211,13 +211,13 @@ SGL_DEVICE void radix_select_topk(const float* __restrict__ input, int* __restri
       __syncthreads();
 
       if (round == 3) {
-        // Final tie-bin deposit: every candidate left here is bit-identical.
-        // Select by ascending index rank (torch.topk convention): a candidate
-        // wins iff fewer than `remain` smaller-indexed candidates tie with it.
-        // Counting is a pure function of the candidate set, so the selected
-        // SET is run-invariant. The tie list caps at SMEM_INPUT_SIZE; a pop
-        // that large (only reachable with >4096 identical scores) falls back
-        // to the legacy arrival-order deposit.
+        // Select by ascending index rank: a candidate wins iff fewer than
+        // `remain` smaller-indexed candidates tie with it. Counting is a pure
+        // function of the candidate set, so the selected SET is run-invariant.
+        // Caveat: the tie list is capped at SMEM_INPUT_SIZE and the cap can be
+        // hit earlier (round-0 threshold bin larger than SMEM), where the
+        // stored subset is arrival-order and the SET is NOT run-invariant;
+        // the branch below cannot recover that (counts are capped by then).
         int tie_count = min(s_num_input[r_idx ^ 1], int(SMEM_INPUT_SIZE));
         int* tie_list = s_input_idx[r_idx ^ 1];
         if (s_num_input[r_idx ^ 1] > int(SMEM_INPUT_SIZE)) {

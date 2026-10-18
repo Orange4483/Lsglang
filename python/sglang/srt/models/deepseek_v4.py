@@ -4671,12 +4671,6 @@ class DeepseekV4Model(nn.Module):
             hc_eps=self.hc_eps,
         )
 
-    def _check_late_layer_tail_readers(
-        self, forward_batch: ForwardBatch, tail: LateLayerTail
-    ) -> None:
-        # Rows outside the tail are never computed from late_layer_start on;
-        # late_layer_whole_extend gives the requests that read them a whole tail.
-        extend_lens = forward_batch.extend_seq_lens_cpu
     def _check_late_layer_tail_readers(self, forward_batch: ForwardBatch) -> None:
         # Rows outside the tail are never computed past the last kv_source layer.
         if (

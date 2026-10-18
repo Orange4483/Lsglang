@@ -573,7 +573,10 @@ class GenerateReqInput:
                 continue
             if len(found) == 1 and isinstance(self.sampling_params, dict):
                 setattr(self, key, found[0][1])
-            elif getattr(self, key) is None:
+            elif getattr(self, key) is None or getattr(self, key) is False:
+                # False is the unset default of return_text_in_logprobs (the
+                # other keys default to None); treat both as "not set at top
+                # level" so a misplaced value is not silently dropped.
                 if len(self.sampling_params) > 1 and len(found) < len(dicts):
                     # Per-entry fields keep per-request semantics; broadcast a
                     # found value to the entries that did not set it.

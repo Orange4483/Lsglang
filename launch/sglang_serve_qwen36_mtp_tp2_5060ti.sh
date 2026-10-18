@@ -41,7 +41,12 @@ sglang serve \
     --tool-call-parser auto \
     --reasoning-parser auto \
     --disable-shared-experts-fusion \
+    --mamba-radix-cache-strategy extra_buffer_lazy \
+    --mamba-max-states-per-path 2 \
+    --mamba-track-interval 256 \
+    --max-mamba-cache-size 11 \
     --cuda-graph-backend-prefill disabled \
+    --warmups prefill_shapes \
     --speculative-algorithm NEXTN \
     --speculative-num-steps 3 \
     --speculative-eagle-topk 1 \

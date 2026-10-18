@@ -1371,6 +1371,68 @@ class DeepseekV4AttnBackend(
             online_state_slot_offset=online_c128_state_slot_offset,
         )
 
+    def prewarm_dsv41_rope_tail_kernels(self) -> None:
+        """Cold-load the FP4 RoPE-tail Triton kernel at engine init (pool built,
+        before CUDA graph capture and serving, where free device memory is still
+        ~GBs) so the first serve-time low-ratio prefill does not lazy
+        ``cuModuleLoad`` it under the tight serve headroom. That load fired on a
+        boot at 0.54 GiB free: the compressed-latent tier only runs on the first
+        big prefill, long after init, so without this the first tail commit pays
+        the JIT/``cuModuleLoad`` right where the pool has almost no room.
+
+        Driven through the real production entry ``rope_tail_fake_quant_fp4`` so
+        the warmed cubin is the exact specialization serving reuses. Three tiers
+        cover every reachable constexpr/runtime split: the indexer K row (rows per
+        token 1, per-32 UE8M0), the indexer Q head-batch (rows per token = n_heads,
+        the divisible-by-16 variant), and the compressed latent (per-16 E4M3,
+        ``compressed_kv``). Output lands in a throwaway ``empty_like``: the pools
+        are never touched and nothing real is written."""
+        if self.is_draft_runner:
+            return
+        if not (torch.cuda.is_available() and torch.version.cuda is not None):
+            return
+        from sglang.kernels.ops.attention.dsv4.fp4_rope_fake_quant import (
+            rope_tail_fake_quant_fp4,
+        )
+
+        cfg = self.model_runner.model_config.hf_text_config
+        rope = int(getattr(cfg, "qk_rope_head_dim", 64))
+        index_head_dim = int(getattr(cfg, "index_head_dim", 128))
+        n_heads = int(getattr(cfg, "index_n_heads", 1))
+        head_dim = int(self.model_runner.model_config.head_dim)
+        if rope % 2 != 0:
+            return
+        device = self.device
+        bf16 = torch.bfloat16
+
+        def _freqs(tokens: int) -> torch.Tensor:
+            return torch.ones((tokens, rope // 2), dtype=torch.complex64, device=device)
+
+        warmed = []
+        if index_head_dim % 32 == 0 and rope <= index_head_dim:
+            # indexer K row: [rows, index_head_dim], per-32, rows per token 1.
+            k = torch.zeros((1, index_head_dim), dtype=bf16, device=device)
+            rope_tail_fake_quant_fp4(k, _freqs(1), rope)
+            warmed.append(f"k[d{index_head_dim},blk32]")
+            # indexer Q head-batch: [1, n_heads, index_head_dim], per-32, rows per
+            # token = n_heads (the divisible-by-16 specialization when %16==0).
+            if n_heads > 1:
+                q = torch.zeros((1, n_heads, index_head_dim), dtype=bf16, device=device)
+                rope_tail_fake_quant_fp4(q, _freqs(1), rope)
+                warmed.append(f"q[d{index_head_dim},h{n_heads},blk32]")
+        if head_dim % 16 == 0 and rope <= head_dim:
+            # compressed latent: [rows, head_dim], per-16 E4M3 (compressed_kv).
+            latent = torch.zeros((1, head_dim), dtype=bf16, device=device)
+            rope_tail_fake_quant_fp4(latent, _freqs(1), rope, compressed_kv=True)
+            warmed.append(f"c[d{head_dim},blk16]")
+        if not warmed:
+            return
+
+        torch.cuda.synchronize(device)
+        logger.info(
+            "Preloaded DSV4.1 FP4 rope-tail kernels %s at init", " ".join(warmed)
+        )
+
     def init_forward_metadata_indexer(
         self,
         core_attn_metadata: DSV4AttnMetadata,
@@ -1810,6 +1872,20 @@ class DeepseekV4AttnBackend(
                 forward_batch.global_num_token_non_padded = bound
                 forward_batch.num_token_non_padded = bound
         tail_core = tail_metadata.core_attn_metadata
+        # Carry the candidate block-ids the source layer published on the full
+        # metadata into the tail, sliced to the tail rows; the tail's consumers
+        # (candidate_source_layer_id < layer_id, all past late_layer_start)
+        # otherwise read a None publish and trip the consume-time assert.
+        full_candidate = self.forward_metadata.candidate_metadata
+        tail_metadata.candidate_metadata = (
+            full_candidate.tail(
+                tail.local_lens_cpu
+                if tail.cp_metadata is not None
+                else tail.extend_seq_lens_cpu
+            )
+            if full_candidate is not None
+            else None
+        )
         self.forward_metadata = tail_metadata
         if self.token_to_kv_pool.request_window is not None:
             self.token_to_kv_pool.request_window.activate(

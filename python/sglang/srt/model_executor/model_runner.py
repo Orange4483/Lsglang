@@ -1033,6 +1033,61 @@ class ModelRunner:
             [self.attn_backend, self.decode_attn_backend]
         )
 
+        # Cold-load the spec-verify conv-window scatter kernels while free memory
+        # is still ~GBs (pool allocated above, CUDA graph capture and serving
+        # below). The verify commit runs outside the captured graph, so the first
+        # serve step would otherwise lazy-load them under the ~0.2 GiB serve
+        # headroom -- a cuModuleLoad that has wedged cold boots on SM120 and SM86 alike.
+        if not self.is_draft_worker:
+            candidates = [self.attn_backend, self.decode_attn_backend]
+            candidates += list(self.decode_attn_backend_group or [])
+            seen = set()
+            warmed = set()
+            while candidates:
+                backend = candidates.pop()
+                if backend is None or id(backend) in seen:
+                    continue
+                seen.add(id(backend))
+                # Hybrid wrappers (e.g. HybridLinearAttnBackend) do not forward
+                # attributes: the prewarm lives on the inner linear backend, so
+                # expand every known delegation edge, not just prefill/decode.
+                # A forwarding wrapper (SuperChunk-style __getattr__) can hand
+                # out the SAME function twice from two objects -- dedup by the
+                # underlying function, else one pool gets prewarmed (and
+                # logged) per alias.
+                candidates += [
+                    getattr(backend, edge, None)
+                    for edge in (
+                        "prefill_backend",
+                        "decode_backend",
+                        "linear_attn_backend",
+                        "full_attn_backend",
+                    )
+                ]
+                candidates += list(getattr(backend, "attn_backend_list", None) or [])
+                prewarm = getattr(backend, "prewarm_mtp_verify_scatter_kernels", None)
+                if prewarm is not None and id(prewarm.__func__) not in warmed:
+                    warmed.add(id(prewarm.__func__))
+                    prewarm()
+
+        # Cold-load the DSV4.1 FP4 rope-tail kernel while free memory is still
+        # ~GBs. The compressed-latent tier only runs on the first big low-ratio
+        # prefill, so without this the serve-time tail commit would lazy-load it
+        # under the near-zero pool headroom (a cuModuleLoad that OOMs a cold boot).
+        if not self.is_draft_worker:
+            seen = set()
+            for backend in (
+                [self.attn_backend, self.decode_attn_backend]
+                + list(self.decode_attn_backend_group or [])
+            ):
+                if backend is None or id(backend) in seen:
+                    continue
+                seen.add(id(backend))
+                prewarm = getattr(backend, "prewarm_dsv41_rope_tail_kernels", None)
+                if prewarm is not None:
+                    prewarm()
+                    break
+
         if get_parallel().dcp_enabled and get_parallel().dcp_replicate_q_proj:
             self._prepare_replicated_q_proj()
 
@@ -1817,17 +1872,14 @@ class ModelRunner:
         """Run deferred clear/COW on the forward stream, before the mamba layers
         read the pool, so the copies don't race the scheduler copy stream.
 
-        No-op unless this is an extend forward on a mamba model's target worker;
-        COW/clear only happen at prefix match on extend.
+        COW stays extend-only (it comes from prefix-match donate); clears also
+        ride decode forwards -- a decode-time boundary commit donates the keep
+        slot and queues the swapped-in recycled slot for clearing, and a
+        decode-only stream would otherwise never zero it before the next
+        boundary write donates the residue onward.
         """
         pool = self.req_to_token_pool
-        if (
-            not isinstance(pool, HybridReqToTokenPool)
-            or self.is_draft_worker
-            or not forward_batch.forward_mode.is_extend()
-            or forward_batch.forward_mode.is_target_verify()
-            or forward_batch.forward_mode.is_draft_extend_v2()
-        ):
+        if not isinstance(pool, HybridReqToTokenPool) or self.is_draft_worker:
             return
         if (
             forward_batch.mamba_clear_indices is not None
@@ -1838,6 +1890,13 @@ class ModelRunner:
             pool.mamba_pool.clear_slots(
                 pool.translate_mamba_indices(forward_batch.mamba_clear_indices)
             )
+        forward_batch.mamba_clear_indices = None
+        if (
+            not forward_batch.forward_mode.is_extend()
+            or forward_batch.forward_mode.is_target_verify()
+            or forward_batch.forward_mode.is_draft_extend_v2()
+        ):
+            return
         if (
             forward_batch.mamba_cow_src_indices is not None
             and len(forward_batch.mamba_cow_src_indices) > 0
@@ -1855,7 +1914,6 @@ class ModelRunner:
                     pool.translate_mamba_indices(forward_batch.mamba_cow_src_indices),
                     pool.translate_mamba_indices(forward_batch.mamba_cow_dst_indices),
                 )
-        forward_batch.mamba_clear_indices = None
         forward_batch.mamba_cow_src_indices = None
         forward_batch.mamba_cow_dst_indices = None
 
@@ -1890,6 +1948,14 @@ class ModelRunner:
                 self.hisparse_coordinator.wait_for_pending_backup()
                 self.hisparse_coordinator.num_real_reqs.fill_(forward_batch.batch_size)
 
+            # Deferred mamba COW/clear on the forward stream, before any path
+            # (graph replay or eager) reads the pool. Must run before the graph
+            # branch: decode replays the captured graph (which cannot carry the
+            # per-step clear set), so a decode-time boundary commit's queued
+            # recycled-slot clear would otherwise never be applied — and the
+            # scheduler already drained the req-side queue at prepare_for_decode.
+            self._maybe_execute_deferred_mamba_cow_and_clear(forward_batch)
+
             # Replay cuda graph if applicable
             if can_run_graph:
                 ret = self.decode_cuda_graph_runner.execute(
@@ -1898,6 +1964,20 @@ class ModelRunner:
                 )
                 return ModelRunnerOutput(logits_output=ret, can_run_graph=can_run_graph)
 
+            # Tripwire only: a decode that reaches the eager forward while the
+            # decode graph runner exists means this rank skipped its graph.
+            # Symmetric on uncaptured bs; a one-sided line here is the exact
+            # point where the TP collective streams split (AR counter skew).
+            if forward_batch.forward_mode.is_decode() and (
+                self.decode_cuda_graph_runner is not None
+            ):
+                from sglang.srt.utils import lockstep
+
+                lockstep.note_decode_eager_fallback(
+                    f"bs={forward_batch.batch_size} "
+                    f"mode={forward_batch.forward_mode.name}"
+                )
+
             # DP / MLP-sync padding + attn-tp normalization. Only the decode
             # cuda-graph path above pre-pads its static buffers and returns
             # early; split prefill, the prefill cuda graph, and the eager
@@ -1905,10 +1985,6 @@ class ModelRunner:
             # global_dp_buffer_len / padded token counts that graph eligibility
             # and the collectives depend on.
             self._prepare_eager_forward_batch(forward_batch)
-
-            # Deferred mamba COW/clear on the forward stream, before the extend
-            # dispatch below reads the pool.
-            self._maybe_execute_deferred_mamba_cow_and_clear(forward_batch)
 
             dwdp_mgr = get_global_dwdp_manager()
             if dwdp_mgr is not None:
