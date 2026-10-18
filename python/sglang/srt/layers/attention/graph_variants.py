@@ -107,11 +107,16 @@ def create_dsv41_candidate_graph_variants(
         and not model_runner.is_draft_worker
         and captured_req_width > 0
     )
+    # Candidate capture is supported from SM80 up (the indexer runs on Triton
+    # below SM90), so gate at capability major >= 8, not 10. A per-arch capture
+    # structure that differs inside one TP group desyncs CUDA-graph capture
+    # (different collective counts per rank -> busy-wait); gating at 8 keeps the
+    # captured variant set identical across an SM86+SM120 group.
     if not (
         (capture_forward_mode == ForwardMode.DECODE or dspark_target_verify)
         and model_runner.device == "cuda"
         and not is_hip()
-        and torch.cuda.get_device_capability(model_runner.gpu_id)[0] >= 10
+        and torch.cuda.get_device_capability(model_runner.gpu_id)[0] >= 8
         and getattr(text_config, "model_type", None) == "deepseek_v41"
         and getattr(text_config, "candidate_source_layer_id", -1) >= 0
     ):

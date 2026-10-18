@@ -561,6 +561,46 @@ class MoEGate(nn.Module):
 _FUSED_FINALIZE_ALL_REDUCE_MAX_TOKENS = 384
 
 
+_TP_ARCH_CACHE: dict[str, bool] = {}
+
+
+def _tp_all(pred: str) -> bool:
+    """Whether EVERY rank in the TP group satisfies an arch predicate.
+
+    ``_fuse_finalize_all_reduce`` and friends decide a communication op that is
+    captured into the CUDA graph. In a heterogeneous TP group (e.g. SM86 +
+    SM120) a per-rank ``get_platform()`` value makes one rank emit a fused
+    finalize all-reduce and its peers a plain one, so the captures diverge and
+    warmup deadlocks on the first small-M (<=8) decode/verify graph. Resolving
+    the decision on a group-wide AND keeps every rank's graph identical;
+    homogeneous hosts get back their own local value. Mirrors the same helper
+    in ``deepseek_v4`` (kept local to avoid a circular import).
+    """
+    cached = _TP_ARCH_CACHE.get(pred)
+    if cached is not None:
+        return cached
+    plat = get_platform()
+    local = {
+        "blackwell": bool(plat.is_blackwell),
+    }[pred]
+    group = get_parallel().tp_group
+    world = getattr(group, "world_size", 1)
+    if (
+        world > 1
+        and torch.distributed.is_available()
+        and torch.distributed.is_initialized()
+    ):
+        flag = torch.tensor(
+            [1 if local else 0], dtype=torch.int32, device=torch.cuda.current_device()
+        )
+        torch.distributed.all_reduce(flag, group=group.device_group)
+        result = int(flag.item()) == world
+    else:
+        result = local
+    _TP_ARCH_CACHE[pred] = result
+    return result
+
+
 class DeepseekV2MoE(nn.Module):
     def __init__(
         self,
@@ -619,7 +659,7 @@ class DeepseekV2MoE(nn.Module):
         self._fuse_finalize_all_reduce = (
             is_deepseek_v4
             and getattr(config, "hc_pre_from_prev_sublayer", False)
-            and get_platform().is_blackwell
+            and _tp_all("blackwell")
             and self.tp_size == 4
         )
 
