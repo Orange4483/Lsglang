@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import TYPE_CHECKING, List
 
@@ -162,10 +163,31 @@ async def prefill_shapes(disaggregation_mode: str, tokenizer_manager: TokenizerM
 
         await tokenizer_manager.generate_request(generate_req_input, None).__anext__()
 
-    # NOTE(bs2-warmup): batched bs=2 warmup trips a device-side assert in
-    # the hybrid-linear child backend (see the bs2 case file in bugs/);
-    # until fixed, bs=2 kernel variants load on the first concurrent
-    # request.
+    # Concurrent-prefill arm: two requests in flight at once is the ONLY
+    # path that touches the bs>1 extend alloc, the QSA mixed-batch layout
+    # and the multi-layer conv window scatter kernels. First concurrent
+    # request used to JIT-load them mid-serving with TP ranks module-loading
+    # at unequal times — NCCL then turns the stagger into a lockstep deadlock.
+    pair_a = GenerateReqInput(
+        input_ids=(np.random.randint(2**16, size=[300])).tolist(),
+        sampling_params={"max_new_tokens": 16, "temperature": 0.0},
+    )
+    pair_b = GenerateReqInput(
+        input_ids=(np.random.randint(2**16, size=[130])).tolist(),
+        sampling_params={"max_new_tokens": 16, "temperature": 0.0},
+    )
+    if disaggregation_mode == "null":
+        await asyncio.gather(
+            tokenizer_manager.generate_request(pair_a, None).__anext__(),
+            tokenizer_manager.generate_request(pair_b, None).__anext__(),
+        )
+
+    # NOTE(bs2-warmup): batched bs=2 warmup once tripped a device-side assert
+    # in the hybrid-linear child backend (case file predates this tree). The
+    # bs=2 arm of the extend/alloc/QSA kernels otherwise JIT-loads during the
+    # first concurrent request, where TP ranks module-load at unequal times
+    # and NCCL turns the stagger into a lockstep deadlock. Re-enabled; if the
+    # assert is still alive it surfaces here at startup, not mid-serving.
 
     for size in (65, 2049):
         generate_req_input = GenerateReqInput(
