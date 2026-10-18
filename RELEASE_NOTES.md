@@ -1,3 +1,24 @@
+# lsglang v1.6.1 — Determinism Hardening, Heterogeneous TP Fixes
+
+**Base:** v1.6.0 tree (upstream sglang @ `583fada954`); correctness-only release.
+
+## Fixes
+
+- Pinned-host race eliminated tree-wide: async H2D sources park in a 16-deep
+  ring (`park_pinned`/`h2d_async`); 11 sites — kills the greedy non-determinism /
+  runaway-loop family (Qwen3.8, DeepSeek V4.x; cf. upstream #37343/#35632/#38319/#43956).
+- Heterogeneous TP4 capture deadlock: graph eligibility via group-consensus
+  arch check (`_tp_all`), capture gate `>=10` → `>=8`.
+- First-request JIT stall on DeepSeek V4.x: flashinfer sampling kernel prewarmed
+  at model load (V4 + dspark).
+
+## Known Issues
+
+- Prefill logits not bit-reproducible across requests (two bs=1-shape-guarded
+  kernels upstream-side; investigation ongoing).
+- `--enable-decoder-swa-bounded-replay` not numerically equivalent to full prefill.
+- `reasoning_content` dropped on `tool_calls` responses with speculative decoding.
+
 # lsglang v1.6.0 — GPU Expert Pool, NVMe Weight Offload, Super-Mix Prefill
 
 **Base:** upstream sglang @ `583fada954` (main, 2026-09-27)

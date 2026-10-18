@@ -2,7 +2,7 @@
 export LOG=${LOG:-/tmp/opencode/serve_logs/$(basename "$0" .sh)_$(date +%m%d_%H%M%S).log}
 mkdir -p /tmp/opencode/serve_logs
 exec > >(tee -a "$LOG") 2>&1
-# DeepSeek-V4.1-Flash · 2× RTX 3090 (SM86), TP2, plain decode.
+# DeepSeek-V4.1-Flash-1017 · 2× RTX 3090 (SM86), TP2, plain decode.
 
 CUDA_DEVICE_ORDER=PCI_BUS_ID \
 GLOO_SOCKET_IFNAME=lo NCCL_SOCKET_IFNAME=lo \
@@ -24,8 +24,8 @@ SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE=1 \
 SGLANG_SKIP_P2P_CHECK=1 \
 FLASHINFER_DISABLE_VERSION_CHECK=1 \
 sglang serve \
-  --model ~/Models/DeepSeek-V4.1-Flash \
-  --served-model-name DeepSeek-V4.1-Flash \
+  --model ~/Models/DeepSeek-V4.1-Flash-1017 \
+  --served-model-name DeepSeek-V4.1-Flash-1017 \
   --host 0.0.0.0 \
   --port 8070 \
   --trust-remote-code \
@@ -40,4 +40,4 @@ sglang serve \
   --max-total-tokens 262144 \
   --mem-fraction-static 0.78 \
   --swa-full-tokens-ratio 0.1 \
-  --cuda-graph-backend-prefill disabled \
+  --cuda-graph-backend-prefill disabled

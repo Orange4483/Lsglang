@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# DeepSeek-V4.1-Flash · 2× RTX 3090 (SM86), TP2, DSPARK speculative decode.
+# DeepSeek-V4.1-Flash-1017 · 2× RTX 3090 (SM86), TP2, DSPARK speculative decode.
 
 CUDA_DEVICE_ORDER=PCI_BUS_ID \
 GLOO_SOCKET_IFNAME=lo NCCL_SOCKET_IFNAME=lo \
@@ -22,8 +22,8 @@ SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE=1 \
 SGLANG_SKIP_P2P_CHECK=1 \
 FLASHINFER_DISABLE_VERSION_CHECK=1 \
 sglang serve \
-  --model ~/Models/DeepSeek-V4.1-Flash \
-  --served-model-name DeepSeek-V4.1-Flash \
+  --model ~/Models/DeepSeek-V4.1-Flash-1017 \
+  --served-model-name DeepSeek-V4.1-Flash-1017 \
   --host 0.0.0.0 \
   --port 8070 \
   --trust-remote-code \
@@ -41,4 +41,4 @@ sglang serve \
   --cuda-graph-backend-prefill disabled \
   --speculative-algorithm DSPARK \
   --speculative-dspark-block-size 5 \
-  --speculative-attention-mode decode 
+  --speculative-attention-mode decode
