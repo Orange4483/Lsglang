@@ -316,6 +316,12 @@ class Envs:
     # sizes the KV pool. Cap its resident set; 0 disables the trim.
     SGLANG_QWEN4_PLE_FILE_RSS_BUDGET_GB = EnvFloat(8.0)
     SGLANG_QWEN4_PLE_FILE_RSS_INTERVAL_S = EnvFloat(30.0)
+# Sort the QSA top-k block selection into a deterministic order. The CUDA
+    # top-k kernels deposit slots with atomicAdd, so their per-row output
+    # ORDER (not the selected set) varies run to run; sparse attention merges
+    # blocks in list order, making logits run-dependent. Set 0 to keep the raw
+    # atomic order (faster by one small sort, nondeterministic).
+    SGLANG_QSA_SORT_TOPK = EnvBool(True)
     SGLANG_PREFETCH_BLOCK_SIZE_MB = EnvInt(16)
     SGLANG_GEMMA_OUT_OF_PLACE_POSITION_MUTATION = EnvBool(False)
     SGLANG_ENABLE_WEIGHT_LOADER_V2 = EnvBool(False)
