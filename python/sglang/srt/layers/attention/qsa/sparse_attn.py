@@ -20,9 +20,29 @@ _L20_CONFIGS = [
     (float("inf"), (16, 1, 2)),
 ]
 
+# Measured on the RTX PRO 6000 (SM120) with paired CUDA-graph ABBA against the
+# shipped buckets; only rows with a confirmed win differ from _L20_CONFIGS.
+# The <=32 bucket is the one that matters: NEXTN verify runs the extend path at
+# bs*draft-tokens rows (<=16), so it re-runs every decode step -- (64, 4, 2) is
+# +35% there (12/12); the old (32, 8, 2) was tuning a shape SM120 dislikes.
+_SM120_CONFIGS = [
+    (32, (64, 4, 2)),
+    (64, (64, 8, 2)),
+    (128, (64, 4, 2)),
+    (512, (32, 4, 3)),
+    (float("inf"), (16, 2, 3)),
+]
+
 
 def _get_best_config(total_q: int):
-    table = _H20_CONFIGS if "H20" in torch.cuda.get_device_name(0) else _L20_CONFIGS
+    from sglang.srt.utils import is_sm120
+
+    if is_sm120():
+        table = _SM120_CONFIGS
+    elif "H20" in torch.cuda.get_device_name(0):
+        table = _H20_CONFIGS
+    else:
+        table = _L20_CONFIGS
     return next(cfg for limit, cfg in table if total_q <= limit)
 
 
