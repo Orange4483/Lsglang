@@ -911,6 +911,9 @@ class LateLayerTail(msgspec.Struct, frozen=True):
     swa_out_cache_loc: torch.Tensor
     # Set when the tail is the extend's last rows (one request): a view, not a gather.
     contiguous_start: Optional[int] = None
+    # Exact real-row count when the tail is a fixed-capacity padded block
+    # (prefill CUDA graph); None means token_indices holds only real rows.
+    real_rows_count: Optional[int] = None
     # prefill CP: this rank's tail rows padded to the largest share; cp_metadata is that layout
     pad_rows: int = 0
     cp_metadata: Optional[InterleaveContextParallelMetadata] = None
@@ -1788,29 +1791,6 @@ class DeepseekV4AttnBackend(
             get_local_dp_buffer_len(),
         )
         tail = tail_metadata.late_layer_tail
-        # The layers before the switch published top-k into the full metadata's
-        # buffers; carry the tail rows into the tail metadata's (padding stays -1).
-        full_core = saved[0].core_attn_metadata
-        tail_core = tail_metadata.core_attn_metadata
-        for ratio in tail_core.low_ratios:
-            for full_buf, tail_buf in (
-                (
-                    full_core.sparse_page_indices(ratio),
-                    tail_core.sparse_page_indices(ratio),
-                ),
-                (
-                    full_core.sparse_topk_lengths(ratio),
-                    tail_core.sparse_topk_lengths(ratio),
-                ),
-                (
-                    full_core.sparse_raw_indices(ratio),
-                    tail_core.sparse_raw_indices(ratio),
-                ),
-            ):
-                if full_buf is None or tail_buf is None:
-                    continue
-                rows = tail.real_rows(full_buf)
-                tail_buf[: rows.shape[0]].copy_(rows)
         saved = saved + (
             forward_batch.global_num_token_non_padded_cpu,
             forward_batch.global_num_token_non_padded,
@@ -1840,11 +1820,38 @@ class DeepseekV4AttnBackend(
             set_local_dp_buffer_len(sum(tail.cp_metadata.per_rank_actual_token))
         return saved
 
+    def carry_tail_topk_rows(self, full_core, tail_core, tail) -> None:
+        # Carry the top-k rows the pre-switch layers published in the full
+        # metadata into the tail metadata's buffers (padding stays -1). Our
+        # tail is always real-row-sized, so rows() lands exactly.
+        for ratio in tail_core.low_ratios:
+            for full_buf, tail_buf in (
+                (
+                    full_core.sparse_page_indices(ratio),
+                    tail_core.sparse_page_indices(ratio),
+                ),
+                (
+                    full_core.sparse_topk_lengths(ratio),
+                    tail_core.sparse_topk_lengths(ratio),
+                ),
+                (
+                    full_core.sparse_raw_indices(ratio),
+                    tail_core.sparse_raw_indices(ratio),
+                ),
+            ):
+                if full_buf is None or tail_buf is None:
+                    continue
+                rows = tail.real_rows(full_buf)
+                tail_buf[: rows.shape[0]].copy_(rows)
+
     def exit_late_layer_tail(self, saved: tuple, forward_batch: ForwardBatch) -> None:
         (
             self.forward_metadata,
             forward_batch.attn_cp_metadata,
             local_dp_buffer_len,
+            non_padded,
+            non_padded_gpu,
+            local_non_padded,
         ) = saved
         set_local_dp_buffer_len(local_dp_buffer_len)
         forward_batch.global_num_token_non_padded_cpu = non_padded

@@ -4754,7 +4754,13 @@ class DeepseekV4Model(nn.Module):
                 combined_attn = None
                 normalized_attn = None
                 # Decode reaches back at most SWA_WINDOW positions.
+                full_core = attn_backend.forward_metadata.core_attn_metadata
                 saved_full = attn_backend.enter_late_layer_tail(forward_batch)
+                attn_backend.carry_tail_topk_rows(
+                    full_core,
+                    attn_backend.forward_metadata.core_attn_metadata,
+                    tail,
+                )
                 hidden_states, prev_pre, input_ids, input_ids_global = (
                     tail.rows(hidden_states),
                     tail.rows(prev_pre),
