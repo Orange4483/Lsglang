@@ -29,6 +29,7 @@ def _hc_mix_persistent_kernel(
     w_down_ptr,
     w_up_ptr,
     t_raw_ptr,
+    t_part_ptr,
     out_ptr,
     counters_ptr,
     K,
@@ -44,6 +45,10 @@ def _hc_mix_persistent_kernel(
     BLOCK_J: tl.constexpr,
     BLOCK_R: tl.constexpr,
 ):
+    # Run-deterministic: the down projection lands in per-tile private slots
+    # (store, not atomic) and is summed in fixed slot order by a single owner,
+    # so replayed launches are bit-identical. Atomic accumulation here drifted
+    # ~1ulp per decode step and flipped greedy argmax within ~40 tokens.
     pid = tl.program_id(0)
     offs_m = tl.arange(0, ROWS)
     mask_m = offs_m < num_rows
@@ -76,14 +81,37 @@ def _hc_mix_persistent_kernel(
             other=0.0,
         )
         acc = tl.dot(xt, tl.trans(w))
-        tl.atomic_add(
-            t_raw_ptr + offs_m[:, None] * LOWRANK + n[None, :],
+        tl.store(
+            t_part_ptr
+            + tile * ROWS * BLOCK_N
+            + offs_m[:, None] * BLOCK_N
+            + offs_n[None, :],
             acc,
-            mask=mask_n[None, :],
-            sem="relaxed",
-            scope="gpu",
+            mask=mask_m[:, None] & mask_n[None, :],
         )
     _grid_barrier(counters_ptr + 1, num_ctas)
+
+    # Fixed-order reduction into t_raw by a single owner: for each column
+    # block, sum the k-chunk slots ascending (slot id = kc*n_blocks + nb,
+    # matching phase 2's tile = kc*n_blocks + nb enumeration).
+    if pid == 0:
+        offs_n0 = tl.arange(0, BLOCK_N)
+        for nb in range(0, n_blocks):
+            acc_n = tl.zeros((ROWS, BLOCK_N), dtype=tl.float32)
+            for kc in range(0, k_chunks):
+                acc_n += tl.load(
+                    t_part_ptr
+                    + (kc * n_blocks + nb) * ROWS * BLOCK_N
+                    + offs_m[:, None] * BLOCK_N
+                    + offs_n0[None, :]
+                )
+            n0 = nb * BLOCK_N + offs_n0
+            tl.store(
+                t_raw_ptr + offs_m[:, None] * LOWRANK + n0[None, :],
+                acc_n,
+                mask=(n0 < LOWRANK)[None, :],
+            )
+    _grid_barrier(counters_ptr + 3, num_ctas)
 
     offs_j = tl.arange(0, BLOCK_J)
     offs_r = tl.arange(0, BLOCK_R)
@@ -132,9 +160,8 @@ def _hc_mix_persistent_kernel(
 
     ticket = tl.atomic_add(counters_ptr + 2, 1, sem="acq_rel", scope="gpu")
     if ticket == num_ctas - 1:
-        tl.store(counters_ptr + 0, 0)
-        tl.store(counters_ptr + 1, 0)
-        tl.store(counters_ptr + 2, 0)
+        for c in tl.static_range(4):
+            tl.store(counters_ptr + c, 0)
 
 
 _counters_cache = {}
@@ -143,19 +170,23 @@ _counters_cache = {}
 def _get_counters(device: torch.device) -> torch.Tensor:
     buf = _counters_cache.get(device)
     if buf is None:
-        buf = torch.zeros(3, dtype=torch.int32, device=device)
+        buf = torch.zeros(4, dtype=torch.int32, device=device)
         _counters_cache[device] = buf
     return buf
 
 
-def _deterministic_inference() -> bool:
-    from sglang.srt.runtime_context import get_exec
+_t_part_cache = {}
 
-    try:
-        exec_cfg = get_exec()
-    except ValueError:
-        return False
-    return bool(exec_cfg.deterministic.enable_deterministic_inference)
+
+def _get_t_part(device, tiles: int, rows_pad: int, block_n: int) -> torch.Tensor:
+    key = (device, tiles, rows_pad, block_n)
+    buf = _t_part_cache.get(key)
+    if buf is None:
+        buf = torch.empty(
+            (tiles, rows_pad, block_n), dtype=torch.float32, device=device
+        )
+        _t_part_cache[key] = buf
+    return buf
 
 
 def fused_hc_mix_supported(
@@ -163,8 +194,6 @@ def fused_hc_mix_supported(
 ) -> bool:
     # The persistent kernel accumulates the down projection with
     # device-scope atomics, so summation order varies across replays.
-    if _deterministic_inference():
-        return False
     return (
         hyper_input_normed.is_cuda
         and hyper_input_normed.dtype in (torch.bfloat16, torch.float16)
@@ -195,11 +224,18 @@ def fused_hc_mix(
     out = torch.empty((rows, hs), dtype=hyper_input_normed.dtype, device=device)
     if rows == 0:
         return out
+    t_part = _get_t_part(
+        device,
+        tiles=((lowrank + 31) // 32) * ((k + 255) // 256),
+        rows_pad=rows_pad,
+        block_n=32,
+    )
     _hc_mix_persistent_kernel[(num_ctas,)](
         hyper_input_normed,
         w_down,
         w_up,
         t_raw,
+        t_part,
         out,
         _get_counters(device),
         k,
