@@ -1,4 +1,16 @@
 #!/usr/bin/env bash
+LOG="${LOG:-/tmp/opencode/serve_logs/sglang_serve_qwen36_mtp_tp2_5060ti.log}"
+mkdir -p /tmp/opencode/serve_logs
+echo "===== $(date "+%F %T") launch pid=$$ =====" >> "$LOG"
+if [ -t 1 ]; then
+    # interactive terminal: console and log both live (closing the
+    # terminal is a deliberate stop)
+    exec > >(tee -a "$LOG") 2>&1
+else
+    # detached/tool launch: plain file append, no coprocess that a
+    # session teardown could kill (EPIPE would take the engine down)
+    exec >> "$LOG" 2>&1
+fi
 # Qwen3.6-35B-A3B-NVFP4 · 2× RTX 5060 Ti (SM120), TP2, NEXTN d4 (MTP), resident 0-1,33-34 + pool.
 
 CUDA_DEVICE_ORDER=PCI_BUS_ID \

@@ -1,7 +1,16 @@
 #!/usr/bin/env bash
 LOG="${LOG:-/tmp/opencode/serve_logs/sglang_serve_qwen38_mtp_tp4.log}"
- mkdir -p /tmp/opencode/serve_logs
- exec > >(tee -a "$LOG") 2>&1
+mkdir -p /tmp/opencode/serve_logs
+echo "===== $(date "+%F %T") launch pid=$$ =====" >> "$LOG"
+if [ -t 1 ]; then
+    # interactive terminal: console and log both live (closing the
+    # terminal is a deliberate stop)
+    exec > >(tee -a "$LOG") 2>&1
+else
+    # detached/tool launch: plain file append, no coprocess that a
+    # session teardown could kill (EPIPE would take the engine down)
+    exec >> "$LOG" 2>&1
+fi
 # Qwen3.8-Flash-Next-NVFP4 · 2x RTX 3090 (SM86) + 2x RTX 5060 Ti (SM120), TP4, MTP (NEXTN).
 
 CUDA_DEVICE_ORDER=PCI_BUS_ID \
@@ -10,8 +19,6 @@ GLOO_SOCKET_IFNAME=lo NCCL_SOCKET_IFNAME=lo \
 CUDA_VISIBLE_DEVICES=0,1,2,3 \
 SGLANG_SKIP_P2P_CHECK=1 \
 SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0 \
-SGLANG_HC_NORM_FOLD=1 \
-SGLANG_HC_MIX_TRITON=1 \
 LK_MOE_HYBRID_ENABLED=1 \
 LK_THREADS=48 \
 OMP_NUM_THREADS=1 \

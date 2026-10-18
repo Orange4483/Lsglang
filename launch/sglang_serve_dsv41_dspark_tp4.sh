@@ -1,4 +1,16 @@
 #!/usr/bin/env bash
+LOG="${LOG:-/tmp/opencode/serve_logs/sglang_serve_dsv41_dspark_tp4.log}"
+mkdir -p /tmp/opencode/serve_logs
+echo "===== $(date "+%F %T") launch pid=$$ =====" >> "$LOG"
+if [ -t 1 ]; then
+    # interactive terminal: console and log both live (closing the
+    # terminal is a deliberate stop)
+    exec > >(tee -a "$LOG") 2>&1
+else
+    # detached/tool launch: plain file append, no coprocess that a
+    # session teardown could kill (EPIPE would take the engine down)
+    exec >> "$LOG" 2>&1
+fi
 # DeepSeek-V4.1-Flash-1017 · 2× RTX 3090 (SM86), 2x RTX 5060Ti, TP4, DSPARK speculative decode.
 
 CUDA_DEVICE_ORDER=PCI_BUS_ID \
