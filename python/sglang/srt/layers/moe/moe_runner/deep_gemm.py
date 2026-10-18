@@ -43,6 +43,7 @@ from sglang.srt.utils import (
     ceil_div,
     dispose_tensor,
     get_bool_env_var,
+    h2d_async,
     is_cuda,
     is_hip,
     is_musa,
@@ -1418,12 +1419,9 @@ def pre_permute_deepep_normal_to_deep_gemm(
             num_recv_tokens_per_expert
         )
     else:
-        num_recv_tokens_per_expert_gpu = torch.tensor(
-            num_recv_tokens_per_expert,
-            dtype=torch.int32,
-            pin_memory=True,
-            device="cpu",
-        ).cuda(non_blocking=True)
+        num_recv_tokens_per_expert_gpu = h2d_async(
+            num_recv_tokens_per_expert, torch.int32, "cuda"
+        )
     expert_start_loc = torch.empty_like(num_recv_tokens_per_expert_gpu)
 
     ep_scatter(

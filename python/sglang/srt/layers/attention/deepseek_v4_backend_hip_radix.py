@@ -44,6 +44,7 @@ from sglang.srt.runtime_context import (
 from sglang.srt.speculative.eagle_utils import per_step_draft_out_cache_loc
 from sglang.srt.speculative.ragged_verify import resolve_ragged_verify_layout
 from sglang.srt.utils import ceil_align
+from sglang.srt.utils.common import h2d_async
 
 if TYPE_CHECKING:
     from sgl_kernel.flash_mla import FlashMLASchedMeta
@@ -636,8 +637,7 @@ class DeepseekV4HipRadixBackend(
         ] = None
 
     def _move_to_device(self, x: List[int]) -> torch.Tensor:
-        pin_tensor = torch.tensor(x, dtype=torch.int32, pin_memory=True)
-        return pin_tensor.to(self.device, non_blocking=True)
+        return h2d_async(x, torch.int32, self.device)
 
     def init_forward_metadata_indexer(self, core_attn_metadata: DSV4AttnMetadata):
         return PagedIndexerMetadata(

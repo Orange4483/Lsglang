@@ -3,6 +3,8 @@ from typing import List, Optional, Tuple
 
 import torch
 
+from sglang.srt.utils.common import park_pinned
+
 from sglang.kernels.ops.gemm.embedding_lora_a import embedding_lora_a_fwd
 from sglang.kernels.ops.gemm.gate_up_lora_b import gate_up_lora_b_fwd
 from sglang.kernels.ops.gemm.qkv_lora_b import qkv_lora_b_fwd
@@ -646,14 +648,24 @@ class TritonLoRABackend(BaseLoRABackend):
                     sgemm.bs = num_chunks
                     sgemm.num_segments = num_segments
                     sgemm.weight_indices[:num_segments].copy_(
-                        torch.tensor(
-                            indices, dtype=torch.int32, pin_memory=True, device="cpu"
+                        park_pinned(
+                            torch.tensor(
+                                indices,
+                                dtype=torch.int32,
+                                pin_memory=True,
+                                device="cpu",
+                            )
                         ),
                         non_blocking=True,
                     )
                     sgemm.seg_lens[:num_segments].copy_(
-                        torch.tensor(
-                            lengths, dtype=torch.int32, pin_memory=True, device="cpu"
+                        park_pinned(
+                            torch.tensor(
+                                lengths,
+                                dtype=torch.int32,
+                                pin_memory=True,
+                                device="cpu",
+                            )
                         ),
                         non_blocking=True,
                     )

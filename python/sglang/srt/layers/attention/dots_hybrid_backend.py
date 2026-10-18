@@ -14,6 +14,7 @@ from sglang.srt.layers.attention.base_attn_backend import (
     SharedReadEnds,
 )
 from sglang.srt.layers.attention.hybrid_attn_backend import HybridAttnBackend
+from sglang.srt.utils.common import h2d_async
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -307,7 +308,7 @@ class DotsSWAMLAAttnBackend(AttentionBackend):
             kv_indices=kv_indices,
             cu_seqlens_q=metadata.cu_seqlens_q,
             cu_seqlens_k=torch.cumsum(
-                lens_cpu.to(device=forward_batch.seq_lens.device, non_blocking=True),
+                h2d_async(lens_cpu, None, forward_batch.seq_lens.device),
                 dim=0,
                 dtype=torch.int32,
             ),

@@ -2222,15 +2222,17 @@ def set_mamba_track_indices_from_reqs(
             for req in batch.reqs
         ]
     batch.mamba_track_buffer_indices = list(track_positions)
-    idx = (
-        torch.tensor(
-            track_positions,
-            dtype=torch.int64,
-            pin_memory=True,
-        )
-        .unsqueeze(1)
-        .to(device=all_buffers.device, non_blocking=True)
-    )
+    # The pinned staging block MUST stay referenced until the async H2D
+    # completes: torch's pinned allocator hands the block to the NEXT
+    # allocation the moment the temp dies, and track_positions alternates
+    # 0/1 (ping-pong) -- a recycled block mid-copy makes this step's gather
+    # read the NEXT step's flip, i.e. state tracks into the wrong ping-pong
+    # slot. Keep the owner on the batch (lives past the copy) and tie the
+    # copy to the current stream via record_stream as a belt-brace.
+    _pin = torch.tensor(track_positions, dtype=torch.int64, pin_memory=True)
+    idx = _pin.unsqueeze(1).to(device=all_buffers.device, non_blocking=True)
+    idx.record_stream(torch.cuda.current_stream(all_buffers.device))
+    batch._mamba_track_pin = _pin  # pin alive until batch is recycled
     batch.mamba_track_indices = (
         torch.gather(all_buffers, 1, idx).squeeze(1).to(torch.int64)
     )
@@ -3639,10 +3641,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.mamba_decode_batch_idx_cpu = [
                 req.decode_batch_idx for req in self.reqs
             ]
-            # async H2D
-            self.mamba_track_mask = track_mask_cpu.pin_memory().to(
-                device=self.device, non_blocking=True
-            )
+            # async H2D -- the pinned temp must outlive the copy (same race
+            # class as the track-indices gather: recycled pinned blocks make
+            # the mask read the NEXT step's flip).
+            _mask_pin = track_mask_cpu.pin_memory()
+            self.mamba_track_mask = _mask_pin.to(device=self.device, non_blocking=True)
+            self.mamba_track_mask.record_stream(torch.cuda.current_stream(self.device))
+            self._mamba_track_mask_pin = _mask_pin
 
     def filter_batch(
         self,

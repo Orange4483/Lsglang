@@ -21,6 +21,7 @@ from sglang.srt.layers.attention.dsa.utils import (
 from sglang.srt.model_executor.forward_context import get_req_to_token_pool
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import is_cuda, is_hip
+from sglang.srt.utils.common import h2d_async
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.dsa.dsa_topk_backend import TopkTransformMethod
@@ -315,7 +316,7 @@ def _kpool_plan_to_gpu(
             dtype=torch.int64,
             pin_memory=True,
         )
-        i64_gpu = i64_cpu.to(device, non_blocking=True)
+        i64_gpu = h2d_async(i64_cpu, None, device)
         c = 0
         pool_req_t = i64_gpu[c : c + n_pool]
         c += n_pool
@@ -347,7 +348,7 @@ def _kpool_plan_to_gpu(
             dtype=torch.int32,
             pin_memory=True,
         )
-        i32_gpu = i32_cpu.to(device, non_blocking=True)
+        i32_gpu = h2d_async(i32_cpu, None, device)
         c = 0
         pool_n_from_tail_t = i32_gpu[c : c + n_pool]
         c += n_pool

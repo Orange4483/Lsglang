@@ -128,7 +128,7 @@ from sglang.srt.speculative.ragged_verify import (
     resolve_ragged_verify_layout,
 )
 from sglang.srt.utils import ceil_align, is_cuda, is_xpu
-from sglang.srt.utils.common import is_sm80_supported, is_sm120_supported
+from sglang.srt.utils.common import h2d_async, is_sm80_supported, is_sm120_supported
 
 if TYPE_CHECKING:
     from sgl_kernel.flash_mla import FlashMLASchedMeta
@@ -1290,8 +1290,7 @@ class DeepseekV4AttnBackend(
         self.cuda_graph_swa_out_cache_loc: Optional[torch.Tensor] = None
 
     def _move_to_device(self, x: List[int]) -> torch.Tensor:
-        pin_tensor = torch.tensor(x, dtype=torch.int32, pin_memory=True)
-        return pin_tensor.to(self.device, non_blocking=True)
+        return h2d_async(x, torch.int32, self.device)
 
     def _resolve_verify_layout(
         self,

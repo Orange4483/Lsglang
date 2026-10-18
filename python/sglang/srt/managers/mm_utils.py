@@ -56,6 +56,7 @@ from sglang.srt.utils import (
     flatten_nested_list,
     print_warning_once,
 )
+from sglang.srt.utils.common import h2d_async
 from sglang.srt.utils.stale_shm_cleanup import make_shm_name
 from sglang.utils import logger
 
@@ -464,11 +465,8 @@ def embed_mm_inputs(
             pad_values = [item.pad_value for item in items]
             if input_ids.device.type == "cuda":
                 # Pinned staging keeps the placeholder copy asynchronous on CUDA.
-                placeholder_cpu = torch.tensor(
-                    pad_values, dtype=torch.int64, device="cpu", pin_memory=True
-                )
-                placeholder_tensor = placeholder_cpu.to(
-                    input_ids.device, non_blocking=True
+                placeholder_tensor = h2d_async(
+                    pad_values, torch.int64, input_ids.device
                 )
             else:
                 placeholder_tensor = torch.as_tensor(

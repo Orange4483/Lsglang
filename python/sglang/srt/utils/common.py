@@ -49,7 +49,7 @@ import types
 import uuid
 import warnings
 from array import array
-from collections import OrderedDict, defaultdict
+from collections import OrderedDict, defaultdict, deque
 from contextlib import contextmanager
 from dataclasses import dataclass
 from decimal import Decimal
@@ -583,6 +583,20 @@ def is_pin_memory_available(device=None) -> bool:
     return current_platform.is_pin_memory_available(device)
 
 
+_pin_ring = deque(maxlen=16)
+
+
+def park_pinned(tensor: torch.Tensor) -> torch.Tensor:
+    """Keep a pinned staging tensor alive a few steps longer.
+
+    Dropping it when the copy call returns lets the caching allocator hand
+    the same block to the next pinned tensor, whose CPU-side fill then races
+    the still-in-flight copy (silently wrong values, no crash).
+    """
+    _pin_ring.append(tensor)
+    return tensor
+
+
 def async_d2h(tensor: torch.Tensor) -> torch.Tensor:
     """Enqueue a CUDA-to-pinned-host copy on the current stream."""
     if not tensor.is_cuda:
@@ -590,7 +604,16 @@ def async_d2h(tensor: torch.Tensor) -> torch.Tensor:
     host = torch.empty(tensor.shape, dtype=tensor.dtype, pin_memory=True)
     host.copy_(tensor, non_blocking=True)
     tensor.record_stream(torch.cuda.current_stream(tensor.device))
-    return host
+    return park_pinned(host)
+
+
+def h2d_async(x, dtype: torch.dtype | None, device: torch.device | str) -> torch.Tensor:
+    """Copy ``x`` (a python list, or an already-pinned tensor) to ``device``
+    without a host sync, keeping the pinned staging block parked (see
+    park_pinned) so its copy cannot be raced by the next pinned fill."""
+    if not isinstance(x, torch.Tensor):
+        x = torch.tensor(x, dtype=dtype, pin_memory=True)
+    return park_pinned(x).to(device, non_blocking=True)
 
 
 def get_dispatch_device_backend():

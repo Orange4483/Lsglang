@@ -25,8 +25,11 @@ def get_tail_row_indices(
     device = torch.device(device)
     if device.type != "cuda":
         return torch.tensor(rows, dtype=torch.int64, device=device)
-    staged = torch.tensor(rows, dtype=torch.int64, pin_memory=True)
-    return staged.to(device, non_blocking=True)
+    # Imported lazily: a module-level ``common`` import here closes a cycle
+    # (common -> ... -> v41_indexer -> common) under some load orders.
+    from sglang.srt.utils.common import h2d_async
+
+    return h2d_async(rows, torch.int64, device)
 
 
 class CandidateMetadata:
