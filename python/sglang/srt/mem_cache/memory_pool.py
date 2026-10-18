@@ -1618,7 +1618,8 @@ class HybridReqToTokenPool(ReqToTokenPool):
         )
         buf[:n] = slots
         req.kv.mamba_ping_pong_track_buffer = buf
-        req.kv.mamba_prev_track_seqlen = None
+        # (mamba_prev_track_seqlen lives in the upstream ReqKvInfo lineage this
+        # absorb did not take; nothing here or downstream reads it.)
         # Freshly recycled from the shared pool; these slots are never zeroed on
         # free, so stage a deferred forward-stream clear (see
         # _collect_deferred_mamba_cow_and_clear). Without it a skipped boundary
