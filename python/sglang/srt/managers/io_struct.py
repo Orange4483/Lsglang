@@ -428,6 +428,7 @@ class GenerateReqInput:
         self._determine_batch_size()
         if self.session_id is not None and self.session_params is not None:
             raise ValueError("session_id and session_params cannot both be set.")
+        self._lift_misplaced_logprob_kwargs()
         self._handle_parallel_sampling()
 
         if self.is_single:
@@ -545,6 +546,50 @@ class GenerateReqInput:
                 self.input_ids = [self.input_ids]
             if self.input_embeds is not None:
                 self.input_embeds = [self.input_embeds]
+
+    _MISPLACED_SAMPLING_KEYS = (
+        "return_logprob",
+        "logprob_start_len",
+        "top_logprobs_num",
+        "token_ids_logprob",
+        "return_text_in_logprobs",
+    )
+
+    def _lift_misplaced_logprob_kwargs(self):
+        # These fields belong on the request, not in the sampling dict that
+        # feeds SamplingParams (msgspec rejects unknown kwargs with a 500).
+        # Hoist them to top level so misplaced-but-understandable requests
+        # succeed instead of dying in the tokenizer.
+        dicts = []
+        if isinstance(self.sampling_params, dict):
+            dicts = [self.sampling_params]
+        elif isinstance(self.sampling_params, list) and all(
+            isinstance(sp, dict) for sp in self.sampling_params
+        ):
+            dicts = self.sampling_params
+        for key in self._MISPLACED_SAMPLING_KEYS:
+            found = [(i, sp.pop(key)) for i, sp in enumerate(dicts) if key in sp]
+            if not found:
+                continue
+            if len(found) == 1 and isinstance(self.sampling_params, dict):
+                setattr(self, key, found[0][1])
+            elif getattr(self, key) is None:
+                if len(self.sampling_params) > 1 and len(found) < len(dicts):
+                    # Per-entry fields keep per-request semantics; broadcast a
+                    # found value to the entries that did not set it.
+                    missing = {
+                        "return_logprob": False,
+                        "return_text_in_logprobs": False,
+                        "logprob_start_len": -1,
+                        "top_logprobs_num": 0,
+                        "token_ids_logprob": None,
+                    }[key]
+                    values = [missing] * len(dicts)
+                    for i, value in found:
+                        values[i] = value
+                    setattr(self, key, values)
+                else:
+                    setattr(self, key, found[0][1])
 
     def _normalize_single_inputs(self):
         """Normalize inputs for a single example."""
