@@ -45,6 +45,7 @@ from sglang.srt.models.deepseek_v4 import (
     _dequant_fp8_wo_a_streaming,
     hc_head_torch,
     make_hc_head_params,
+    prewarm_block_fp8_linear_kernels,
 )
 from sglang.srt.models.dspark import (
     DSparkConfidenceHead,
@@ -1147,6 +1148,12 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
             params_dict=params_dict, loaded_params=loaded_params
         )
 
+        # The draft's own block-fp8 linears are otherwise first loaded inside
+        # the verify capture -- the mixed SM86+SM120 cold-cubin deadlock. Warm
+        # them here; shapes overlap the main model so most of this is a hit.
+        if torch.version.cuda is not None:
+            prewarm_block_fp8_linear_kernels(self)
+
     def _assert_confidence_head_loaded(
         self, *, params_dict: dict, loaded_params: set
     ) -> None:
@@ -1258,6 +1265,13 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         if mapped_rest.endswith(".scale"):
             mapped_rest = mapped_rest.removesuffix(".scale") + ".weight_scale_inv"
         return f"stages.{stage_id}.{mapped_rest}"
+
+    def precompile_kernels_after_loading(self) -> None:
+        from sglang.srt.models.deepseek_common.utils import (
+            precompile_flashinfer_sampling,
+        )
+
+        precompile_flashinfer_sampling()
 
 
 EntryClass = [DeepseekV4ForCausalLMDSpark]

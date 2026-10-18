@@ -167,6 +167,7 @@ from sglang.srt.models.deepseek_common.amd.deepseek_v4_fused_mhc import (
 from sglang.srt.models.deepseek_common.utils import (
     _use_aiter_bpreshuffle_gfx95,
     is_wint4afp8_or_wint4a16_config,
+    precompile_flashinfer_sampling,
     quant_blocks_shared_experts_fusion,
 )
 from sglang.srt.models.deepseek_v2 import (
@@ -583,17 +584,17 @@ def _apply_wo_a_bf16_matmul(
             (
                 is_decode
                 and o.shape[0] == 1
-                and (get_platform().is_blackwell or get_platform().is_sm90)
+                and (_tp_all("blackwell") or _tp_all("sm90"))
             )
             or (
                 is_target_verify
                 and 0 < o.shape[0] <= 384
-                and get_platform().is_blackwell
+                and _tp_all("blackwell")
             )
             or (
                 is_prefill
                 and 4096 <= o.shape[0] <= 65536
-                and get_platform().is_blackwell
+                and _tp_all("blackwell")
             )
         )
         and o.shape[1:] == (2, 4096)
@@ -1432,7 +1433,7 @@ class MQALayer(MqaAttentionBase):
         if (
             _is_cuda
             and self.is_dsv41
-            and get_platform().is_blackwell
+            and _tp_all("blackwell")
             and q.dtype == self.q_norm.weight.dtype == torch.bfloat16
             and q.ndim == 2
             and 0 < q.shape[0] <= 8
@@ -1488,7 +1489,7 @@ class MQALayer(MqaAttentionBase):
                     0 < q.shape[0] <= 8
                     or (
                         self.is_dsv41
-                        and get_platform().is_blackwell
+                        and _tp_all("blackwell")
                         and self.n_local_heads == 16
                         and 4096 <= q.shape[0] <= 65536
                     )
@@ -2347,7 +2348,7 @@ class MQALayer(MqaAttentionBase):
 
         low_ratio_multi_stream = (
             _is_cuda
-            and get_platform().is_blackwell
+            and _tp_all("blackwell")
             and self.compress_ratio in (1, 2)
             and self.alt_streams is not None
             and (
@@ -3512,7 +3513,7 @@ class DeepseekV4DecoderLayer(nn.Module):
 
             if (
                 x.is_cuda
-                and get_platform().is_blackwell
+                and _tp_all("blackwell")
                 and (
                     0 < x.shape[0] <= 96
                     or (
@@ -3696,7 +3697,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         if (
             self.config.model_type == "deepseek_v41"
             and hidden_states.is_cuda
-            and get_platform().is_blackwell
+            and _tp_all("blackwell")
             and forward_batch.forward_mode.is_extend_without_speculative()
             and 4096 <= hidden_states.shape[0] <= 65536
             and get_parallel().attn_dp_size == 1
@@ -3731,7 +3732,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         if (
             self.config.model_type == "deepseek_v41"
             and x.is_cuda
-            and get_platform().is_blackwell
+            and _tp_all("blackwell")
             and (
                 (
                     128 <= x.shape[0] <= 384
@@ -3841,7 +3842,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         if (
             self.config.model_type == "deepseek_v41"
             and x.is_cuda
-            and get_platform().is_blackwell
+            and _tp_all("blackwell")
             and (0 < x.shape[0] <= 8 or medium_verify)
             and x.shape[1] == 5120
             and self.hc_mult == 4
@@ -3952,7 +3953,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         if (
             self.config.model_type == "deepseek_v41"
             and x.is_cuda
-            and get_platform().is_blackwell
+            and _tp_all("blackwell")
             and (0 < x.shape[0] <= 8 or (medium_verify and next_combined is not None))
             and x.shape[1] == 5120
             and self.hc_mult == 4
@@ -4530,6 +4531,11 @@ class DeepseekV4Model(nn.Module):
             and config.hc_pre_from_prev_sublayer
             else None
         )
+        # Warm every arch predicate the captured forward branches on so the
+        # group-wide AND's all-reduce lands here (outside any CUDA graph), never
+        # on the first capture-path call. See ``_tp_all``.
+        for _pred in ("blackwell", "sm90", "hopper_or_blackwell", "sm8"):
+            _tp_all(_pred)
         self.engram_layout = EngramLayout.from_config(config)
         self.layers, self.start_layer, self.end_layer = make_layers(
             config.num_hidden_layers,
@@ -4784,7 +4790,7 @@ class DeepseekV4Model(nn.Module):
                 and i + 1 < self.end_layer
                 and tail is None
                 and hidden_states.is_cuda
-                and get_platform().is_blackwell
+                and _tp_all("blackwell")
                 and 0 < hidden_states.shape[0] <= 8
                 and (
                     forward_batch.forward_mode.is_decode()
@@ -5127,6 +5133,81 @@ class DeepseekV4Model(nn.Module):
             return (hidden_states, pre_hc_head), dspark_aux_hidden_states
 
         return hidden_states, pre_hc_head
+
+
+def prewarm_block_fp8_linear_kernels(root: torch.nn.Module) -> None:
+    """Warm every block-fp8 quant linear under *root* at the real captured M.
+
+    A cold block-fp8 cubin is a deadlock here, not a perf nit, on a mixed
+    SM86+SM120 TP group: whichever rank first ``cuModuleLoadData``s one inside
+    a CUDA-graph capture stalls against the peer ranks' already-captured
+    collective and the whole group busy-waits. Every rank runs its OWN dispatch
+    (so fp8-dot and w8a16 ranks each warm the kernel they actually use) at each
+    captured-M bucket -- the decode bs and the verify ``bs * draft_tokens``
+    rows -- before any capture. Config is read straight: a genuinely missing
+    value raises, because a guessed bucket set is exactly how a cold cubin
+    slips into capture. Shared by the main and the draft (nextn) models so
+    neither leaves its dense linears cold.
+    """
+    from sglang.srt.layers.linear import LinearBase
+    from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
+    from sglang.srt.runtime_context import get_schedule, get_spec
+
+    max_req = int(get_schedule().max_running_requests)
+    capture_bs = sorted(
+        {
+            int(b)
+            for b in get_exec().graph.cuda_graph_config.decode.bs
+            if 0 < int(b) <= max_req
+        }
+    )
+    assert capture_bs, "decode graph captures no batch size <= max_running_requests"
+    spec = get_spec()
+    block = (
+        int(spec.speculative_num_draft_tokens) if spec.speculative_algorithm else 0
+    )
+    m_buckets = {1, 2, 16}
+    for bs in capture_bs:
+        m_buckets.add(bs)
+        if block >= 2:
+            m_buckets.add(bs * block)
+    m_buckets = sorted(m_buckets)
+    logger.info(
+        "[prewarm-diag] block-fp8 linear prewarm: capture_bs=%s block=%s M buckets=%s",
+        capture_bs,
+        block,
+        m_buckets,
+    )
+    warmed = 0
+    shapes = set()
+    for module in root.modules():
+        if not isinstance(module, LinearBase):
+            continue
+        qm = getattr(module, "quant_method", None)
+        weight = getattr(module, "weight", None)
+        scale = getattr(module, "weight_scale_inv", None)
+        if (
+            not isinstance(qm, Fp8LinearMethod)
+            or weight is None
+            or weight.device.type != "cuda"
+            or scale is None
+            or getattr(qm, "block_quant", False) is not True
+        ):
+            continue
+        k = weight.shape[-1]
+        warmed += 1
+        shapes.add((int(weight.shape[0]), int(weight.shape[-1])))
+        for m in m_buckets:
+            x = torch.zeros((m, k), dtype=torch.bfloat16, device=weight.device)
+            qm.apply(module, x, None)
+    torch.cuda.synchronize()
+    logger.info(
+        "[prewarm-diag] block-fp8 linear prewarm done: warmed %d module(s), "
+        "%d distinct (N,K) shape(s)=%s",
+        warmed,
+        len(shapes),
+        sorted(shapes),
+    )
 
 
 class DeepseekV4ForCausalLM(nn.Module):
@@ -5664,7 +5745,7 @@ class DeepseekV4ForCausalLM(nn.Module):
             engram_commit_history,
             engram_hash_ids,
         )
-        from sglang.srt.server_args import get_global_server_args
+        from sglang.srt.runtime_context import get_spec
 
         n = hasher.max_ngram_size
         dev = hasher.token_map.device
@@ -5692,9 +5773,9 @@ class DeepseekV4ForCausalLM(nn.Module):
         # Verify graphs: BLOCK is a constexpr equal to the configured draft
         # token count (eagle: speculative_num_draft_tokens; dspark:
         # gamma + 1 == the same value), so one prewarm per captured bs.
-        sa = get_global_server_args()
-        if sa.speculative_algorithm is not None and sa.speculative_num_draft_tokens:
-            block = int(sa.speculative_num_draft_tokens)
+        spec = get_spec()
+        if spec.speculative_algorithm is not None and spec.speculative_num_draft_tokens:
+            block = int(spec.speculative_num_draft_tokens)
             if block >= 2:
                 for bs in (1, 2):
                     t = bs * block
@@ -5741,50 +5822,132 @@ class DeepseekV4ForCausalLM(nn.Module):
         torch.cuda.synchronize()
 
     def _prewarm_fp8_linear_kernels(self) -> None:
-        """Compile+load the w8a16 block-fp8 GEMM cubins the decode graphs use.
+        """Warm the w8a16 block-fp8 GEMM cubins the decode/verify graphs use.
 
-        Same cold-cubin family as the engram hash: on a mixed SM86+SM120 host
-        the SM86 ranks stream their dense block-fp8 linears through
-        ``sm8_w8a16_block_fp8_linear`` while the SM120 ranks run FlashInfer
-        MXFP8 and never launch the Triton w8a16 cubin at all. The verify
-        capture (M = bs * block >= 2) and a capture-warmup forward only warm
-        Triton's generic-M specialization; the first DECODE bs=1 forward under
-        capture then cold-loads the M == 1 specialization inside the graph
-        capture and deadlocks the group against the SM120 ranks' collective.
-        Call every block-fp8 linear's own ``quant_method.apply`` (the exact
-        production kernel-selection path, pure local GEMM, no collectives) at
-        each captured-M bucket so every cubin is warm before any capture.
-        Homogeneous hosts just pay a warmup; hosts whose dispatch never
-        reaches w8a16 (SM120+/Blackwell) return immediately.
+        See ``prewarm_block_fp8_linear_kernels`` for the mixed-arch rationale;
+        the draft (nextn) model calls the same helper for its own linears.
         """
-        from sglang.kernels.ops.quantization.fp8_kernel import fp8_dot_supported
-        from sglang.srt.layers.linear import LinearBase
-        from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
-        from sglang.srt.layers.quantization.fp8_utils import _is_ada_sm89
+        prewarm_block_fp8_linear_kernels(self.model)
 
-        if fp8_dot_supported() and not _is_ada_sm89():
-            return
-        for module in self.model.modules():
-            if not isinstance(module, LinearBase):
-                continue
-            qm = getattr(module, "quant_method", None)
-            weight = getattr(module, "weight", None)
-            scale = getattr(module, "weight_scale_inv", None)
-            if (
-                not isinstance(qm, Fp8LinearMethod)
-                or weight is None
-                or weight.device.type != "cuda"
-                or scale is None
-                or getattr(qm, "block_quant", False) is not True
-            ):
-                continue
-            # bf16 activations: the w8a16 contract (and what Ada's decode-M
-            # branch of the M-routed callable feeds to the same kernel).
-            k = weight.shape[-1]
-            for m in (1, 2, 16):
-                x = torch.zeros((m, k), dtype=torch.bfloat16, device=weight.device)
-                qm.apply(module, x, None)
-        torch.cuda.synchronize()
+    def prepare_before_cuda_graph_capture(self, model_runner, runner=None) -> None:
+        """Warm the attention / MLA / indexer / rope / in-graph-metadata cubins.
+
+        ``BaseRunner.warmup`` calls this once, after the request pool and
+        attention backends exist but before any CUDA-graph capture. The 2
+        capture-warmup forwards already reach MLA + indexer + rope, but the
+        DEVICE-side raw->full metadata upgrade and the paged indexer fire only
+        inside the capture region (warmup runs them on the host). On a mixed
+        SM86+SM120 group that first ``cuModuleLoadData`` inside capture
+        deadlocks against the peer rank's captured collective. Run one real
+        dummy forward per captured-M bucket here -- under ``model_capture_mode``
+        so it takes the SAME paged-indexer + device-metadata branch capture
+        will -- so every cubin is resident before the graph is recorded.
+
+        Every decision that could differ by rank or arch is logged with the
+        ``[attn-prewarm]`` tag and the ranks rendezvous on a barrier, so a
+        skew shows up as mismatched lines instead of a silent hang.
+        """
+        import torch.distributed as dist
+
+        from sglang.srt.model_executor.forward_batch_info import ForwardMode
+        from sglang.srt.model_executor.runner_utils.capture_mode import (
+            get_is_capture_mode,
+            model_capture_mode,
+        )
+        from sglang.srt.runtime_context import get_schedule, get_spec
+
+        runner = runner or getattr(model_runner, "decode_cuda_graph_runner", None)
+        tp_rank = model_runner.tp_rank
+        world = model_runner.tp_size
+
+        spec = get_spec()
+        is_spec = spec.speculative_algorithm is not None
+        block = (
+            int(spec.speculative_num_draft_tokens)
+            if (spec.speculative_algorithm and is_spec)
+            else 0
+        )
+        max_req = int(get_schedule().max_running_requests)
+        capture_bs = sorted(
+            {
+                int(b)
+                for b in get_exec().graph.cuda_graph_config.decode.bs
+                if 0 < int(b) <= max_req
+            }
+        )
+        assert capture_bs, "no decode capture bs <= max_running_requests"
+        verify_bs = capture_bs  # verify feeds bs rows, num_tokens_per_req = block
+
+        logger.info(
+            "[attn-prewarm] rank=%d/%d runner=%s is_spec=%s block=%s "
+            "capture_bs=%s verify_bs=%s get_is_capture_mode=%s",
+            tp_rank,
+            world,
+            type(runner).__name__ if runner is not None else None,
+            is_spec,
+            block,
+            capture_bs,
+            verify_bs,
+            get_is_capture_mode(),
+        )
+        if runner is None:
+            # No silent skip: a missing runner means the hook fired at the
+            # wrong point in the boot order; a cold cubin then stalls capture.
+            raise RuntimeError(
+                "[attn-prewarm] decode_cuda_graph_runner not attached at "
+                "prepare_before_cuda_graph_capture; boot order changed"
+            )
+
+        buffers, _ = runner._autotune_buffers()
+        if buffers is None:
+            raise RuntimeError("[attn-prewarm] _autotune_buffers() returned None")
+        logger.info(
+            "[attn-prewarm] rank=%d buffers ok "
+            "(input_ids=%d seq_lens=%d, per_req_tokens=%s)",
+            tp_rank,
+            buffers.input_ids.shape[0],
+            buffers.seq_lens.shape[0],
+            model_runner.decode_num_tokens_per_req() if is_spec else 1,
+        )
+
+        # Ranks must run the identical number of forwards (each has a TP
+        # collective); rendezvous first so a config skew fails here, not in
+        # the middle of a capture barrier.
+        if world > 1:
+            dist.barrier(group=get_parallel().tp_group.cpu_group)
+
+        n_fwd = 0
+        # Warm with REAL (eager) launches, NOT under model_capture_mode(): the
+        # sm120f JIT quant, cublasLt heuristics and any cuModuleLoadData guarded
+        # on ``is_current_stream_capturing`` skip their first-load while
+        # "capturing", so a capture-mode prewarm leaves the cold kernel to fire
+        # inside the real capture and deadlock the group. Eager forwards do the
+        # actual first launch here, outside any graph.
+        with nullcontext():
+            for bs in capture_bs:
+                runner._dummy_run(
+                    batch_size=bs,
+                    buffers=buffers,
+                    forward_mode_override=ForwardMode.DECODE,
+                )
+                n_fwd += 1
+            if is_spec:
+                for bs in verify_bs:
+                    # default path selects TARGET_VERIFY (num_tokens = bs * block),
+                    # exercising make_forward_metadata_from_raw_verify on device.
+                    runner._dummy_run(batch_size=bs, buffers=buffers)
+                    n_fwd += 1
+            torch.cuda.synchronize()
+
+        if world > 1:
+            dist.barrier(group=get_parallel().tp_group.cpu_group)
+        logger.info(
+            "[attn-prewarm] rank=%d done: %d dummy forward(s), %d decode + %d verify",
+            tp_rank,
+            n_fwd,
+            len(capture_bs),
+            len(verify_bs) if is_spec else 0,
+        )
 
     def _prewarm_fused_rmsnorm_kernels(self) -> None:
         """Compile+load the fused RMSNorm kernels at every captured row count.
@@ -5948,40 +6111,26 @@ class DeepseekV4ForCausalLM(nn.Module):
         if self._mhc_prewarmed_at_load:
             return
         self._mhc_prewarmed_at_load = True
+        logger.info("[prewarm-diag] MHC load-time prewarm begin (not is_nextn)")
         # Warm BOTH branches of _hc_mix_and_combine at a rank-uniform point
         # *before* capture: the group decision (_tp_all) can send either arch onto
         # the branch it does not natively run, and that branch's first
         # cuModuleLoadData must not be the capture warmup. Kept off the tilelang
         # gate so it runs even when the tilelang prewarm below is disabled.
         if not (_is_npu or _is_xpu) and torch.version.cuda is not None:
-            try:
-                self._prewarm_hc_mix_kernels()
-            except Exception as e:  # never block startup on a warmup miss
-                logger.debug("hc-mix prewarm skipped: %s", e)
-            try:
-                self._prewarm_engram_hash_kernels()
-            except Exception as e:
-                logger.debug("engram hash prewarm skipped: %s", e)
-            try:
-                self._prewarm_fp8_linear_kernels()
-            except Exception as e:
-                logger.debug("block-fp8 linear prewarm skipped: %s", e)
-            try:
-                self._prewarm_fused_rmsnorm_kernels()
-            except Exception as e:
-                logger.debug("fused rmsnorm prewarm skipped: %s", e)
-            try:
-                self._prewarm_wo_a_bf16_matmul()
-            except Exception as e:
-                logger.warning("wo_a bf16 matmul prewarm skipped: %s", e)
-            try:
-                self._prewarm_moe_gate_kernels()
-            except Exception as e:
-                logger.warning("moe gate prewarm skipped: %s", e)
-            try:
-                self._prewarm_marlin_align_kernels()
-            except Exception as e:
-                logger.warning("marlin align prewarm skipped: %s", e)
+            # A cold cubin left un-warmed here is NOT a perf nit on a mixed
+            # SM86+SM120 TP group: it is first loaded inside the CUDA-graph
+            # warmup on one arch while the other races into its next NCCL
+            # collective, and the whole group deadlocks. A prewarm failure is
+            # therefore fatal and must propagate -- not be caught, demoted to a
+            # log line, or guessed around with a fallback.
+            self._prewarm_hc_mix_kernels()
+            self._prewarm_engram_hash_kernels()
+            self._prewarm_fp8_linear_kernels()
+            self._prewarm_fused_rmsnorm_kernels()
+            self._prewarm_wo_a_bf16_matmul()
+            self._prewarm_moe_gate_kernels()
+            self._prewarm_marlin_align_kernels()
         if _is_npu or _is_xpu or not envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.get():
             return
         layer = next(
@@ -6439,6 +6588,16 @@ class DeepseekV4ForCausalLM(nn.Module):
                     layer.engram.embed.finish_load(label=f"layer {i}")
             self._nvme_engram_loaded = is_lk_engram_nvme_enabled()
             self._prewarm_mhc_kernels()
+        else:
+            # The draft (nextn) model skips the MHC-family prewarms, but its
+            # OWN block-fp8 linears (dense MLP etc.) get cold-loaded inside
+            # the verify capture on exactly the mixed-arch deadlock path.
+            # Warm them here too; the shapes overlap the main model's so this
+            # is mostly a Triton cache hit, not a second compile burst.
+            logger.info("[prewarm-diag] MHC prewarm skipped for nextn; "
+                        "running block-fp8 linear prewarm on draft model")
+            if not (_is_npu or _is_xpu) and torch.version.cuda is not None:
+                self._prewarm_fp8_linear_kernels()
 
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight
@@ -6452,6 +6611,9 @@ class DeepseekV4ForCausalLM(nn.Module):
         # accessor so this works on both CUDA/HIP and NPU.
         torch.get_device_module().empty_cache()
         torch.get_device_module().synchronize()
+
+    def precompile_kernels_after_loading(self) -> None:
+        precompile_flashinfer_sampling()
 
     @classmethod
     def get_model_config_for_expert_location(cls, config):

@@ -197,3 +197,32 @@ def tiny_router_gemm_max_tokens(
     if not can_use_tiny_gemm(num_experts, hidden_size, max_m=16):
         return -1
     return 16
+
+
+def precompile_flashinfer_sampling() -> bool:
+    """Build the flashinfer sampling module at startup, with a visible log
+    line, instead of letting the first decode step pay the JIT silently
+    behind a request that looks hung. Returns False on non-CUDA.
+    """
+    import time
+
+    from sglang.srt.utils import is_cuda
+
+    if not is_cuda():
+        return False
+    from flashinfer.sampling import top_k_top_p_sampling_from_probs
+
+    t0 = time.time()
+    probs = torch.full((1, 8), 0.125, device="cuda")
+    top_k_top_p_sampling_from_probs(
+        probs,
+        torch.ones(1, dtype=torch.int32, device="cuda"),
+        torch.ones(1, device="cuda"),
+        filter_apply_order="joint",
+    )
+    torch.cuda.synchronize()
+    logging.getLogger(__name__).info(
+        "DeepSeek prewarm: flashinfer sampling module built in %.1fs",
+        time.time() - t0,
+    )
+    return True
