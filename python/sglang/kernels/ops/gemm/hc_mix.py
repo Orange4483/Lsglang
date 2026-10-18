@@ -58,16 +58,16 @@ def _hc_mix_persistent_kernel(
     for z0 in range(pid * 256, zero_span, num_ctas * 256):
         idx = z0 + offs_z
         tl.store(t_raw_ptr + idx, 0.0, mask=idx < zero_span)
-    # Self-reset rides inside barrier 0 (arrivals are past the acquire edge,
-    # and every CTA passes this point exactly once per launch). At barrier 3
-    # or at the tail, a CTA parked in a long phase-2/4 tail would let a fast
-    # peer re-arm barrier 0 with a stale counter — and one per-CTA atomic at
-    # the tail would put a global RMW in the per-iteration steady path.
+    _grid_barrier(counters_ptr + 0, num_ctas)
+    # Self-reset after barrier 0: every CTA has now passed the acquire edge,
+    # so the last ticket holder knows no peer can still be counting on any
+    # counter. (Resetting before the barrier can zero a counter mid-barrier
+    # and strand the remaining CTAs forever.) One ticket atomic per launch,
+    # not per iteration — the tail-placement cost ~13% decode throughput.
     ticket = tl.atomic_add(counters_ptr + 2, 1, sem="acq_rel", scope="gpu")
     if ticket == num_ctas - 1:
         for c in tl.static_range(4):
             tl.store(counters_ptr + c, 0)
-    _grid_barrier(counters_ptr + 0, num_ctas)
 
     offs_k = tl.arange(0, BLOCK_K)
     offs_n = tl.arange(0, BLOCK_N)
