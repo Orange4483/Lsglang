@@ -260,7 +260,20 @@ class BaseRunner(ABC):
             mr.model, "prepare_before_cuda_graph_capture", None
         )
         if prepare_model_resources is not None:
-            prepare_model_resources(mr)
+            # A model that needs the runner (e.g. to reuse its dummy-run
+            # buffers) declares a second parameter; the runner is still
+            # `self` here because model_runner only records it after
+            # warmup() returns. 1-arg hooks keep the legacy call unchanged.
+            try:
+                accepts_runner = (
+                    len(inspect.signature(prepare_model_resources).parameters) >= 2
+                )
+            except (TypeError, ValueError):
+                accepts_runner = False
+            if accepts_runner:
+                prepare_model_resources(mr, self)
+            else:
+                prepare_model_resources(mr)
 
         if should_run_flashinfer_autotune(self.model_runner):
             buffers, batch_size = self._autotune_buffers()

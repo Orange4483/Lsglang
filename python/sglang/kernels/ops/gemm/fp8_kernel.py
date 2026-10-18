@@ -255,8 +255,14 @@ def _w8a8_block_fp8_matmul_hopper(
 
 @triton.jit
 def _reduce_block_fp8_split_k(
-    Parts, Out, ELEMENTS: tl.constexpr, SPLITS: tl.constexpr, BLOCK: tl.constexpr
+    Parts, Out, ELEMENTS, SPLITS: tl.constexpr, BLOCK: tl.constexpr
 ):
+    # ELEMENTS must stay a runtime int. As a tl.constexpr Triton keys a cubin on
+    # the exact M*N of every layer/step, so a new decode-M / DSPARK verify /
+    # super-mix shape cold-compiles a fresh cubin during the CUDA-graph warmup.
+    # On a heterogeneous TP group that cold cuModuleLoadData stalls against the
+    # peers' NCCL spin and deadlocks the group. Runtime keeps one cubin for all M
+    # (model N is always 16-aligned, so Triton's specialization never forks).
     offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     splits = tl.arange(0, SPLITS)
     values = tl.load(

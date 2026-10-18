@@ -1428,8 +1428,17 @@ def _e4m3_u8_to_f32(u):
 
 @triton.jit
 def _reduce_block_fp8_split_k(
-    Parts, Out, ELEMENTS: tl.constexpr, SPLITS: tl.constexpr, BLOCK: tl.constexpr
+    Parts, Out, ELEMENTS, SPLITS: tl.constexpr, BLOCK: tl.constexpr
 ):
+    # ELEMENTS is intentionally NOT a tl.constexpr: with a constexpr, Triton keys
+    # a cubin on the exact M*N of every layer/step, so each new decode-M (or a
+    # DSPARK verify / super-mix shape) cold-compiles a fresh cubin. On a
+    # heterogeneous TP group the SM86 ranks stream their dense block-fp8 linears
+    # through this w8a16 split-K reduce while the SM120 ranks use MXFP8 and never
+    # launch it; a cold cuModuleLoadData during the CUDA-graph warmup then stalls
+    # against the peers' NCCL spin and deadlocks the group. As a runtime int the
+    # kernel collapses to a single cubin (Every model N is a multiple of 16, so
+    # Triton's specialization never forks), which the load-time prewarm warms.
     offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     splits = tl.arange(0, SPLITS)
     values = tl.load(

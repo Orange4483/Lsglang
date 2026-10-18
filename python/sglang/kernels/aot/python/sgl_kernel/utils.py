@@ -14,6 +14,7 @@
 # ==============================================================================
 
 import functools
+import os
 from typing import Dict, Tuple
 
 import torch
@@ -56,6 +57,10 @@ def cache_once(fn):
 
 @cache_once
 def is_arch_support_pdl() -> bool:
+    from sglang.srt.environ import envs
+
+    if envs.SGLANG_DISABLE_PDL.get():
+        return False
     if getattr(torch.version, "hip", None) or getattr(torch.version, "musa", None):
         return False
     try:

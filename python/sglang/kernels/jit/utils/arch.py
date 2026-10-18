@@ -176,6 +176,10 @@ def get_jit_cuda_arch() -> ArchInfo:
 
 @cache_once
 def is_arch_support_pdl() -> bool:
+    from sglang.srt.environ import envs
+
+    if envs.SGLANG_DISABLE_PDL.get():
+        return False
     if is_hip_runtime() or is_musa_runtime():
         return False
     return get_jit_cuda_arch().major >= 9

@@ -1195,6 +1195,16 @@ class Envs:
     SGLANG_USE_DEEPGEMM_BMM = EnvBool(False)
     SGLANG_DEEPGEMM_SANITY_CHECK = EnvBool(False)
     SGLANG_DEEPGEMM_PDL = EnvBool(True)
+    # Force-disable Programmatic Dependent Launch (cudaLaunchKernelEx + a grid
+    # dependency edge) on every rank. PDL is SM90+/Blackwell-only, so a
+    # heterogeneous TP group (e.g. SM86 + SM120) would capture a plain
+    # cuLaunchKernel on the SM86 ranks and a PDL launch on the SM120 ranks, so
+    # the two graphs get different node structure and a captured NCCL can never
+    # align -> warmup deadlock at the first small-M decode/verify graph. Set 1
+    # on a mixed host so both ranks emit the identical non-PDL launch sequence.
+    # No-op on a homogeneous host (all ranks already agree); correctness is
+    # unaffected where it disables PDL, only the launch-overlap optimization.
+    SGLANG_DISABLE_PDL = EnvBool(False)
     SGLANG_PP_PARALLEL_DEEPGEMM_WARMUP = EnvBool(False)
 
     # ===================================================================

@@ -56,6 +56,7 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     is_in_tc_piecewise_cuda_graph,
 )
+from sglang.srt.model_executor.runner_utils.capture_mode import get_is_capture_mode
 from sglang.srt.runtime_context import (
     get_exec,
     get_parallel,
@@ -892,7 +893,15 @@ class C4IndexerBackendMixin:
             or is_in_breakable_cuda_graph()
         ):
             return False
-        return not torch.cuda.is_current_stream_capturing()
+        # Warmup and capture MUST take the same indexer branch: keying on
+        # ``is_current_stream_capturing()`` (False in the 2 capture-warmup
+        # forwards, True in the capture region) made warmup run the non-paged
+        # kernel while the graph captured the paged one -> the paged cubin
+        # first-loads inside capture, which deadlocks a mixed SM86+SM120 group.
+        # ``get_is_capture_mode()`` is constant across warmup+capture (decode
+        # wraps both in ``model_capture_mode()``) and False in normal serving,
+        # so the serving fast path is untouched.
+        return not get_is_capture_mode()
 
     def _get_nonpaged_indexer_plan(
         self,
