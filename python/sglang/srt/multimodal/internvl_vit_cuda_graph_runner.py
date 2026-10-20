@@ -19,6 +19,8 @@ from __future__ import annotations
 from typing import Dict, Hashable, Tuple
 
 import torch
+
+from sglang.srt.utils.common import park_lk_moe_expert_pool
 import torch.nn as nn
 
 from sglang.srt.layers.attention.vision import VisionAttention
@@ -134,7 +136,7 @@ class InternViTCudaGraphRunner:
 
         torch.cuda.synchronize()
 
-        with torch.cuda.graph(g):
+        with park_lk_moe_expert_pool(), torch.cuda.graph(g):
             y = self.inp[key]
             for blk in self.encoder.layers:
                 y = blk(y, cu_seqlens=cu_ws, output_ws=self.ws[key])
@@ -183,6 +185,7 @@ class InternViTCudaGraphRunner:
         self.inp[key].copy_(x)
 
         # replay
-        self.graphs[key].replay()
+        with park_lk_moe_expert_pool():
+            self.graphs[key].replay()
 
         return self.out[key]

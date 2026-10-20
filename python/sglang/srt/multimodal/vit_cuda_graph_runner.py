@@ -21,6 +21,8 @@ from contextlib import nullcontext
 from typing import Dict, Hashable, List, Optional, Tuple
 
 import torch
+
+from sglang.srt.utils.common import park_lk_moe_expert_pool
 import torch.nn as nn
 
 from sglang.srt.layers.attention.vision import VisionAttention
@@ -220,7 +222,7 @@ class ViTCudaGraphRunner:
                 )
         torch.cuda.synchronize()
 
-        with self._capture_context(), torch.cuda.graph(graph):
+        with park_lk_moe_expert_pool(), self._capture_context(), torch.cuda.graph(graph):
             y = None
             deepstack_outs: List[torch.Tensor] = []
             deepstack_capture_idx = 0
@@ -425,7 +427,8 @@ class ViTCudaGraphRunner:
         self.block_input[graph_key].copy_(x_3d)
 
         # replay
-        self.block_graphs[graph_key].replay()
+        with park_lk_moe_expert_pool():
+            self.block_graphs[graph_key].replay()
 
         out = self.block_output[graph_key]
 

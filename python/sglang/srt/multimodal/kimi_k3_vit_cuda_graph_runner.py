@@ -9,6 +9,8 @@ from typing import TYPE_CHECKING, Any, Hashable, List, Tuple
 
 import torch
 
+from sglang.srt.utils.common import park_lk_moe_expert_pool
+
 from sglang.srt.model_executor.runner_utils.pool import (
     get_or_create_global_graph_memory_pool,
     graph_pool_capture_scope,
@@ -112,7 +114,9 @@ class KimiK3ViTCudaGraphRunner:
         graph = torch.cuda.CUDAGraph()
         if self._graph_memory_pool is None:
             self._graph_memory_pool = get_or_create_global_graph_memory_pool(torch.cuda)
-        with torch.cuda.graph(graph, pool=self._graph_memory_pool):
+        with park_lk_moe_expert_pool(), torch.cuda.graph(
+            graph, pool=self._graph_memory_pool
+        ):
             outputs = self.tower._forward_eager(
                 input_buffer,
                 grid_thws,
@@ -160,7 +164,8 @@ class KimiK3ViTCudaGraphRunner:
         if entry is not None:
             entry.input_buffer.copy_(pixel_values)
             with graph_pool_replay_scope():
-                entry.graph.replay()
+                with park_lk_moe_expert_pool():
+                    entry.graph.replay()
             return list(entry.outputs)
 
         max_seqlen = max(t * h * w for t, h, w in grid_thw_list)
@@ -213,5 +218,6 @@ class KimiK3ViTCudaGraphRunner:
 
             self.graphs[key] = entry
             entry.input_buffer.copy_(pixel_values)
-            entry.graph.replay()
+            with park_lk_moe_expert_pool():
+                entry.graph.replay()
         return list(entry.outputs)
