@@ -114,6 +114,44 @@ if TYPE_CHECKING:
     pass
 
 logger = logging.getLogger(__name__)
+
+from sglang.srt.utils.env_vars import (
+    get_bool_env_var,
+    get_int_env_var,
+    get_str_env_var,
+    set_int_env_var,
+)
+from sglang.srt.utils.lk_moe_env import (  # noqa: F401  (compat re-export)
+    LkMoeConfig,
+    enabled_layerwise_load,
+    get_gpu_prefetch_window,
+    get_gpu_prefill_engine,
+    get_gpu_prefill_min_tokens,
+    get_gpu_resident_env_var,
+    get_hf_mbox,
+    get_lk_moe_config,
+    get_lk_ple_probe_dump_path,
+    get_lk_pool_layer_set,
+    get_model_type_from_layer_name,
+    get_pool_inflight,
+    get_pool_log,
+    get_pool_slots,
+    get_pool_window,
+    get_super_chunk_size,
+    get_verify_resident,
+    get_verify_skip_miss,
+    is_lk_gpu_prefill_enabled,
+    is_lk_moe_feature_enabled,
+    is_lk_moe_gpu_resident_layer,
+    is_lk_ple_probe_enabled,
+    is_lk_pool_decode_enabled,
+    is_lk_pool_enabled,
+    is_lk_pool_layer,
+    is_lk_prefill_debug,
+    is_numa_interleave_enabled,
+    lk_route_probe_enabled,
+    park_lk_moe_expert_pool,
+)
 torch_release = pkg_version.parse(torch.__version__).release
 
 
@@ -1373,41 +1411,6 @@ def random_uuid() -> str:
     return str(uuid.uuid4().hex)
 
 
-_warned_bool_env_var_keys = set()
-
-
-def get_bool_env_var(name: str, default: str = "false") -> bool:
-    # FIXME: move your environment variable to sglang.srt.environ
-    value = os.getenv(name, default)
-    value = value.lower()
-
-    truthy_values = ("true", "1")
-    falsy_values = ("false", "0")
-
-    if (value not in truthy_values) and (value not in falsy_values):
-        # Warn once per env var key (not per value), otherwise different keys that share the
-        # same invalid value may suppress warnings incorrectly.
-        if name not in _warned_bool_env_var_keys:
-            logger.warning(
-                f"get_bool_env_var({name}) encountered unrecognized value={value} and will treat as false"
-            )
-        _warned_bool_env_var_keys.add(name)
-
-    return value in truthy_values
-
-
-def get_int_env_var(name: str, default: int = 0) -> int:
-    # FIXME: move your environment variable to sglang.srt.environ
-    value = os.getenv(name)
-    if value is None or not value.strip():
-        return default
-    try:
-        return int(value)
-    except ValueError:
-        return default
-    
-def set_int_env_var(name: str, value: int):
-    os.environ[name] = str(value)
 
 
 # ---------------------------------------------------------------- lk_moe
@@ -5098,188 +5101,3 @@ def init_cublas():
     return c
 
 from typing import Optional
-
-def get_str_env_var(var_name: str, default: str = None) -> str:
-    return os.getenv(var_name, default) 
-
-def is_lk_moe_feature_enabled() -> bool:
-    return get_bool_env_var("LK_MOE_HYBRID_ENABLED")
-
-def is_numa_interleave_enabled() -> bool:
-    # Doctrine: tier power follows the master switch - default on; 0 opts out.
-    return get_bool_env_var("LK_NUMA_INTERLEAVE", default="true")
-
-def get_gpu_prefill_min_tokens() -> int:
-    # Dual knob (designs/lk_switch_doctrine.md rule 2): default 0 = tier off,
-    # pure CPU prefill; >0 both enables the tier and sets the batch gate.
-    # Forwarded to lk_moe via cfg; lk_moe itself never reads the env.
-    return get_int_env_var("LK_GPU_PREFILL_MIN_TOKENS", 0)
-
-def get_pool_window() -> int:
-    # Tuned default (hit ~81%). The ONLY pool switch is LK_POOL_SLOTS: any
-    # illegal value (incl. <=0) clamps to the minimum 8, never disables --
-    # a perf knob must not secretly flip the membership switch.
-    return max(8, get_int_env_var("LK_POOL_WINDOW", 32))
-
-def is_lk_gpu_prefill_enabled() -> bool:
-    return is_lk_moe_feature_enabled() and get_gpu_prefill_min_tokens() > 0
-
-def get_super_chunk_size() -> int:
-    if not is_lk_gpu_prefill_enabled():
-        return 0
-    return get_int_env_var("LK_GPU_PREFILL_SUB_M")
-
-def get_pool_inflight() -> int:
-    # In-flight DMA jobs / event-ring depth of the decode pump; the
-    # backpressure cap is 8x this -- 12 false-positives at small batch.
-    return get_int_env_var("LK_POOL_INFLIGHT", 16)
-
-def get_verify_resident() -> int:
-    # VR: draft-row pool-resident experts computed GPU-side; has an acceptance
-    # fidelity tradeoff -> python-owned cfg value (LK_* env is the script UI).
-    return get_int_env_var("LK_VERIFY_RESIDENT", 0)
-
-
-def get_verify_skip_miss() -> int:
-    # verify rows drop CPU-side misses (distribution declaration, not bitwise).
-    return get_int_env_var("LK_VERIFY_SKIP_MISS", 0)
-
-
-def get_hf_mbox() -> int:
-    # mailbox early-start decode path (default on; 0 = pure host-node path).
-    return get_int_env_var("LK_HF_MBOX", 1)
-
-
-def get_pool_log() -> int:
-    # dstep interval of the C++ [pool] stats line (0 = silent).
-    return get_int_env_var("LK_POOL_LOG")
-
-def is_lk_prefill_debug() -> bool:
-    # Extra tracing inside the prefill staging tier.
-    return get_bool_env_var("LK_PP_DEBUG")
-
-def get_gpu_prefetch_window() -> int:
-    # Dual-semantics perf knob: 1 (default) = serialized halves; 2 = ping-pong
-    # rings (copy overlaps gemm) - only worth it with fast PCIe.
-    return get_int_env_var("LK_GPU_PREFETCH_WINDOW", 1)
-
-
-def get_model_type_from_layer_name(layer_name: str) -> str:
-    if not layer_name:
-        return "main"
-    
-    if layer_name.startswith('stages.'):
-        return "dspark"
-    if layer_name.startswith('mtp.') or '.mtp.' in layer_name:
-        return "mtp"
-    return "main"
-
-def get_gpu_resident_env_var(model_type: str = "main") -> Optional[str]:
-    if model_type in ("dspark", "mtp"):
-        env_value = get_str_env_var("LK_GPU_RESIDENT_MOE_LAYERS_SPEC", None)
-        if env_value is not None:
-            return env_value
-
-        role_env = (
-            "LK_GPU_RESIDENT_MOE_LAYERS_MTP"
-            if model_type == "mtp"
-            else "LK_GPU_RESIDENT_MOE_LAYERS_DSPARK"
-        )
-        env_value = get_str_env_var(role_env, None)
-        if env_value is not None:
-            return env_value
-
-    return get_str_env_var("LK_GPU_RESIDENT_MOE_LAYERS", None)
-
-def is_lk_ple_probe_enabled() -> bool:
-    """PLE ngram-row locality/traffic probe master switch."""
-    return get_bool_env_var("LK_PLE_PROBE")
-
-def get_lk_ple_probe_dump_path() -> Optional[str]:
-    """Probe row-dump path, or None (empty string means off)."""
-    return get_str_env_var("LK_PLE_PROBE_DUMP", None) or None
-
-def is_lk_moe_gpu_resident_layer(layer_id: str, model_type: str = "main") -> bool:
-    if not is_lk_moe_feature_enabled():
-        return True
-     
-    disabled_layers_env = get_gpu_resident_env_var(model_type)
-    if not disabled_layers_env:
-        return False   
-    
-    disabled_layers_env = disabled_layers_env.strip()
-    
-    disabled_layers = set()
-    for part in disabled_layers_env.split(','):
-        part = part.strip()
-        if not part:
-            continue
-        
-        if '-' in part:
-            try:
-                start, end = map(int, part.split('-')) 
-                if start <= end:
-                    disabled_layers.update(range(start, end + 1))
-            except ValueError: 
-                continue
-        else:
-            try:
-                disabled_layers.add(int(part))
-            except ValueError: 
-                continue
-     
-    return layer_id in disabled_layers
-
-def get_lk_pool_layer_set() -> Optional[set]:
-    # Same grammar as the resident-layer env; None (unset) = all non-resident
-    # layers get a pool. The engine never reads this env: membership lands on
-    # MOEConfigV2.gpu_pool at construction time.
-    layers_env = get_str_env_var("LK_POOL_LAYERS", None)
-    if not layers_env:
-        return None
-
-    pool_layers = set()
-    for part in layers_env.strip().split(','):
-        part = part.strip()
-        if not part:
-            continue
-        if '-' in part:
-            try:
-                start, end = map(int, part.split('-'))
-                if start <= end:
-                    pool_layers.update(range(start, end + 1))
-            except ValueError:
-                continue
-        else:
-            try:
-                pool_layers.add(int(part))
-            except ValueError:
-                continue
-    return pool_layers
-
-
-def get_pool_slots() -> int:
-    return get_int_env_var("LK_POOL_SLOTS", 0)
-
-def is_lk_pool_enabled() -> bool:
-    return is_lk_moe_feature_enabled() and get_pool_slots() > 0
-
-def is_lk_pool_layer(layer_id: str, model_type: str = "main") -> bool:
-    if model_type != "main":
-        return False
-    if is_lk_moe_gpu_resident_layer(layer_id, model_type):
-        return False
-    return is_lk_pool_enabled()
-
-def lk_route_probe_enabled() -> bool:
-    return is_lk_pool_enabled() and get_bool_env_var("LK_ROUTE_PROBE")
-
-def is_lk_pool_decode_enabled() -> bool:
-    if not is_lk_moe_feature_enabled():
-        return False
-    return get_bool_env_var("LK_POOL_DECODE",
-                            "true" if is_lk_pool_enabled() else "false")
-
-def enabled_layerwise_load() -> bool:
-    return get_bool_env_var("LK_MOE_LAYERWISE_LOAD")
-
