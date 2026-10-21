@@ -4,11 +4,9 @@ __init__ must resolve auto -> flashinfer_cutlass BEFORE weight prep when
 capability >= 12, leave explicit backends untouched, and leave other archs
 alone. Run: python test/manual/test_nvfp4_sm120_backend_resolution.py
 """
-import os
 import sys
 
 sys.argv = [sys.argv[0]]
-import torch
 
 import sglang.srt.layers.quantization.modelopt_quant as mq
 from sglang.srt.layers.moe.utils import MoeRunnerBackend

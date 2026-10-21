@@ -31,6 +31,8 @@ from __future__ import annotations
 
 import ctypes
 import ctypes.util
+import hashlib
+import json
 import logging
 import os
 import re
@@ -389,6 +391,79 @@ def ple_nvme_matches_checkpoint(
         return False
     finally:
         os.close(fd)
+
+
+def _ple_ready_marker_path(table: torch.Tensor) -> Optional[str]:
+    path = getattr(table, "_sglang_ple_file_path", None)
+    return None if path is None else path + ".ready"
+
+
+def ple_table_fingerprint(*parts) -> str:
+    """Stable id for a derived PLE table across restarts.
+
+    Metadata-only on purpose: hashing the table would mean reading it, which is
+    the cost this marker exists to avoid. The derived file name is already
+    keyed by model path + shape + dtype + tag, so a *different* checkpoint
+    lands in a *different* table_dir and cannot collide here.
+    """
+    return hashlib.sha256(repr(parts).encode()).hexdigest()
+
+
+def ple_table_is_ready(table: torch.Tensor, fingerprint: str, probes: int = 64) -> bool:
+    """True if this derived table was fully built for ``fingerprint`` before.
+
+    Guards: the file is the expected size, the sidecar records the same
+    fingerprint, and no probed row is all-zero. An interrupted first boot
+    leaves sparse zeros exactly where the copy did not reach, so an all-zero
+    probe row must not be trusted.
+    """
+    path = getattr(table, "_sglang_ple_file_path", None)
+    marker = _ple_ready_marker_path(table)
+    if path is None or marker is None:
+        return False
+    try:
+        with open(marker) as f:
+            if json.load(f).get("fingerprint") != fingerprint:
+                return False
+        fd = os.open(path, os.O_RDONLY)
+    except OSError:
+        return False
+    try:
+        row_bytes = (
+            int(table.shape[-1]) * table.element_size()
+            if table.dim() >= 2
+            else table.element_size()
+        )
+        rows = table.shape[0] if table.dim() >= 2 else 1
+        if rows <= 0:
+            return False
+        step = max(1, rows // probes)
+        saw_nonzero = False
+        for r in range(0, rows, step):
+            got = os.pread(fd, row_bytes, r * row_bytes)
+            if len(got) != row_bytes:
+                return False
+            if any(got):
+                saw_nonzero = True
+        return saw_nonzero
+    except Exception:
+        return False
+    finally:
+        os.close(fd)
+
+
+def ple_table_mark_ready(table: torch.Tensor, fingerprint: str) -> None:
+    """Record that ``table`` now fully reflects this checkpoint."""
+    marker = _ple_ready_marker_path(table)
+    if marker is None:
+        return
+    try:
+        tmp = marker + f".tmp{os.getpid()}"
+        with open(tmp, "w") as f:
+            json.dump({"fingerprint": fingerprint}, f)
+        os.replace(tmp, marker)
+    except OSError as e:
+        logger.warning("PLE table: could not write ready marker %s: %s", marker, e)
 
 
 def make_ple_file_prefetcher(table: torch.Tensor) -> Optional[PleFilePrefetcher]:

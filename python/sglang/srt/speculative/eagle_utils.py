@@ -3,10 +3,12 @@ from __future__ import annotations
 import logging
 import math
 from enum import IntEnum
+from functools import partial
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
 
+from sglang.kernels.ops.sampling import softmax as sampling_softmax
 from sglang.kernels.ops.speculative.spec_tree import (
     sgl_build_tree_kernel_efficient_triton,
     verify_tree_greedy_kernel_triton,
@@ -19,15 +21,13 @@ from sglang.srt.mem_cache.allocation_sizing import (
     get_alloc_reserve_per_decode,
     page_aligned_decode_alloc_lens,
 )
-from sglang.srt.environ import envs
-from sglang.srt.runtime_context import get_parallel, get_spec
+from sglang.srt.runtime_context import get_spec
 from sglang.srt.utils import (
     is_cpu,
     is_cuda,
     is_hip,
     is_musa,
     is_npu,
-    is_pin_memory_available,
     is_xpu,
 )
 from sglang.srt.utils.async_probe import maybe_detect_oob
@@ -40,6 +40,7 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
+    from sglang.srt.sampling.watermarking.core import WatermarkState
     from sglang.srt.speculative.eagle_info import EagleVerifyInput
 
 _is_cuda = is_cuda()
@@ -568,14 +569,19 @@ def eagle_prepare_for_verify(
         # Uniform variant: end offsets (= start + draft_token_num) are computed
         # inside the kernel, keeping the eager `seq_lens + N` add off the host
         # critical path (bs=1 MTP inter-phase seam).
-        batch.out_cache_loc = assign_extend_cache_locs_uniform_func(
-            req_pool_indices=batch.req_pool_indices,
-            req_to_token=req_to_token_pool.req_to_token,
-            start_offset=batch.seq_lens,
-            batch_size=bs,
-            draft_token_num=verify_input.draft_token_num,
-            device=device,
-        )
+        if verify_input.prepared_out_cache_loc is not None:
+            batch.out_cache_loc = verify_input.prepared_out_cache_loc
+        else:
+            batch.out_cache_loc = assign_extend_cache_locs_uniform_func(
+                req_pool_indices=batch.req_pool_indices,
+                req_to_token=req_to_token_pool.req_to_token,
+                start_offset=batch.seq_lens,
+                batch_size=bs,
+                draft_token_num=verify_input.draft_token_num,
+                device=device,
+            )
+        if batch.hisparse_coordinator is not None:
+            batch.hisparse_coordinator.prepare_spec_verify(batch)
 
         batch.out_cache_loc_dsv4 = maybe_build_dsv4_verify_bundle(
             batch, verify_input.draft_token_num
@@ -603,6 +609,8 @@ def eagle_prepare_for_verify(
         target_worker.model_runner,
         capture_hidden_mode=capture_mode,
         return_hidden_states_before_norm=False,
+        spec_mrope_positions=verify_input.prepared_mrope_positions,
+        kv_loc_plan=verify_input.kv_loc_plan,
     )
 
     # Run attention backend plan and cuda graph preparation
@@ -736,13 +744,14 @@ def eagle_sample(
     logits_output: LogitsProcessorOutput,
     grammar_mask: Optional[GrammarMask] = None,
     uno_target_max_top_k: Optional[int] = None,
+    *,
+    watermark_state: Optional[WatermarkState] = None,
+    watermark_full_mask: bool = True,
 ):
     """
     Verify and find accepted tokens based on logits output and batch
     (which contains spec decoding information).
     """
-    import torch.nn.functional as F
-
     from sglang.srt.layers.dp_attention import (
         is_dp_attention_enabled,
     )
@@ -798,6 +807,46 @@ def eagle_sample(
     if grammar_mask is not None:
         grammar_mask.apply(next_token_logits)
 
+    watermark_context_hashes = None
+    watermark_selected = None
+    if watermark_state is not None and sampling_info.has_watermark_candidates:
+        if batch.return_logprob:
+            # compute_spec_logprobs reads logits_output after verify.
+            next_token_logits = next_token_logits.clone()
+        if next_token_logits.is_cuda:
+            watermark_context_hashes, watermark_selected = (
+                watermark_state.force_speculative_from_tree(
+                    logits=next_token_logits,
+                    req_pool_indices=batch.req_pool_indices,
+                    draft_tokens=verify_input.draft_token,
+                    custom_mask=verify_input.custom_mask,
+                    positions=verify_input.positions,
+                    sampling_info=sampling_info,
+                    draft_token_num=verify_input.draft_token_num,
+                    full_mask=watermark_full_mask,
+                )
+            )
+        else:
+            contexts, context_lengths = watermark_state.speculative_contexts(
+                req_pool_indices=batch.req_pool_indices,
+                draft_tokens=verify_input.draft_token,
+                custom_mask=verify_input.custom_mask,
+                positions=verify_input.positions,
+                draft_token_num=verify_input.draft_token_num,
+                full_mask=watermark_full_mask,
+                context_windows=watermark_state.context_windows(sampling_info),
+            )
+            watermark_context_hashes, watermark_selected = (
+                watermark_state.force_speculative(
+                    logits=next_token_logits,
+                    req_pool_indices=batch.req_pool_indices,
+                    contexts=contexts,
+                    context_lengths=context_lengths,
+                    sampling_info=sampling_info,
+                    draft_token_num=verify_input.draft_token_num,
+                )
+            )
+
     candidates = verify_input.draft_token.reshape(bs, verify_input.draft_token_num)
     predict_shape = list(next_token_logits.shape)[:-1]
     predict = torch.zeros(predict_shape, dtype=torch.int32, device=device).flatten()
@@ -829,14 +878,6 @@ def eagle_sample(
             target_predict=target_predict,
             topk=verify_input.tree_topk,
         )
-
-        if envs.SGLANG_RS_DEBUG.get():
-            logger.warning(
-                "[verify-dbg] draft=%s target=%s ncorr=%s",
-                candidates[:2, :4].tolist(),
-                target_predict[:2, :4].tolist(),
-                num_correct_drafts[:2].tolist(),
-            )
 
         if _is_hip:
             # On ROCm, the per-rank draft tokens can differ, so ranks accept a
@@ -905,6 +946,8 @@ def eagle_sample(
         # branch not taken, and HIP only reaches here with rejection sampling on.
         if use_rejection_sampling:
             sampling_fn = chain_speculative_sampling_triton
+            if get_spec().speculative_use_block_verification:
+                sampling_fn = partial(sampling_fn, block_verification=True)
         else:
             if _is_cuda:
                 from sglang.kernels.ops.speculative.sampling import (
@@ -933,8 +976,8 @@ def eagle_sample(
             sampling_info.temperatures, verify_input.draft_token_num, dim=0
         )  # (bs * num_draft_tokens, 1)
 
-        target_probs = F.softmax(
-            next_token_logits / expanded_temperature, dim=-1
+        target_probs = sampling_softmax(
+            next_token_logits, temperatures=expanded_temperature
         )  # (bs * num_draft_tokens, vocab_size)
         maybe_detect_nan(target_probs, "v2 verify: target_probs after softmax")
         if sampling_info.need_top_k_sampling:
@@ -970,18 +1013,6 @@ def eagle_sample(
                 "does not produce one (draft_probs missing or vocab-mismatched)."
             )
 
-        if envs.SGLANG_RS_DEBUG.get() and bs > 1:
-            _qs = draft_probs.sum(dim=-1).cpu().tolist()
-            _nan = torch.isnan(draft_probs).any(dim=-1).cpu().tolist()
-            logger.warning(
-                "[rs-dbg] q_rowsum=%s q_nan=%s p_sum_err=%s",
-                [[round(v, 3) for v in row] for row in _qs],
-                _nan,
-                [
-                    round(v, 3)
-                    for v in (target_probs.sum(dim=-1) - 1).abs().max(-1).values.cpu().tolist()
-                ],
-            )
         coins, coins_for_final_sampling = _verify_coins(
             sampling_info=sampling_info,
             seq_lens=batch.seq_lens,
@@ -1006,17 +1037,6 @@ def eagle_sample(
             threshold_acc=get_spec().speculative_accept_threshold_acc,
             deterministic=True,
         )
-        if envs.SGLANG_RS_DEBUG.get():
-            _ac = num_correct_drafts.reshape(-1).tolist()
-            _q = verify_input.draft_probs
-            _qrow = (
-                _q.reshape(_q.shape[0], -1, _q.shape[-1]).sum(-1)
-                .round(decimals=2)
-                .tolist()
-                if _q is not None
-                else None
-            )
-            logger.warning("[rs-dbg] accept=%s probs_rowsum=%s", _ac, _qrow)
         del (
             expanded_temperature,
             target_probs,
@@ -1077,13 +1097,20 @@ def eagle_sample(
     # `num_correct_drafts` stays drafts-only inside this function; the returned
     # tensor includes the trailing/bonus token via out-of-place +1 so the
     # name no longer flips semantics mid-function (naming doc C2).
-    return predict, num_correct_drafts + 1, accept_index
+    accept_lens = num_correct_drafts + 1
+    if watermark_state is not None and sampling_info.has_watermark_candidates:
+        watermark_state.record_speculative(
+            batch.req_pool_indices,
+            watermark_context_hashes,
+            watermark_selected,
+            accept_index,
+            accept_lens,
+        )
+    return predict, accept_lens, accept_index
 
 
 def eagle_prepare_for_decode(batch: ScheduleBatch):
     batch.maybe_evict_swa()
-
-    bs = batch.batch_size()
 
     # Accumulate penalty
     # This is a relaxed version of penalties for speculative decoding.
@@ -1101,13 +1128,8 @@ def eagle_prepare_for_decode(batch: ScheduleBatch):
     for r in batch.reqs:
         r.decode_batch_idx += 1
 
-    _pin = is_pin_memory_available(batch.device)
-    cur_kv_lens_cpu = torch.tensor(
-        cur_kv_lens, dtype=torch.int32, device="cpu", pin_memory=_pin
-    )
-    nxt_kv_lens_cpu = torch.tensor(
-        nxt_kv_lens, dtype=torch.int32, device="cpu", pin_memory=_pin
-    )
+    cur_kv_lens_cpu = torch.tensor(cur_kv_lens, dtype=torch.int32, device="cpu")
+    nxt_kv_lens_cpu = torch.tensor(nxt_kv_lens, dtype=torch.int32, device="cpu")
 
     # Fail fast if the page>1 + topk>1 draft over-allocation
     # (get_alloc_reserve_per_decode) outgrows the req_to_token row: the write below

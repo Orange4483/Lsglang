@@ -32,7 +32,6 @@ import torch
 
 from sglang.srt.layers.attention.base_attn_backend import (
     AttentionBackend,
-    SharedReadEnds,
 )
 from sglang.srt.utils import logger
 
@@ -41,7 +40,7 @@ if TYPE_CHECKING:
 
 
 def _super_chunk_unsupported_reason(
-    fb: "ForwardBatch", inner_size: int, allow_spec_info_extend: bool = False
+    fb: ForwardBatch, inner_size: int, allow_spec_info_extend: bool = False
 ) -> Optional[str]:
     if inner_size <= 0:
         return "disabled (super_chunk_inner_size=0)"
@@ -93,7 +92,7 @@ def _super_chunk_unsupported_reason(
 
 
 def compute_super_chunk_token_bounds(
-    fb: "ForwardBatch", inner_size: int
+    fb: ForwardBatch, inner_size: int
 ) -> List[Tuple[int, int]]:
     """Token-axis [lo, hi) bounds, cut at multiples of inner_size."""
     total = fb.extend_num_tokens
@@ -107,8 +106,8 @@ def compute_super_chunk_token_bounds(
 
 
 def build_super_chunk_children(
-    fb: "ForwardBatch", bounds: List[Tuple[int, int]]
-) -> List["ForwardBatch"]:
+    fb: ForwardBatch, bounds: List[Tuple[int, int]]
+) -> List[ForwardBatch]:
     """Per-sub-chunk ForwardBatch views. Sequential token layout: request r
     owns [cum[r], cum[r+1]); a sub-chunk intersects a contiguous request run,
     with head/tail requests possibly cut mid-sequence."""
@@ -295,7 +294,7 @@ class SuperChunkAttnBackend(AttentionBackend):
             primary, "extend_dummy_seqs_capped_by_req_pool", False
         )
         self._child_backends: List[AttentionBackend] = []
-        self._child_batches: Optional[List["ForwardBatch"]] = None
+        self._child_batches: Optional[List[ForwardBatch]] = None
         # per-forward plan: None => passthrough (primary runs the whole batch)
         self._active = False
         self._warned_kwargs = set()
@@ -359,7 +358,7 @@ class SuperChunkAttnBackend(AttentionBackend):
             for i, (lo, hi) in enumerate(self._child_bounds)
         ]
 
-    def init_forward_metadata(self, forward_batch: "ForwardBatch"):
+    def init_forward_metadata(self, forward_batch: ForwardBatch):
         reason = _super_chunk_unsupported_reason(
             forward_batch, self.inner_size, self._allow_spec_info_extend
         )
@@ -398,7 +397,7 @@ class SuperChunkAttnBackend(AttentionBackend):
         k: Optional[torch.Tensor] = None,
         v: Optional[torch.Tensor] = None,
         layer=None,
-        forward_batch: Optional["ForwardBatch"] = None,
+        forward_batch: Optional[ForwardBatch] = None,
         save_kv_cache: bool = True,
         *,
         mixed_qkv: Optional[torch.Tensor] = None,
@@ -543,11 +542,24 @@ class SuperChunkAttnBackend(AttentionBackend):
                 # Write-through into the joined stream: the chunk result is
                 # freed immediately, so the peak is stream + one chunk, not
                 # stream + all chunks (torch.cat's 2x). Pure copies.
+                # A 4D result keeps the token axis at dim 1 ([B, tokens, ...],
+                # GDN and absorbed MLA alike), so its stream buffer is
+                # (B, total, ...) instead of (total, ...).
                 if out is None:
-                    out = torch.empty(
-                        (total, *r.shape[1:]), dtype=r.dtype, device=r.device
-                    )
-                out[lo:hi] = r
+                    if r.dim() == 4:
+                        out = torch.empty(
+                            (r.shape[0], total, *r.shape[2:]),
+                            dtype=r.dtype,
+                            device=r.device,
+                        )
+                    else:
+                        out = torch.empty(
+                            (total, *r.shape[1:]), dtype=r.dtype, device=r.device
+                        )
+                if out.dim() == 4:
+                    out[:, lo:hi] = r
+                else:
+                    out[lo:hi] = r
             else:
                 outs.append(r)
         if out is not None:
@@ -570,7 +582,7 @@ class SuperChunkAttnBackend(AttentionBackend):
         return getattr(self.primary, name)
 
 
-def super_chunk_token_plan(forward_batch: "ForwardBatch"):
+def super_chunk_token_plan(forward_batch: ForwardBatch):
     """Model-layer entry point: the active sub-chunk plan or None.
 
     None means "run today's whole-forward path" (no wrapper, wrapper

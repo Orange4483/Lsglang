@@ -9,7 +9,6 @@ import triton
 import triton.language as tl
 
 from sglang.srt.layers import deep_gemm_wrapper
-from sglang.kernels.ops.quantization.fp8_kernel import fp8_dot_supported
 from sglang.srt.runtime_context import get_platform
 from sglang.srt.utils import (
     get_device_core_count,
@@ -34,8 +33,11 @@ def deep_gemm_fp8_fp8_bf16_nt(
     B: torch.Tensor,
     Bs: torch.Tensor,
     C: torch.Tensor,
+    block_n: int = 128,
+    block_k: int = 128,
 ) -> None:
-    deep_gemm_wrapper.gemm_nt_f8f8bf16((A, As), (B, Bs), C)
+    recipe = (1, block_n, block_k) if (block_n, block_k) != (128, 128) else None
+    deep_gemm_wrapper.gemm_nt_f8f8bf16((A, As), (B, Bs), C, recipe=recipe)
 
 
 @register_custom_op(mutates_args=["C"])
@@ -255,14 +257,8 @@ def _w8a8_block_fp8_matmul_hopper(
 
 @triton.jit
 def _reduce_block_fp8_split_k(
-    Parts, Out, ELEMENTS, SPLITS: tl.constexpr, BLOCK: tl.constexpr
+    Parts, Out, ELEMENTS: tl.constexpr, SPLITS: tl.constexpr, BLOCK: tl.constexpr
 ):
-    # ELEMENTS must stay a runtime int. As a tl.constexpr Triton keys a cubin on
-    # the exact M*N of every layer/step, so a new decode-M / DSPARK verify /
-    # super-mix shape cold-compiles a fresh cubin during the CUDA-graph warmup.
-    # On a heterogeneous TP group that cold cuModuleLoadData stalls against the
-    # peers' NCCL spin and deadlocks the group. Runtime keeps one cubin for all M
-    # (model N is always 16-aligned, so Triton's specialization never forks).
     offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     splits = tl.arange(0, SPLITS)
     values = tl.load(
@@ -573,7 +569,7 @@ def get_w8a8_block_fp8_configs(
 
     # First look up if an optimized configuration is available in the configs
     # directory
-    device_name = get_device_name(torch.cuda.current_device()).replace(" ", "_")
+    device_name = get_device_name().replace(" ", "_")
     json_file_name = f"N={N},K={K},device_name={device_name},dtype=fp8_w8a8,block_shape=[{block_n}, {block_k}].json"
 
     config_file_path = os.path.join(
@@ -638,7 +634,7 @@ def get_w8a8_channelwise_fp8_configs(N: int, K: int) -> Optional[Dict[int, Any]]
     if torch._dynamo.is_compiling():
         return None
 
-    device_name = get_device_name(torch.cuda.current_device()).replace(" ", "_")
+    device_name = get_device_name().replace(" ", "_")
     json_file_name = (
         f"N={N},K={K},device_name={device_name},dtype=fp8_w8a8_channelwise.json"
     )
@@ -753,7 +749,7 @@ def w8a8_block_fp8_matmul_deepgemm(
     # Deepgemm only supports output tensor type as bfloat16
     assert C.dtype == torch.bfloat16 and deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
 
-    deep_gemm_fp8_fp8_bf16_nt(A, As, B, Bs, C)
+    deep_gemm_fp8_fp8_bf16_nt(A, As, B, Bs, C, block_size[0], block_size[1])
 
     return C
 
@@ -830,17 +826,8 @@ def w8a8_block_fp8_matmul_triton(
     )
     if hopper_tuned:
         kernel = _w8a8_block_fp8_matmul_hopper
-    elif _is_gfx1250 or not fp8_dot_supported():
-        # No fp8 tl.dot on this arch (gfx1250, or CUDA before Ada): upcast the
-        # fp8 tiles to bf16 in-register. That kernel also needs num_stages=1.
-        # With per-row weight scales (block_size[0] == 1) the default config
-        # would ask for BLOCK_SIZE_N == 1, which tl.dot cannot express, so
-        # clamp it to the dot minimum; the scales stay indexed per column.
-        config = {
-            **config,
-            "num_stages": 1,
-            "BLOCK_SIZE_N": max(config["BLOCK_SIZE_N"], 16),
-        }
+    elif _is_gfx1250:
+        config = {**config, "num_stages": 1}
         kernel = _w8a8_block_fp8_matmul_gfx1250
     else:
         kernel = select_w8a8_block_fp8_matmul_kernel(M, N, config)

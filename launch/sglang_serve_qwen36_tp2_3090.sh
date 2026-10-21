@@ -25,10 +25,11 @@ OMP_NUM_THREADS=1 \
 LK_POWER_SAVING=1 \
 LK_NUMA_INTERLEAVE=1 \
 LK_GPU_PREFILL_MIN_TOKENS=1024 \
+LK_GPU_PREFILL_ENGINE=triton \
 LK_GPU_PREFILL_SUB_M=32768 \
-LK_GPU_RESIDENT_MOE_LAYERS=0-1,33-34 \
+LK_GPU_RESIDENT_MOE_LAYERS=0-1,38-39 \
 LK_POOL_SLOTS=128 \
-LK_POOL_DECODE=0 \
+FLASHINFER_USE_CUDA_NORM=1 \
 sglang serve \
     --model ~/Models/Qwen3.6-35B-A3B-NVFP4 \
     --served-model-name Qwen3.6-35B-A3B-NVFP4 \
@@ -39,7 +40,7 @@ sglang serve \
     --max-running-requests 2 \
     --chunked-prefill-size 8192 \
     --max-total-tokens 262144 \
-    --mem-fraction-static 0.95 \
+    --mem-fraction-static 0.90 \
     --tool-call-parser auto \
     --reasoning-parser auto \
     --disable-shared-experts-fusion \

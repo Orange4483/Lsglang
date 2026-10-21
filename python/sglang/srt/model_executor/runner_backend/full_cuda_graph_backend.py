@@ -57,6 +57,19 @@ def _park_expert_pool():
         yield
 
 
+def _wait_expert_pool_fences():
+    """Stream-wait the pump's per-layer copy fences on the launch stream.
+
+    Must run inside the park window, right before graph replay: the pump may
+    have published claimed slots whose H2D copies are still in flight on the
+    pump stream; without this wait the replayed kernels can read half-written
+    slots. No-op unless lk_moe pool + det_split are on (C++ side gates it).
+    """
+    from sglang.srt.utils.common import wait_lk_moe_pool_fences
+
+    wait_lk_moe_pool_fences(torch.cuda.current_stream().cuda_stream)
+
+
 def _allocate_output_buffer(output: Any) -> Optional[Any]:
     """Same-structure buffer for a tensor or a (nested) list/tuple of
     row-major tensors; None when any leaf is something else."""
@@ -245,6 +258,10 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
             # the copy threads wait on libcuda's rwlock). Capture is already
             # parked (_park_expert_pool); park it around the launch too.
             with _park_expert_pool():
+                # Claimed slots can still have copies in flight on the pump
+                # stream (det_split publishes at fence-record, not at DMA
+                # completion): make the launch stream wait for them.
+                _wait_expert_pool_fences()
                 self._graphs[shape_key].replay()
         return self._outputs[shape_key]
 

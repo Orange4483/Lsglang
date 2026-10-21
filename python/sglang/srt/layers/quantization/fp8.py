@@ -53,13 +53,16 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizeMethodBase,
 )
 from sglang.srt.layers.quantization.fp8_utils import (
+    _deepgemm_block_fp8_supported,
     _use_aiter_bpreshuffle_gfx95,
     apply_fp8_linear,
+    block_fp8_scale_to_e8m0_128,
     block_fp8_scale_to_mxfp8_e8m0,
     can_auto_enable_marlin_fp8,
     can_serve_block_fp8_as_mxfp8,
     cutlass_fp8_supported,
     deepgemm_w8a8_block_fp8_linear_with_fallback,
+    dense_mxscale_wanted,
     dispatch_block_fp8_mxfp8_linear,
     dispatch_w8a8_block_fp8_linear,
     dispatch_w8a8_mxfp8_linear,
@@ -96,6 +99,7 @@ from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
     get_device_capability,
+    get_int_env_var,
     is_cpu,
     is_cuda,
     is_flashinfer_available,
@@ -113,6 +117,7 @@ from sglang.srt.utils import (
 )
 
 if TYPE_CHECKING:
+    from sglang.srt.layers.linear import LinearBase
     from sglang.srt.layers.moe.moe_runner.aiter import AiterMoeQuantInfo
     from sglang.srt.layers.moe.token_dispatcher import CombineInput, DispatchOutput
     from sglang.srt.layers.quantization.w4afp8 import W4AFp8Config
@@ -126,6 +131,9 @@ _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
 _is_fp8_fnuz = is_fp8_fnuz()
 _is_gfx95_supported = is_gfx95_supported()
+
+if _is_hip:
+    from sglang.srt.layers.quantization import fp8_hip
 # gfx942 (MI300) has no MX matmul HW; MXFP8 checkpoints are converted to
 # block-fp8 [128,128] at load and run through the native block-fp8 kernels.
 # SGLANG_FORCE_MXFP8_BLOCK_CONVERT=1 opts into that same block-fp8 path on
@@ -178,6 +186,7 @@ if _use_aiter:
 ACTIVATION_SCHEMES = ["static", "dynamic"]
 
 logger = logging.getLogger(__name__)
+_DENSE_MXSCALE_LOGGED: set = set()
 
 DSV4_DEQUANT_FP4_TABLE = torch.tensor(
     [
@@ -536,6 +545,32 @@ class Fp8LinearMethod(LinearMethodBase):
             if _wbs is not None and len(_wbs) == 2 and _wbs[1] not in (-1, 128):
                 self.use_marlin = False
 
+        # SM8x group-32 Marlin W8A16: the group_blocks=2 fp8 Marlin templates
+        # are instantiated in the JIT marlin, so MXFP8 (ue8m0, 32-wide K
+        # groups) dense linears can use Marlin's decode GEMV shape instead of
+        # the streaming Triton w8a16 kernel. Per-layer: only eligible layers
+        # are repacked; the rest stay on the w8a16 Triton path.
+        # Device-aware gate: can_auto_enable_marlin_fp8() reads device_id=0,
+        # so on a heterogeneous TP group every rank would see GPU0's SM86.
+        _marlin_group32_cap = (
+            torch.cuda.get_device_capability(torch.cuda.current_device())
+            if _is_cuda
+            else (0, 0)
+        )
+        self.use_marlin_group32 = (
+            _is_cuda
+            and 80 <= _marlin_group32_cap[0] * 10 + _marlin_group32_cap[1] < 89
+            and self.quant_config.weight_block_size is not None
+            and len(self.quant_config.weight_block_size) == 2
+            and self.quant_config.weight_block_size[1] == 32
+            and get_bool_env_var("SGLANG_SM8X_MARLIN_GROUP32", default="true")
+        )
+        # Marlin is a decode-shape kernel; large-M (prefill) calls stay on the
+        # Triton block-fp8 GEMM, which reads the plain weight kept on layer.
+        self.marlin_group32_max_m = get_int_env_var(
+            "SGLANG_SM8X_MARLIN_GROUP32_MAX_M", 16
+        )
+
         self.use_mxfp8 = getattr(self.quant_config, "use_mxfp8", False)
         self.block_quant = (
             self.use_mxfp8 or self.quant_config.weight_block_size is not None
@@ -582,6 +617,7 @@ class Fp8LinearMethod(LinearMethodBase):
 
     @staticmethod
     def validate_block_quant_shapes(
+        layer: LinearBase,
         quant_config,
         input_size: int,
         input_size_per_partition: int,
@@ -600,7 +636,8 @@ class Fp8LinearMethod(LinearMethodBase):
                 "Skipping block quantization checks for weight partition."
             )
         else:
-            tp_size = get_parallel().tp_size
+            tp_group = layer.tp_group
+            tp_size = tp_group.world_size if tp_group is not None else 1
             # Required by row parallel
             if tp_size > 1 and input_size // input_size_per_partition == tp_size:
                 if input_size_per_partition % block_k != 0:
@@ -650,6 +687,7 @@ class Fp8LinearMethod(LinearMethodBase):
         if block_quant:
             block_n, block_k = quant_config.weight_block_size
             Fp8LinearMethod.validate_block_quant_shapes(
+                layer,
                 quant_config,
                 input_size,
                 input_size_per_partition,
@@ -751,7 +789,100 @@ class Fp8LinearMethod(LinearMethodBase):
             params_dtype=params_dtype,
         )
 
+    def _maybe_prepare_marlin_group32(self, layer: Module) -> None:
+        if not self.use_marlin_group32:
+            return
+        if getattr(layer, "keep_plain_weight_layout", False):
+            # The model reads .weight / .weight_scale_inv directly.
+            return
+        weight = layer.weight
+        if weight.dtype != torch.float8_e4m3fn:
+            return
+        n, k = layer.weight.shape
+        # Marlin thread tiles need N%64==0 (decode uses the 64-wide tiles) and
+        # a whole number of 32-wide K groups; tiny-N shapes lose to the
+        # streaming w8a16 Triton kernel and stay on it.
+        if n < 512 or n % 64 != 0 or k % 32 != 0:
+            return
+        scale = layer.weight_scale_inv.data
+        if scale.dtype == torch.uint8:
+            scale_bf16 = (scale.to(torch.int32) << 23).view(torch.float32).to(
+                torch.bfloat16
+            )
+        else:
+            scale_bf16 = scale.to(torch.bfloat16)
+        if scale_bf16.shape != (n, k // 32):
+            # A [bn, 32]-block checkpoint stores one scale per bn-row block;
+            # broadcasting each block scale over its rows is numerically
+            # identical to Marlin's per-row [N, K // 32] group-32 layout.
+            wbs = self.weight_block_size
+            block_n = wbs[0] if wbs is not None and len(wbs) == 2 else 0
+            if block_n in (1, 32) and scale_bf16.shape == (
+                (n + block_n - 1) // block_n,
+                k // 32,
+            ):
+                if block_n > 1:
+                    scale_bf16 = scale_bf16.repeat_interleave(block_n, dim=0)[:n]
+            else:
+                return
+
+        from sglang.srt.layers.quantization.marlin_utils import (
+            marlin_make_workspace,
+            marlin_permute_scales,
+        )
+        from sglang.srt.layers.quantization.marlin_utils_fp8 import (
+            fp8_fused_exponent_bias_into_scales,
+            pack_fp8_to_int32,
+        )
+        from sglang.kernels.ops.quantization.gptq_marlin_repack import (
+            gptq_marlin_repack,
+        )
+
+        qweight = pack_fp8_to_int32(weight.data, size_k_first=False).T.contiguous()
+        marlin_qweight = gptq_marlin_repack(
+            b_q_weight=qweight,
+            perm=torch.empty(0, dtype=torch.int, device=weight.device),
+            size_k=k,
+            size_n=n,
+            num_bits=8,
+        )
+        scales_nk = scale_bf16.T.contiguous()
+        marlin_scales = fp8_fused_exponent_bias_into_scales(
+            marlin_permute_scales(s=scales_nk, size_k=k, size_n=n, group_size=32)
+        )
+        # Dual retention: keep the plain block-fp8 tensors on the layer (large-M
+        # prefill and direct readers stay on the Triton block kernel) and hang
+        # the Marlin repack under a separate name, dispatched per-call by M.
+        layer.marlin_qweight = marlin_qweight
+        layer.marlin_weight_scale = marlin_scales
+        layer.marlin_workspace = marlin_make_workspace(weight.device)
+        layer.marlin_group32_ready = True
+
+        # Warm the decode-M kernels before CUDA-graph capture. The capture
+        # loop replays these exact launches; a cold cuModuleLoadData on one TP
+        # rank while its peer waits in NCCL is the 2026-10-18 capture-hang
+        # shape. Inputs are zeros and outputs/workspace are discarded, so this
+        # only touches the JIT cache.
+        for m in (1, 2, 6, 12, 16):
+            if m > self.marlin_group32_max_m:
+                continue
+            x = torch.zeros((m, k), dtype=torch.bfloat16, device=weight.device)
+            torch.ops.sglang.apply_fp8_marlin_linear(
+                input=x,
+                weight=layer.marlin_qweight,
+                weight_scale=layer.marlin_weight_scale,
+                workspace=layer.marlin_workspace,
+                size_n=n,
+                size_k=k,
+                bias=None,
+            )
+        torch.cuda.synchronize(weight.device)
+
     def process_weights_after_loading_block_quant(self, layer: Module) -> None:
+        use_deepgemm_runner = (
+            getattr(self.w8a8_block_fp8_linear, "func", self.w8a8_block_fp8_linear)
+            is deepgemm_w8a8_block_fp8_linear_with_fallback
+        )
         if self.convert_mxfp8_to_block:
             from sglang.srt.layers.quantization.mxfp8_block_convert import (
                 convert_mxfp8_weight_to_block_fp8,
@@ -798,6 +929,7 @@ class Fp8LinearMethod(LinearMethodBase):
             layer.weight_scale_inv.requires_grad_(False)
             layer.weight_scale_inv.format_ue8m0 = True
             self._process_mxfp8_linear_weight_scale(layer)
+            self._maybe_prepare_marlin_group32(layer)
             return
         elif _is_npu and is_npu_arch35():
             from sglang.srt.hardware_backend.npu.quantization.w8a8_mxfp8 import (
@@ -833,10 +965,6 @@ class Fp8LinearMethod(LinearMethodBase):
             return
         else:
             # Requantize block scales to UE8M0 when DeepGEMM is the active runner.
-            use_deepgemm_runner = (
-                self.w8a8_block_fp8_linear
-                is deepgemm_w8a8_block_fp8_linear_with_fallback
-            )
             requant_block_scale_ue8m0_for_deepgemm(
                 layer.weight,
                 layer.weight_scale_inv,
@@ -849,8 +977,61 @@ class Fp8LinearMethod(LinearMethodBase):
 
         layer.weight.data = weight.data
         layer.weight_scale_inv.data = weight_scale.data
+        if hasattr(layer, "_block_fp8_bf16_weight"):
+            layer._block_fp8_bf16_weight = None
+            layer._derived_weight_cache_error = None
+        if (
+            _is_cuda
+            and get_platform().is_sm90
+            and envs.SGLANG_OPT_HOPPER_BLOCK_FP8_BF16.get()
+            and not (
+                use_deepgemm_runner
+                and _deepgemm_block_fp8_supported(
+                    weight.shape,
+                    self.weight_block_size,
+                    getattr(layer, "orig_dtype", None),
+                )
+            )
+            and weight.is_cuda
+            and weight.dtype == torch.float8_e4m3fn
+            and self.weight_block_size == [32, 32]
+            and getattr(self.quant_config, "scale_fmt", None) == "ue8m0"
+            and getattr(layer, "orig_dtype", None) == torch.bfloat16
+            and not self.use_marlin
+            and not getattr(layer, "keep_plain_weight_layout", False)
+        ):
+            from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
+            from sglang.srt.layers.quantization.fp8_utils import block_quant_dequant
+
+            # Keep even the smallest/largest finite E4M3 value representable
+            # as normal BF16, and reject mislabeled non-power-of-two scales.
+            exact_bf16_scales = (
+                (weight_scale >= 2.0**-117)
+                & (weight_scale <= 2.0**119)
+                & (torch.frexp(weight_scale)[0] == 0.5)
+            ).all()
+            if not is_batch_invariant_mode_enabled() and exact_bf16_scales.item():
+                # Hopper group32 FP8 accumulates each 32-wide block separately.
+                # Reuse a BF16 weight expansion for larger GEMMs, keeping the
+                # original FP8 weights for decode and weight reloads.
+                layer.register_buffer(
+                    "_block_fp8_bf16_weight",
+                    block_quant_dequant(weight, weight_scale, [32, 32], torch.bfloat16),
+                    persistent=False,
+                )
+                layer._derived_weight_cache_error = (
+                    "Online weight updates are not supported while Hopper FP8 "
+                    "BF16 weight caches are active: captured CUDA graphs retain "
+                    "these derived weights. Restart with "
+                    "SGLANG_OPT_HOPPER_BLOCK_FP8_BF16=0 to allow online updates."
+                )
         if self.block_fp8_as_mxfp8:
             self._prepare_block_fp8_as_mxfp8(layer)
+        if not getattr(layer, "block_fp8_mxfp8_ready", False):
+            # SM8x group-32 Marlin route for block-fp8 (ue8m0, 32-wide K)
+            # checkpoints: an alternative decode kernel for the same math,
+            # so it also applies when the MXFP8 view did not engage.
+            self._maybe_prepare_marlin_group32(layer)
 
         # The preshuffle rewrites the weight into a layout only
         # aiter_w8a8_block_fp8_linear can read, so it is correct exactly when
@@ -876,6 +1057,7 @@ class Fp8LinearMethod(LinearMethodBase):
                 # instead of silently reading a permuted weight.
                 layer.aiter_bpreshuffled = True
                 layer.weight.is_shuffled = True
+                self._maybe_prepare_dense_mxscale(layer)
 
         if (
             is_xpu()
@@ -899,6 +1081,36 @@ class Fp8LinearMethod(LinearMethodBase):
                 scale_reordered.copy_(scale)
                 with torch.no_grad():
                     layer.weight_scale_inv.set_(scale_reordered)
+
+    def _maybe_prepare_dense_mxscale(self, layer: Module) -> None:
+        """SGLANG_DSV4_DENSE_MXSCALE: give a (16, 16)-preshuffled 128x128 block-fp8
+        weight an e8m0 copy of its scale, which routes aiter_w8a8_block_fp8_linear
+        onto aiter's mxscale bpreshuffle GEMM. Lossless only for power-of-two
+        scales (ue8m0 checkpoints); any other layer stays on the fp32 GEMM. The
+        weight bytes are shared, the copy costs N*K/16384 bytes."""
+        if self.weight_block_size != [128, 128] or self.convert_mxfp8_to_block:
+            return
+        if layer.weight.dtype != torch.float8_e4m3fn:
+            return
+        n, k = layer.weight.shape
+        if not dense_mxscale_wanted(n, k):
+            return
+        scale = layer.weight_scale_inv.data
+        if tuple(scale.shape) != (n // 128, k // 128) or n % 128 or k % 128:
+            return
+        e8m0 = block_fp8_scale_to_e8m0_128(scale)
+        if e8m0 is None:
+            logger.warning(
+                "Dense mxscale: %s keeps the fp32 GEMM (scales are not powers of two)",
+                getattr(layer, "prefix", tuple(layer.weight.shape)),
+            )
+            return
+        layer.weight._mxscale_w_scale = e8m0
+        if (n, k) not in _DENSE_MXSCALE_LOGGED:
+            _DENSE_MXSCALE_LOGGED.add((n, k))
+            logger.info(
+                "Dense mxscale (e8m0 bpreshuffle GEMM) enabled for N=%d K=%d", n, k
+            )
 
     def _prepare_block_fp8_as_mxfp8(self, layer: Module) -> None:
         layer.block_fp8_mxfp8_ready = False
@@ -981,6 +1193,8 @@ class Fp8LinearMethod(LinearMethodBase):
                 "weight_scale_inv_swizzled",
                 block_scale_interleave(scale_u8.contiguous()).contiguous(),
             )
+        elif backend.is_gfx95():
+            fp8_hip.process_dense_weights(self, layer, scale_u8)
         elif backend.is_deep_gemm():
             from sglang.srt.layers.deep_gemm_wrapper.configurer import (
                 DEEPGEMM_SCALE_UE8M0,
@@ -1113,6 +1327,11 @@ class Fp8LinearMethod(LinearMethodBase):
                     if _use_aiter and self.use_aiter_fp8_per_token:
                         # Otherwise, by default, aiter only uses per-tensor quantization
                         self.use_per_token_if_dynamic = True
+                        # This path quantizes activations dynamically per token, which
+                        # is incompatible with a static per-tensor input_scale. Drop it
+                        # so apply_fp8_linear (and the fused RMSNorm+quant path) compute
+                        # the activation scale per token instead of reusing a stale one.
+                        layer.input_scale = None
                         if _is_fp8_fnuz:
                             weight, weight_scale, _ = normalize_e4m3fn_to_e4m3fnuz(
                                 weight=weight,
@@ -1147,13 +1366,17 @@ class Fp8LinearMethod(LinearMethodBase):
                 # Update layer with new values.
                 layer.weight = Parameter(weight.t(), requires_grad=False)
                 layer.weight_scale = Parameter(weight_scale, requires_grad=False)
+                # input_scale is None when the per-token path above dropped it.
                 if (
-                    hasattr(self.quant_config, "activation_scheme")
-                    and self.quant_config.activation_scheme == "static"
-                ) or (
-                    hasattr(self.quant_config, "linear_activation_scheme")
-                    and self.quant_config.linear_activation_scheme == "static"
-                ):
+                    (
+                        hasattr(self.quant_config, "activation_scheme")
+                        and self.quant_config.activation_scheme == "static"
+                    )
+                    or (
+                        hasattr(self.quant_config, "linear_activation_scheme")
+                        and self.quant_config.linear_activation_scheme == "static"
+                    )
+                ) and layer.input_scale is not None:
                     layer.input_scale = Parameter(
                         layer.input_scale.max(), requires_grad=False
                     )
@@ -1191,6 +1414,24 @@ class Fp8LinearMethod(LinearMethodBase):
                 size_k=layer.input_size_per_partition,
                 bias=bias,
             )
+
+        if getattr(layer, "marlin_group32_ready", False) and isinstance(
+            x, torch.Tensor
+        ):
+            num_tokens = x.numel() // x.shape[-1]
+            if num_tokens <= self.marlin_group32_max_m:
+                return torch.ops.sglang.apply_fp8_marlin_linear(
+                    input=x,
+                    weight=layer.marlin_qweight,
+                    weight_scale=layer.marlin_weight_scale,
+                    workspace=layer.marlin_workspace,
+                    size_n=layer.output_size_per_partition,
+                    size_k=layer.input_size_per_partition,
+                    bias=bias,
+                )
+
+        if _is_hip and self.block_fp8_as_mxfp8 and self.mxfp8_dense_backend.is_gfx95():
+            return fp8_hip.apply_dense(self, layer, x, bias)
 
         mxfp8_view = self.use_mxfp8 or (
             self.block_fp8_as_mxfp8 and layer.block_fp8_mxfp8_ready
@@ -1263,6 +1504,10 @@ class Fp8LinearMethod(LinearMethodBase):
                     True,  # is_vnni
                 )
 
+            cached_weight = getattr(layer, "_block_fp8_bf16_weight", None)
+            extra_kwargs = (
+                {"weight_bf16": cached_weight} if cached_weight is not None else {}
+            )
             if isinstance(x, tuple):
                 return self.w8a8_block_fp8_linear(
                     input=x[0],
@@ -1271,6 +1516,7 @@ class Fp8LinearMethod(LinearMethodBase):
                     weight_scale=layer.weight_scale_inv,
                     input_scale=x[1],
                     bias=bias,
+                    **extra_kwargs,
                 )
 
             return self.w8a8_block_fp8_linear(
@@ -1280,6 +1526,7 @@ class Fp8LinearMethod(LinearMethodBase):
                 weight_scale=layer.weight_scale_inv,
                 input_scale=None,
                 bias=bias,
+                **extra_kwargs,
             )
 
         if use_intel_amx_backend(layer):
@@ -1413,7 +1660,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         if is_checkpoint_fp8_serialized:
             params_dtype = torch.uint32 if _use_hip_int4 else torch.float8_e4m3fn
 
-        tp_size = get_parallel().tp_size
+        tp_size = layer.moe_tp_size
         w13_num_shards = 2 if layer.moe_runner_config.is_gated else 1
 
         w13_up_dim, w2_up_dim, weight_padded = get_moe_weight_sizes(
@@ -2696,7 +2943,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 w2_weight=layer.w2_weight,
                 block_quant=True,
                 global_num_experts=int(layer.num_experts),
-                moe_ep_rank=int(layer.moe_ep_rank),
                 w13_weight_scale_inv=layer.hpc_ops_w13_weight_scale,
                 w2_weight_scale_inv=layer.hpc_ops_w2_weight_scale,
                 block_shape=self.quant_config.weight_block_size,
@@ -2707,7 +2953,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 w2_weight=layer.w2_weight,
                 block_quant=False,
                 global_num_experts=int(layer.num_experts),
-                moe_ep_rank=int(layer.moe_ep_rank),
                 gate_up_alphas=layer.hpc_ops_gate_up_alphas,
                 down_alphas=layer.hpc_ops_down_alphas,
                 w13_input_scale=layer.w13_input_scale,

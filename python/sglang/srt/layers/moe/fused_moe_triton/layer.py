@@ -106,7 +106,7 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 logger = logging.getLogger(__name__)
 
-from sglang.srt.utils.common import is_lk_moe_feature_enabled, get_pool_log, get_verify_resident, get_verify_skip_miss, get_hf_mbox, get_pool_inflight, is_lk_prefill_debug, is_lk_moe_gpu_resident_layer, get_gpu_prefetch_window, get_gpu_prefill_min_tokens, get_pool_window, get_super_chunk_size, get_bool_env_var, get_int_env_var, is_lk_gpu_prefill_enabled, get_model_type_from_layer_name, is_lk_pool_layer, get_pool_slots, is_lk_pool_decode_enabled, lk_route_probe_enabled
+from sglang.srt.utils.common import is_lk_moe_feature_enabled, is_lk_pool_enabled, get_pool_log, get_verify_resident, get_verify_skip_miss, get_hf_mbox, get_pool_inflight, is_lk_prefill_debug, is_lk_moe_gpu_resident_layer, get_gpu_prefetch_window, get_gpu_prefill_min_tokens, get_gpu_prefill_engine, get_pool_window, get_super_chunk_size, get_bool_env_var, is_lk_gpu_prefill_enabled, get_model_type_from_layer_name, is_lk_pool_layer, get_pool_slots, is_lk_pool_decode_enabled, lk_route_probe_enabled, get_prefill_wave_experts
 from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import CompressedTensorsFusedMoEMethod
 from sglang.srt.model_executor.runner import get_is_capture_mode
 if is_lk_moe_feature_enabled():
@@ -116,6 +116,22 @@ if is_lk_moe_feature_enabled():
         gather_rows, slot_table_fill, moe_gateup, reduce_gate, moe_down, reduce_down)
 else:
     logger.error("Failed to import lk_moe module or LK_MOE_HYBRID_ENABLED is not set to 1, lk::MOE implementation will not be available")
+
+# Pool-decode determinism: publish the claimed batch and make the GPU half
+# stream-wait on that batch's copy fence before reading slots. Diagnostic
+# probe logs the exact frozen split (claim/ready/snapshot) per pool layer.
+_LK_POOL_DET_SPLIT = bool(
+    is_lk_moe_feature_enabled() and get_bool_env_var("LK_POOL_DET_SPLIT")
+)
+_LK_POOL_SPLIT_PROBE = bool(
+    is_lk_moe_feature_enabled() and get_bool_env_var("LK_POOL_SPLIT_PROBE")
+)
+_LK_POOL_PROBE_N = 0
+if is_lk_moe_feature_enabled():
+    try:
+        lk_moe.pool_set_det_split(_LK_POOL_DET_SPLIT)
+    except Exception:
+        pass
     
 # Log the deferred-finalize config at most once per process (rank). Different MoE
 # layers can resolve to different quant methods, so print_info_once (keyed on the
@@ -244,7 +260,6 @@ def create_moe_dispatcher(
             num_experts=moe_runner_config.num_experts,
             num_local_experts=moe_runner_config.num_local_experts,
             hidden_size=moe_runner_config.hidden_size,
-            moe_runner_config=moe_runner_config,
         )
     else:
         raise NotImplementedError(f"Unsupported a2a backend: {a2a_backend}")
@@ -430,6 +445,8 @@ class FusedMoE(torch.nn.Module):
         # Set by the quant method when it repacks experts for MegaMoE.
         self._mega_moe_weights_built = False
         self._mega_moe_nvfp4 = False
+        # Read at construction: draft_model_build_scope applies the draft's own value.
+        self._mega_moe_w4a4 = get_exec().moe.enable_w4a4_mxfp4_megamoe
         self._pending_fp8_shared_weights: dict[tuple[int, str], torch.Tensor] = {}
         self._pending_fp8_shared_scales: dict[tuple[int, str], torch.Tensor] = {}
 
@@ -493,6 +510,7 @@ class FusedMoE(torch.nn.Module):
             is_gated=is_gated,
             routing_method_type=routing_method_type,
             gate_up_interleaved=gate_up_interleaved,
+            layer=self,
         )
 
         self.quant_method = quant_method
@@ -533,9 +551,16 @@ class FusedMoE(torch.nn.Module):
             and isinstance(self.quant_method, Fp8MoEMethod)
             and self.quant_method.block_quant
         )
+        qwen4_bf16_deferred = (
+            isinstance(self.quant_method, UnquantizedFusedMoEMethod)
+            and params_dtype == torch.bfloat16
+            and hidden_size == 2560
+            and num_experts == 512
+            and top_k == 10
+        )
         self.supports_deferred_finalize = (
             get_moe_runner_backend().is_flashinfer_trtllm()
-            and (nvfp4_deferred or qwen35_fp8_deferred)
+            and (nvfp4_deferred or qwen35_fp8_deferred or qwen4_bf16_deferred)
         )
         global _deferred_finalize_info_logged
         if not _deferred_finalize_info_logged:
@@ -558,6 +583,7 @@ class FusedMoE(torch.nn.Module):
      
         
         self.gpu_prefetch_window = get_gpu_prefetch_window()
+        self.prefill_wave_experts = get_prefill_wave_experts()
         self.lk_moe = None
         self.lk_moe_config = None 
         self.model_type = get_model_type_from_layer_name(self.layer_name)
@@ -575,7 +601,7 @@ class FusedMoE(torch.nn.Module):
         self.route_probe = lk_route_probe_enabled()
         self.pool_decode = is_lk_pool_decode_enabled() and self.is_pool_layer
 
-        self._triton_prefill = None
+        self._gpu_prefill_driver = None
         self._pool_layer_info = None
    
         self.cpu_prefill_group_max_len = self.get_cpu_prefill_group_max_len()
@@ -749,7 +775,6 @@ class FusedMoE(torch.nn.Module):
         expert_data: torch.Tensor,
         shard_id: str,
         loaded_weight: torch.Tensor,
-        tp_rank: int,
         is_bias: bool = False,
     ):
         # Load grouped weight scales for group quantization
@@ -760,7 +785,6 @@ class FusedMoE(torch.nn.Module):
                 shard_dim=shard_dim,
                 loaded_weight=loaded_weight,
                 expert_data=expert_data,
-                tp_rank=tp_rank,
                 is_bias=is_bias,
             )
         elif shard_id in ("w1", "w3", "w13"):
@@ -769,7 +793,6 @@ class FusedMoE(torch.nn.Module):
                 shard_dim=shard_dim,
                 loaded_weight=loaded_weight,
                 expert_data=expert_data,
-                tp_rank=tp_rank,
                 is_bias=is_bias,
             )
 
@@ -779,7 +802,6 @@ class FusedMoE(torch.nn.Module):
         shard_dim: int,
         shard_id: str,
         loaded_weight: torch.Tensor,
-        tp_rank: int,
     ):
         # for per channel weight quantization
         if shard_id == "w2":
@@ -791,7 +813,6 @@ class FusedMoE(torch.nn.Module):
                 shard_dim=shard_dim,
                 loaded_weight=loaded_weight,
                 expert_data=expert_data,
-                tp_rank=tp_rank,
             )
 
     def _load_w13(
@@ -800,7 +821,6 @@ class FusedMoE(torch.nn.Module):
         shard_dim: int,
         shard_id: str,
         loaded_weight: torch.Tensor,
-        tp_rank: int,
         is_bias: bool = False,
     ):
         # Index the loaded weight for tp sharding.
@@ -843,7 +863,7 @@ class FusedMoE(torch.nn.Module):
                 expert_data,
                 loaded_weight,
                 start,
-                shard_size * tp_rank,
+                shard_size * self.moe_tp_rank,
                 shard_dim,
                 shard_size,
                 not self.use_presharded_weights,
@@ -859,7 +879,7 @@ class FusedMoE(torch.nn.Module):
                 # shard size from the loaded weight so we index correctly.
                 loaded_shard_size = loaded_weight.shape[shard_dim] // self.moe_tp_size
                 loaded_weight = loaded_weight.narrow(
-                    shard_dim, loaded_shard_size * tp_rank, loaded_shard_size
+                    shard_dim, loaded_shard_size * self.moe_tp_rank, loaded_shard_size
                 )
 
             expert_data = expert_data.narrow(shard_dim, start, shard_size)
@@ -886,7 +906,6 @@ class FusedMoE(torch.nn.Module):
         shard_dim: int,
         shard_id: str,
         loaded_weight: torch.Tensor,
-        tp_rank: int,
         is_bias: bool = False,
     ):
         """Load w2 weights for down projection.
@@ -896,7 +915,6 @@ class FusedMoE(torch.nn.Module):
             shard_dim: The dimension to shard along
             shard_id: The shard ID (must be "w2")
             loaded_weight: The weight tensor to load from
-            tp_rank: The tensor parallel rank
         """
         if not isinstance(expert_data, torch.Tensor) or not isinstance(
             loaded_weight, torch.Tensor
@@ -934,7 +952,7 @@ class FusedMoE(torch.nn.Module):
                 expert_data,
                 loaded_weight,
                 0,  # param_data_start
-                shard_size * tp_rank,
+                shard_size * self.moe_tp_rank,
                 shard_dim,
                 shard_size,
                 not self.use_presharded_weights,
@@ -947,7 +965,7 @@ class FusedMoE(torch.nn.Module):
                 # do not cause out-of-bounds indexing into the checkpoint.
                 loaded_shard_size = loaded_weight.shape[shard_dim] // self.moe_tp_size
                 loaded_weight = loaded_weight.narrow(
-                    shard_dim, loaded_shard_size * tp_rank, loaded_shard_size
+                    shard_dim, loaded_shard_size * self.moe_tp_rank, loaded_shard_size
                 )
 
         # w2, down_proj: Load into only logical weight of w2.
@@ -974,7 +992,6 @@ class FusedMoE(torch.nn.Module):
         shard_id: str,
         expert_id: int,
         shard_dim: int,
-        tp_rank: int,
     ) -> bool:
         if (
             not self._has_fused_shared
@@ -1042,14 +1059,12 @@ class FusedMoE(torch.nn.Module):
             expert_data=weight_data,
             shard_id=shard_id,
             loaded_weight=fp4_weight,
-            tp_rank=tp_rank,
         )
         self._load_model_weight_or_group_weight_scale(
             shard_dim=shard_dim,
             expert_data=scale_data,
             shard_id=shard_id,
             loaded_weight=fp4_scale,
-            tp_rank=tp_rank,
         )
         return True
 
@@ -1067,7 +1082,6 @@ class FusedMoE(torch.nn.Module):
         expert_data: torch.Tensor,
         shard_dim: int,
         loaded_weight: torch.Tensor,
-        tp_rank: int,
     ):
         if shard_id == "w2":
             self._load_w2(
@@ -1075,7 +1089,6 @@ class FusedMoE(torch.nn.Module):
                 shard_dim=shard_dim,
                 loaded_weight=loaded_weight,
                 expert_data=expert_data,
-                tp_rank=tp_rank,
             )
         else:
             assert shard_id in ("w1", "w3")
@@ -1202,7 +1215,6 @@ class FusedMoE(torch.nn.Module):
         loaded_weight: torch.Tensor,
         shard_id: str,
         expert_id: int,
-        tp_rank: int,
     ) -> bool:
         """Handle GGUF weight loading.
 
@@ -1211,7 +1223,6 @@ class FusedMoE(torch.nn.Module):
             loaded_weight: The weight tensor to load.
             shard_id: The shard ID (w1, w2, or w3).
             expert_id: The expert ID.
-            tp_rank: The tensor parallel rank.
 
         Returns:
             True if the weight was handled as a GGUF weight, False otherwise.
@@ -1229,7 +1240,7 @@ class FusedMoE(torch.nn.Module):
             if self.moe_tp_size > 1:
                 if shard_id in ["w1", "w3", "w2"] and output_dim == 0:
                     shard_size = loaded_weight.size(0) // self.moe_tp_size
-                    start_idx = tp_rank * shard_size
+                    start_idx = self.moe_tp_rank * shard_size
                     loaded_weight = loaded_weight.narrow(
                         0, start_idx, shard_size
                     ).clone()
@@ -1253,10 +1264,8 @@ class FusedMoE(torch.nn.Module):
         shard_id: str,
         expert_id: int,
     ) -> None:
-        tp_rank = self.moe_tp_rank
-
         # Special case for GGUF weights
-        if self._load_gguf_weight(param, loaded_weight, shard_id, expert_id, tp_rank):
+        if self._load_gguf_weight(param, loaded_weight, shard_id, expert_id):
             return
 
         # compressed-tensors checkpoints with packed weights are stored flipped
@@ -1305,8 +1314,14 @@ class FusedMoE(torch.nn.Module):
         if shard_id not in ("w1", "w2", "w3"):
             raise ValueError(f"shard_id must be ['w1','w2','w3'] but got {shard_id}.")
 
+        use_flashinfer_trtllm_weight_layout = (
+            method.use_flashinfer_trtllm_weight_layout
+            if isinstance(method, ModelOptNvFp4FusedMoEMethod)
+            else self.use_flashinfer_trtllm_moe
+        )
+
         # Flashinfer assumes w31 format for w13_weight. Same for the scales.
-        if self.use_flashinfer_trtllm_moe and (
+        if use_flashinfer_trtllm_weight_layout and (
             isinstance(method, ModelOptNvFp4FusedMoEMethod)
             or isinstance(method, Fp8MoEMethod)
             or isinstance(method, UnquantizedFusedMoEMethod)
@@ -1339,7 +1354,6 @@ class FusedMoE(torch.nn.Module):
             shard_id=shard_id,
             expert_id=expert_id,
             shard_dim=shard_dim,
-            tp_rank=tp_rank,
         ):
             return
 
@@ -1378,7 +1392,6 @@ class FusedMoE(torch.nn.Module):
                 shard_id=shard_id,
                 loaded_weight=loaded_weight,
                 expert_data=expert_data,
-                tp_rank=tp_rank,
             )
             return
 
@@ -1406,7 +1419,6 @@ class FusedMoE(torch.nn.Module):
                     shard_dim=shard_dim,
                     loaded_weight=loaded_weight,
                     expert_data=expert_data,
-                    tp_rank=tp_rank,
                 )
             return
 
@@ -1428,7 +1440,6 @@ class FusedMoE(torch.nn.Module):
                     shard_dim=shard_dim,
                     loaded_weight=loaded_weight,
                     expert_data=expert_data,
-                    tp_rank=tp_rank,
                 )
             elif quant_method in [
                 FusedMoeWeightScaleSupported.GROUP.value,
@@ -1439,7 +1450,6 @@ class FusedMoE(torch.nn.Module):
                     shard_dim=shard_dim,
                     loaded_weight=loaded_weight,
                     expert_data=expert_data,
-                    tp_rank=tp_rank,
                 )
             elif quant_method == FusedMoeWeightScaleSupported.TENSOR.value:
                 # INT4-FP8 (INT4 MoE Weight, FP8 Compute): Adjust FP8 per-tensor scaling number for e4m3fnuz (AMD)
@@ -1473,7 +1483,6 @@ class FusedMoE(torch.nn.Module):
                 shard_dim=shard_dim,
                 loaded_weight=loaded_weight,
                 expert_data=expert_data,
-                tp_rank=tp_rank,
             )
             return
 
@@ -1486,7 +1495,6 @@ class FusedMoE(torch.nn.Module):
                 shard_dim=shard_dim,
                 loaded_weight=loaded_weight,
                 expert_data=expert_data,
-                tp_rank=tp_rank,
             )
 
     def weight_loader_fused(
@@ -1496,8 +1504,6 @@ class FusedMoE(torch.nn.Module):
         weight_name: str,
         shard_id: str,
     ) -> None:
-        tp_rank = self.moe_tp_rank
-
         # Mirror _weight_loader_impl: the trtllm bf16 prep reshapes expert weights
         # into block layout; hot weight updates must restore canonical shapes first.
         method = self.quant_method
@@ -1587,7 +1593,6 @@ class FusedMoE(torch.nn.Module):
                 shard_dim=shard_dim,
                 loaded_weight=loaded_weight,
                 expert_data=expert_data,
-                tp_rank=tp_rank,
                 is_bias=is_bias,
             )
             return
@@ -1963,7 +1968,7 @@ class FusedMoE(torch.nn.Module):
         # The driver (or its absence) was decided once at init by probe() --
         # a draft whose format lacks staging GEMMs keeps the CPU baseline.
         return (self.is_gpu_prefill_layer
-                and self._triton_prefill is not None
+                and self._gpu_prefill_driver is not None
                 and hidden_states.size(0) >= self.gpu_prefill_min_tokens)
              
     def _zero_tensor(self, tensor: torch.Tensor):
@@ -2047,9 +2052,30 @@ class FusedMoE(torch.nn.Module):
         # pool = infra MEMBERSHIP (cache OR prefill staging); pool_cache says
         # whether this instance's slots are real (main) or a pure prefill
         # shell with an all-zero snapshot (draft).
-        cfg.pool = self.is_pool_layer or self.is_gpu_prefill_layer
+        # No membership flag on cfg: pool_slots>0 + a cache/prefill half is
+        # the single derivation of pool membership.
         cfg.pool_cache = self.is_pool_layer
+        # Slab sizing: one contiguous pool allocation per weight type.
+        # Members = non-resident layers; the pool tier off means zero rows.
+        cfg.pool_member_layers = 0
+        if is_lk_pool_enabled():
+            # Composite/multimodal configs keep num_hidden_layers on the text
+            # sub-config (Qwen4Exp & co.); reading only the top level yields 0
+            # and silently disables the pool slab, so prefill can never borrow.
+            model_cfg = process_model_config()
+            text_cfg = getattr(model_cfg, "hf_text_config", None)
+            if text_cfg is None:
+                text_cfg = model_cfg.hf_config
+            n_layers = int(getattr(text_cfg, "num_hidden_layers", 0))
+            cfg.pool_member_layers = sum(
+                1 for i in range(n_layers)
+                if not is_lk_moe_gpu_resident_layer(i))
         cfg.prefill_gpu = self.is_gpu_prefill_layer
+        # cutlass engine (pre-408b570) shares the GPU-prefill tier gate but
+        # needs its own StaticGPUMemory arena built in the MOE_V2 ctor; the
+        # triton staging path leaves this False (no arena, uses pool slots).
+        cfg.use_gpu_prefill = (self.is_gpu_prefill_layer
+                               and get_gpu_prefill_engine() == "cutlass")
         cfg.role_draft = self.model_type != "main"
         cfg.pool_decode = self.pool_decode
         cfg.pool_slots = get_pool_slots()
@@ -2075,6 +2101,7 @@ class FusedMoE(torch.nn.Module):
             cfg.swiglu_limit = self.swiglu_limit
         cfg.prefill_min_tokens = self.gpu_prefill_min_tokens
         cfg.prefill_window = self.gpu_prefetch_window
+        cfg.prefill_wave_experts = self.prefill_wave_experts
         cfg.pool_window = get_pool_window()
         cfg.pool_inflight = get_pool_inflight()
         cfg.pool_log = get_pool_log()
@@ -2370,12 +2397,23 @@ class FusedMoE(torch.nn.Module):
     def _init_pool(self):
         if not (self.is_pool_layer or self.is_gpu_prefill_layer):
             return
-        self._triton_prefill = None
+        self._gpu_prefill_driver = None
         if self.is_gpu_prefill_layer:
-            from lk_moe.prefill_staging import StagingPrefill
-            # A GPU-prefill layer that cannot go GPU is a broken boot,
-            # not a CPU layer: probe raises and the boot dies with it.
-            self._triton_prefill = StagingPrefill.probe(self.lk_moe)
+            # Engine selector (LK_GPU_PREFILL_ENGINE, default cutlass): a GPU-
+            # prefill layer that cannot go GPU is a broken boot, not a CPU
+            # layer -- probe failure raises and the boot dies with it.
+            if get_gpu_prefill_engine() == "cutlass":
+                from lk_moe.prefill_cutlass import CutlassPrefill
+                drv = CutlassPrefill.probe(self.lk_moe)
+                if drv is None:
+                    raise RuntimeError(
+                        f"GPU-prefill layer {self.layer_name}: cutlass engine "
+                        f"probe failed (build lacks gpu_prefill or arena not "
+                        f"initialised -- check cfg.use_gpu_prefill)")
+            else:
+                from lk_moe.prefill_staging import StagingPrefill
+                drv = StagingPrefill.probe(self.lk_moe)
+            self._gpu_prefill_driver = drv
         self._pool_layer_info = None
         self.lk_moe.pool_gpu_report(False)
         if self.pool_decode:
@@ -2450,9 +2488,28 @@ class FusedMoE(torch.nn.Module):
 
     def _pool_decode_launch(self, hidden_states, topk_ids, topk_weights,
                          real_tokens=None, rows_per_token=1):
+        global _LK_POOL_PROBE_N
         geo = self._pool_layer_info
+        if (_LK_POOL_SPLIT_PROBE and not get_is_capture_mode()
+                and topk_ids.numel() <= 32):
+            try:
+                ids = topk_ids.flatten().tolist()
+                layer = geo["layer"]
+                claim = [lk_moe.pool_slot(layer, e) for e in ids]
+                ready = [lk_moe.pool_ready_slot(layer, e) for e in ids]
+                snap = [lk_moe.pool_snapshot_slot(layer, e) for e in ids]
+                _LK_POOL_PROBE_N += 1
+                logger.warning(
+                    "[splitprobe] seq=%d L=%d n=%d claim=%d ready=%d snap=%d "
+                    "ids=%s snapslots=%s",
+                    _LK_POOL_PROBE_N, layer, len(ids),
+                    sum(s >= 0 for s in claim), sum(s >= 0 for s in ready),
+                    sum(s >= 0 for s in snap), ids, snap,
+                )
+            except Exception as e:
+                logger.warning("[splitprobe] error %r", e)
         H, I, k = geo["H"], geo["I"], geo["k"]
-        SG, SGB, PK = geo["scale_group"], geo["scale_groups_blk"], geo["packed_k_per_iter"]
+        SG, PK = geo["scale_group"], geo["packed_k_per_iter"]
         SSZ = int(geo.get("scale_size", 1))
         real_tokens = hidden_states.size(0) if real_tokens is None else real_tokens
         n_slots = real_tokens * k
@@ -2475,6 +2532,11 @@ class FusedMoE(torch.nn.Module):
         else:
             gathered_ids, gathered_weights = topk_ids, topk_weights
         side_stream.wait_stream(torch.cuda.current_stream())
+        if _LK_POOL_DET_SPLIT:
+            try:
+                lk_moe.pool_wait_fence(geo["layer"], side_stream.cuda_stream)
+            except Exception:
+                pass
         with torch.cuda.stream(side_stream):
             if rows_per_token > 1:
                 gather_rows[(triton.cdiv(n_slots, 128),)](
@@ -2494,7 +2556,7 @@ class FusedMoE(torch.nn.Module):
                 geo["weight_addr"][1], geo["scale_addr"][1], geo["gateup_gds"],
                 hpart, hidden_states, n_slots, k, rows_per_token,
                 GDS_COLS=2 if geo["has_gate"] else 1,
-                NCOL=I, K_PER_BLOCK=H // PK, SCALE_GROUPS_BLK=H // SGB,
+                NCOL=I, K_PER_BLOCK=H // PK, SCALE_GROUPS_BLK=H // SG,
                 SLOT_BYTES=geo["slot_bytes"][0],
                 SLOT_SCALE_BYTES=geo["slot_scale_bytes"][0],
                 HIDDEN=H, ITERS=geo["ITERS"], SCALE_GROUP=SG,
@@ -2509,7 +2571,7 @@ class FusedMoE(torch.nn.Module):
                 geo["weight_addr"][2], geo["scale_addr"][2], geo["down_gds"],
                 hbuf, gout_part, n_slots,
                 NCOL=H, N_PARTIAL=I, K_PER_BLOCK=I // PK,
-                SCALE_GROUPS_BLK=I // SGB,
+                SCALE_GROUPS_BLK=I // SG,
                 SLOT_BYTES=geo["slot_bytes"][2],
                 SLOT_SCALE_BYTES=geo["slot_scale_bytes"][2],
                 ITERS=geo["ITERS"], SCALE_GROUP=SG,
@@ -2600,7 +2662,7 @@ class FusedMoE(torch.nn.Module):
         return output_gpu
  
     def _gpu_prefill(self, hidden_states, topk_weights, topk_ids):
-        ev, gout = self._triton_prefill.prefill_gpu(
+        ev, gout = self._gpu_prefill_driver.prefill_gpu(
             hidden_states, topk_ids, topk_weights)
         torch.cuda.current_stream().wait_event(ev)
         out = gout.to(hidden_states.dtype)

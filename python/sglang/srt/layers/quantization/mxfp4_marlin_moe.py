@@ -81,12 +81,10 @@ class Mxfp4MarlinMoEMethod:
 
         layer._dsv4_mxfp4_backend = None  # set in process_weights_after_loading
         fp4_block_k = 32
-        # Only the on-GPU path needs tile-aligned buffers, and Marlin repack pads
-        # to tiles by itself anyway.  A CPU-resident layer is handed to lk_moe as
-        # raw pointers plus the exact per-partition strides, so padding the
-        # allocation here would desync the loader (garbage past column 576 at
-        # TP=4) -- keep those buffers unpadded.
-        if not cpu_resident:
+        # lk_moe CPU-resident layers take raw pointers + exact strides: no padding.
+        # Hopper repack pads by itself; keep logical widths there (early 128-pad
+        # turns a TP8 width of 288 into 384).
+        if not cpu_resident and not get_platform().is_sm90:
             intermediate_size_per_partition = round_up(
                 intermediate_size_per_partition, 128
             )

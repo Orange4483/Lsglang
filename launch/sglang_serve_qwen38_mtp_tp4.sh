@@ -25,6 +25,7 @@ OMP_NUM_THREADS=1 \
 LK_THREAD_BINDING=NUMA_NODE \
 LK_GPU_PREFETCH_WINDOW=1 \
 LK_GPU_PREFILL_MIN_TOKENS=1024 \
+LK_GPU_PREFILL_ENGINE=cutlass \
 LK_GPU_PREFILL_SUB_M=32768 \
 LK_NUMA_INTERLEAVE=1 \
 LK_POWER_SAVING=1 \
@@ -32,6 +33,7 @@ LK_GPU_RESIDENT_MOE_LAYERS="" \
 LK_GPU_RESIDENT_MOE_LAYERS_SPEC="" \
 LK_POOL_SLOTS=16 \
 LK_POOL_LOG=0 \
+FLASHINFER_USE_CUDA_NORM=1 \
 FLASHINFER_DISABLE_VERSION_CHECK=1 \
 /home/guqiong/.conda/envs/Lsglang/bin/sglang serve \
   --model ~/Models/Qwen3.8-Flash-Next-NVFP4-W4A16-ATTN-FP8-MTP-NVFP4 \
@@ -45,6 +47,7 @@ FLASHINFER_DISABLE_VERSION_CHECK=1 \
   --disable-custom-all-reduce \
   --ple-offload-embedding \
   --ple-offload-backend pinned \
+  --ple-offload-dir /home/guqiong/Models/.ple_cache/Qwen3.8-Flash-Next-NVFP4-W4A16-ATTN-FP8-MTP-NVFP4 \
   --chunked-prefill-size 1024 \
   --max-total-tokens 262144 \
   --mem-fraction-static 0.80 \

@@ -145,8 +145,6 @@ async def prefill_shapes(disaggregation_mode: str, tokenizer_manager: TokenizerM
         if mid <= 32768:
             sizes.add(mid)
         base *= 2
-    sizes.add(17)   # non-16-multiple: covers triton "other" int specialization class
-    sizes.add(33)   # crosses the 32-token attention-config bucket boundary
     sizes = sorted(sizes)
 
     for size in tqdm.tqdm(sizes, desc="Warmup prefill shapes (up to 32K)"):
@@ -163,11 +161,13 @@ async def prefill_shapes(disaggregation_mode: str, tokenizer_manager: TokenizerM
 
         await tokenizer_manager.generate_request(generate_req_input, None).__anext__()
 
-    # Concurrent-prefill arm: two requests in flight at once is the ONLY
+    # Concurrent-prefill arm: two requests in flight at once is the only
     # path that touches the bs>1 extend alloc, the QSA mixed-batch layout
-    # and the multi-layer conv window scatter kernels. First concurrent
-    # request used to JIT-load them mid-serving with TP ranks module-loading
-    # at unequal times — NCCL then turns the stagger into a lockstep deadlock.
+    # and the multi-layer conv window scatter kernels. Left cold, the
+    # first concurrent request JIT-loads them mid-serving; TP ranks reach
+    # module loading at unequal times and NCCL turns that stagger into a
+    # lockstep deadlock. Cover them here so the cost is boot time, not a
+    # hang in the first batched request.
     pair_a = GenerateReqInput(
         input_ids=(np.random.randint(2**16, size=[300])).tolist(),
         sampling_params={"max_new_tokens": 16, "temperature": 0.0},
@@ -182,19 +182,15 @@ async def prefill_shapes(disaggregation_mode: str, tokenizer_manager: TokenizerM
             tokenizer_manager.generate_request(pair_b, None).__anext__(),
         )
 
-    # NOTE(bs2-warmup): batched bs=2 warmup once tripped a device-side assert
-    # in the hybrid-linear child backend (case file predates this tree). The
-    # bs=2 arm of the extend/alloc/QSA kernels otherwise JIT-loads during the
-    # first concurrent request, where TP ranks module-load at unequal times
-    # and NCCL turns the stagger into a lockstep deadlock. Re-enabled; if the
-    # assert is still alive it surfaces here at startup, not mid-serving.
-
-    for size in (65, 2049):
-        generate_req_input = GenerateReqInput(
-            input_ids=(np.random.randint(2**16, size=[size])).tolist(),
-            sampling_params={
-                "max_new_tokens": 8,
-                "temperature": 0.0,
-            },
+        # Single-request decode arm. max_new_tokens=1 requests above stop after
+        # the prefill forward, so the bs=1 decode step never runs and the
+        # alloc_decode Triton kernel (keyed on next_power_of_2(bs)) stays cold:
+        # the first real decode then JIT-compiles it mid-serving and can hang
+        # in _init_handles (seen on GLM-5.3/3090). Drain a 2-token generation
+        # so one bs=1 decode step is paid here.
+        single = GenerateReqInput(
+            input_ids=(np.random.randint(2**16, size=[64])).tolist(),
+            sampling_params={"max_new_tokens": 2, "temperature": 0.0},
         )
-        await tokenizer_manager.generate_request(generate_req_input, None).__anext__()
+        async for _ in tokenizer_manager.generate_request(single, None):
+            pass

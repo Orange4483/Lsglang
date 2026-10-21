@@ -77,6 +77,26 @@ def park_lk_moe_expert_pool():
         resume()
 
 
+def wait_lk_moe_pool_fences(stream_ptr: int) -> None:
+    """Attach the expert-pool copy fences to ``stream_ptr`` (pre-replay).
+
+    With the deterministic split on, ``publish_snapshot`` publishes CLAIMED
+    slots as soon as the pump's batch fence event is recorded, while the
+    copies may still be in flight on the pump stream.  A graph replay that
+    reads those slots must therefore stream-wait on the recorded fence
+    first; ``pool_wait_all_fences`` does exactly nothing unless det_split
+    is active.  Old lk_moe builds without the hook simply keep the
+    pre-feature behavior.
+    """
+    if not is_lk_pool_enabled():
+        return
+    import lk_moe
+
+    wait = getattr(lk_moe, "pool_wait_all_fences", None)
+    if wait is not None:
+        wait(stream_ptr)
+
+
 def is_lk_moe_feature_enabled() -> bool:
     return get_bool_env_var("LK_MOE_HYBRID_ENABLED")
 
@@ -145,9 +165,19 @@ def is_lk_prefill_debug() -> bool:
     return get_bool_env_var("LK_PP_DEBUG")
 
 def get_gpu_prefetch_window() -> int:
-    # Dual-semantics perf knob: 1 (default) = serialized halves; 2 = ping-pong
-    # rings (copy overlaps gemm) - only worth it with fast PCIe.
+    # Triton staging-ring depth (NOT a cross-layer prefetch: staging always
+    # starts after this layer's topk). 1 (default) = one block, copy/gemm
+    # serialize; 2 = two blocks, the next stage's H2D can overlap the previous
+    # layer's gemm - only worth it with fast PCIe. Ignored by cutlass.
     return get_int_env_var("LK_GPU_PREFETCH_WINDOW", 1)
+
+
+def get_prefill_wave_experts() -> int:
+    # CUTLASS wave width: -1 (default) = auto -- the largest W whose deq
+    # blocks plus whole tail staging layers still fit the borrow slab,
+    # clamped to E (adaptive for E=256/384/512); 0 = single-shot gemm; >0 =
+    # explicit cap. Waves run inside each SUB_M pass. Ignored by triton.
+    return get_int_env_var("LK_GPU_PREFILL_WAVE_EXPERTS", -1)
 
 
 def get_model_type_from_layer_name(layer_name: str) -> str:

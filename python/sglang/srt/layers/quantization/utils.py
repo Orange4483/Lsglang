@@ -44,10 +44,6 @@ def get_scalar_types():
 
 ScalarType, scalar_types = get_scalar_types()
 
-def normalize_prefix(prefix: str) -> str:
-    if prefix.startswith("model."):
-        prefix = prefix[6:]
-    return prefix
 
 def _module_path_match(ignored: str, prefix: str) -> bool:
     # Match on dotted module-path boundaries so that `mlp.gate` does NOT
@@ -76,7 +72,6 @@ def is_layer_skipped(
     ignored_layers: List[str],
     fused_mapping: Mapping[str, List[str]] = MappingProxyType({}),
 ) -> bool:
-    prefix = normalize_prefix(prefix)
     # prefix: model.layers.0.self_attn.q_proj
     # proj_name: q_proj
     proj_name = prefix.split(".")[-1]
@@ -625,20 +620,10 @@ def reorder_w1w3_to_w3w1(
     w1, w3 = weight.split(half, dim=dim)
     s1, s3 = scale.split(half, dim=dim)
 
-    # torch.cat has no CUDA kernel for the scale-only Float8_e8m0fnu dtype.
-    # UE8M0 is a pure-exponent format (no mantissa), so a fp32 round-trip is
-    # bit-exact; use it only for the scale cat, keeping the fp8 weight cat
-    # (Float8_e4m3fn) as-is.
-    if scale.dtype == torch.float8_e8m0fnu:
-        s1 = s1.to(torch.float32)
-        s3 = s3.to(torch.float32)
-        new_scale = (
-            torch.cat([s3, s1], dim=dim).contiguous().to(torch.float8_e8m0fnu)
-        )
-    else:
-        new_scale = torch.cat([s3, s1], dim=dim).contiguous()
-
-    return torch.cat([w3, w1], dim=dim).contiguous(), new_scale
+    return (
+        torch.cat([w3, w1], dim=dim).contiguous(),
+        torch.cat([s3, s1], dim=dim).contiguous(),
+    )
 
 
 def prepare_static_weights_for_trtllm_fp4_moe(

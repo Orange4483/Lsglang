@@ -41,7 +41,7 @@ def get_config_file_name(
     per_channel_quant: bool = False,
     down_moe: bool = False,
 ) -> str:
-    device_name = get_device_name(torch.cuda.current_device()).replace(" ", "_")
+    device_name = get_device_name().replace(" ", "_")
     dtype_selector = "" if not dtype else f",dtype={dtype}"
     block_shape_selector = (
         "" if not block_shape or not all(block_shape) else f",block_shape={block_shape}"

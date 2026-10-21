@@ -145,7 +145,7 @@ class CustomAllReduceV2:
         if max_pull_size is None:
             max_pull_size = min(base_config.max_pull_bytes, max_size)
         if max_push_size is None:
-            max_push_size = min(base_config.max_push_bytes, max_size)
+            max_push_size = min(base_config.max_push_bytes(self.world_size), max_size)
         if _FORCE_PULL_SIZE_KB is not None:
             max_pull_size = int(_FORCE_PULL_SIZE_KB) * 1024
         if _FORCE_PUSH_SIZE_KB is not None:
@@ -185,7 +185,9 @@ class CustomAllReduceV2:
         if max_push_blocks is not None:
             num_push_blocks = max(max_push_blocks, 1)
         self.config = base_config.clip(
-            max_push_bytes=self.max_push_size, max_pull_bytes=self.max_pull_size
+            max_push_bytes=self.max_push_size,
+            max_pull_bytes=self.max_pull_size,
+            world_size=self.world_size,
         )._replace(num_pull_blocks=num_pull_blocks, num_push_blocks=num_push_blocks)
         self.override_algo: Optional[AllReduceAlgo] = None
         # On a multi-node (MNNVL) group the symm-mem workspace plane works
@@ -212,6 +214,18 @@ class CustomAllReduceV2:
         self._graph_inputs: List[Tuple[int, int]] = []  # (data_ptr, nbytes)
         self._graph_counter = 0
         self._graph_mode_allowed = False
+        # Deadlock fix (verified): on a weak-P2P link (PCIe TP2, e.g. 2x3090) a
+        # captured push all-reduce bakes a peer-spin kernel into the decode graph
+        # that wedges cudaGraphLaunch under overlap. Route graph-captured
+        # all-reduce to the barrier-based pull path instead (monotonic, skew-safe,
+        # not a throughput loss). Full-NVLink groups keep the push path.
+        full_nvlink = can_use_custom_all_reduce_with_nvlink(
+            group=self.group,
+            device=self.device,
+            supported_world_size=list(get_supported_world_sizes()),
+            cls_name="CustomAllReduceV2",
+        )
+        self._graph_prefer_pull = self.pull_enabled and (full_nvlink is not True)
         self.disabled = False
 
     def _init_workspace(self) -> None:
@@ -336,8 +350,21 @@ class CustomAllReduceV2:
         # TODO: refactor this along with the config file
         heuristic = self.config.graph if can_use_graph else self.config.eager
         can_use_multicast = self.config.num_mc_blocks is not None
+        if can_use_graph and self._graph_prefer_pull:
+            # Launch-safe graph path (see __init__): prefer the barrier-based
+            # pull algos over the push peer-spin so cudaGraphLaunch never
+            # queues behind a peer-spin node under overlap on weak-P2P.
+            if nbytes <= heuristic.one_shot_pull_threshold:
+                return AllReduceConfig(AllReduceAlgo.ONE_SHOT_PULL, use_graph=True)
+            if can_use_multicast and heuristic.mc.contains(nbytes):
+                return AllReduceConfig(AllReduceAlgo.TWO_SHOT_PULL, use_multicast=True)
+            if nbytes <= heuristic.two_shot_pull_threshold:
+                return AllReduceConfig(AllReduceAlgo.TWO_SHOT_PULL, use_graph=True)
+            return None
         if nbytes <= heuristic.one_shot_push_threshold:
             return AllReduceConfig(AllReduceAlgo.ONE_SHOT_PUSH)
+        if nbytes <= heuristic.two_shot_push_threshold:
+            return AllReduceConfig(AllReduceAlgo.TWO_SHOT_PUSH)
         if nbytes <= heuristic.one_shot_pull_threshold:
             return AllReduceConfig(AllReduceAlgo.ONE_SHOT_PULL, use_graph=can_use_graph)
         if can_use_multicast and heuristic.mc.contains(nbytes):

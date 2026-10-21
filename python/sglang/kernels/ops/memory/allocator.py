@@ -102,6 +102,35 @@ def get_and_clear_swa_pages(
     return swa_pages, peers_mapped, page_mappings_valid
 
 
+def prewarm_get_and_clear_swa_pages(
+    mapping: torch.Tensor,
+    page_size: int,
+    *,
+    reps_dtype: torch.dtype = torch.int32,
+) -> None:
+    """Compile and load the SWA page-release kernel at boot.
+
+    ``get_and_clear_swa_pages`` is first reached from the scheduler's
+    request-release path -- outside shape warmup and outside any CUDA graph.
+    A cold ``cuModuleLoadData`` there runs inside the event loop; on the
+    610.57 open-module driver it can block on a GSP RPC while the peer rank is
+    still inside a collective, wedging both ranks. Warm it against scratch
+    tensors while the device is idle. ``mapping`` only supplies device/dtype;
+    the real mapping is never touched.
+    """
+    if mapping.device.type != "cuda" or page_size <= 0:
+        return
+    scratch = torch.zeros(page_size * 2, dtype=mapping.dtype, device=mapping.device)
+    # Production passes ``free_index[::page_size]``: a one-element view with
+    # stride == page_size. Triton bakes that stride in as ``index_stride``, so
+    # a contiguous dummy would compile a *different* kernel and the release
+    # path would still pay the cold cuModuleLoadData. Reproduce the stride.
+    reps = torch.zeros(page_size, dtype=reps_dtype, device=mapping.device)
+    reps = reps[::page_size]
+    get_and_clear_swa_pages(reps, scratch, page_size, check_page_mappings=False)
+    torch.cuda.synchronize()
+
+
 # free_page_ptr aliases self.free_pages, which the paged allocator re-slices
 # after every allocation (self.free_pages = self.free_pages[num_new_pages:]).
 # Slicing only advances data_ptr() by num_new_pages * 8 bytes, so the pointer

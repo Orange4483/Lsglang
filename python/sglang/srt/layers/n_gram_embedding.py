@@ -29,10 +29,6 @@ class NgramEmbedding(torch.nn.Module):
         self.over_embedding_n = over_embedding_n
         self.eos_token_id = eos_token_id
 
-        self.oe_hidden_dim = embedding_dim // (
-            (over_embedding_n - 1) * over_embedding_k
-        )
-
         use_attn_tp_group = is_dp_attention_enabled()
         self.word_embeder = VocabParallelEmbedding(
             num_embeddings,

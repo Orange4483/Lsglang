@@ -16,6 +16,12 @@ case of lk_moe into sglang.
 
 Note 1: x86 CPUs with AVX2+ instruction sets and Nvidia GPUs with sm80+ architectures.
 
+Note 2: **The first launch is slow because of JIT compilation.** Expect heavy compilation
+during startup — you can see `cicc`, `cc1plus`, `ptxas` (and `nvcc`) processes in `top`.
+The second launch reuses the JIT cache and starts much faster. Some models also JIT extra
+kernel variants on their first request; this is the same behavior and those variants are
+cached for subsequent runs as well.
+
 ---
 
 ## Layer compute modes
@@ -145,7 +151,9 @@ LK_MOE_HYBRID_ENABLED=1                     master
  ├─ pool on            LK_POOL_SLOTS (e.g. 64)      (dual knob: value itself is the switch, 0 = off)
  │   └─ pool decode    LK_POOL_DECODE=1     (unset = follows pool on; explicit `1`/`0` wins)
  ├─ GPU prefill on     LK_GPU_PREFILL_MIN_TOKENS (e.g. 1024)   (dual knob, same rule)
- │   └─ super mix      LK_GPU_PREFILL_SUB_M>0        (super-chunk staging on; 0 = per-chunk staging)
+ │   ├─ engine         LK_GPU_PREFILL_ENGINE=cutlass|triton (default cutlass)
+ │   ├─ wave           LK_GPU_PREFILL_WAVE_EXPERTS (cutlass only; -1 auto / 0 single-shot / >0 cap)
+ │   └─ super mix      LK_GPU_PREFILL_SUB_M (e.g. 16384)  (>0 super-chunk staging; 0 = per-chunk)
  ├─ nvme filler on    LK_NVME_DIRECT=1          (needs the feature's own backend flag: --ple-offload-backend nvme / engram host table;
  └─ resident layers   LK_GPU_RESIDENT_MOE_LAYERS*   (complementary: a resident layer never pools)
 LK_MOE_HYBRID_ENABLED=0  →  every branch above unreachable = original sglang
@@ -157,7 +165,6 @@ LK_MOE_HYBRID_ENABLED=0  →  every branch above unreachable = original sglang
 | Env var | Type | Default | Description |
 |--------|------|--------|------|
 | `LK_MOE_HYBRID_ENABLED` | core | `0` | **master switch**: `1`-on, `0`-off (= stock sglang, all `LK_*` inert) |
-| `LK_MOE_LAYERWISE_LOAD` | load | 0 | `1`: load MoE layers one by one to cut peak load-time VRAM |
 
 ### CPU / NUMA / power
 
@@ -185,8 +192,10 @@ LK_MOE_HYBRID_ENABLED=0  →  every branch above unreachable = original sglang
 | Env var | Type | Default | Description |
 |--------|------|--------|------|
 | `LK_GPU_PREFILL_MIN_TOKENS` | prefill | 0 = off | **tier switch AND batch gate**: the value itself switches (e.g. 1024 turns the tier on; `0` = pure CPU prefill) = minimum token batch for the GPU path; not enabled by default (0 on 16 GB cards) |
-| `LK_GPU_PREFILL_SUB_M` | prefill | 0 | super-mix staging: value itself switches (e.g. 16384 enables super-chunk staging; `0` = per-chunk staging, inert when the tier is off) |
-| `LK_GPU_PREFETCH_WINDOW` | prefill | `1` | staging-ring blocks in flight; `1` = serialized (default); `2` = ping-pong (copy overlaps gemm, needs fast PCIe to pay off) |
+| `LK_GPU_PREFILL_ENGINE` | prefill | `cutlass` | engine selector (does not power the tier): `cutlass` = restored C++ grouped-GEMM, or `triton` = staging ring + Triton group-GEMM; forwarded via cfg, the C++ library itself does not read this env |
+| `LK_GPU_PREFILL_WAVE_EXPERTS` | prefill | `-1` auto | CUTLASS wave width only (triton ignores it), applied inside each `SUB_M` pass: `-1` = largest wave that fits the borrow slab (clamped to E), `0` = single-shot, `>0` = explicit cap; waves are bit-exact with single-shot |
+| `LK_GPU_PREFILL_SUB_M` | prefill | 0 | super-mix staging size (tokens); only meaningful while the tier is on (`LK_GPU_PREFILL_MIN_TOKENS > 0`): `>0` enables super-chunk staging (e.g. 16384), `0` = per-chunk staging |
+| `LK_GPU_PREFETCH_WINDOW` | prefill | `1` | staging-ring blocks in flight (triton only; cutlass ignores it); `1` = serialized (default); `2` = ping-pong (copy overlaps gemm, needs fast PCIe to pay off) |
 | `LK_GPU_RESERVE_GB` | prefill | 0 | GB of KV budget reserved for lk_moe device-side staging |
 
 ### GPU Pool (expert cache)
@@ -197,7 +206,7 @@ LK_MOE_HYBRID_ENABLED=0  →  every branch above unreachable = original sglang
 | `LK_POOL_DECODE` | pool | follow pool | decode GPU half: pool-resident experts go to the GPU resident-gemv half. `1` on / `0` off explicitly; unset follows `LK_POOL_SLOTS` > 0 |
 | `LK_POOL_WINDOW` | pool | 32 | Expected-reuse window in steps: an evicted expert is pumped back only if it is seen again within the window; illegal values clamp to min `8`, never disables |
 | `LK_POOL_INFLIGHT` | pool | `16` | in-flight DMA jobs / event-ring depth (backpressure cap = 8x; lower values false-positive under small batches) |
-| `LK_POOL_LAYERS` | pool | -- | RETIRED: pool membership is global (`LK_POOL_SLOTS` > 0); per-layer mixing with GPU prefill is not supported |
+| `LK_POOL_LAYERS` | pool | -- | RETIRED: pool membership is global (`LK_POOL_SLOTS` > 0); the parser is dead code and per-layer mixing with GPU prefill is not supported |
 | `LK_POOL_STAGE` | pool | 1 | coalesced H2D staging ring (read by lk_moe) |
 | `LK_POOL_LOG` | pool | 0 | windowed `[pool]` stats line every N decode steps (0 = silent) |
 
@@ -224,13 +233,13 @@ LK_MOE_HYBRID_ENABLED=0  →  every branch above unreachable = original sglang
 | Env var | Area | Description |
 |--------|------|------|
 | `LK_ROUTE_PROBE` | routing | per-step `[RP]` routing traces for offline calibration (requires the pool on) |
+| `LK_POOL_DET_SPLIT` | pool | deterministic split: publish the claimed batch and make the GPU half stream-wait on that batch's copy fence before reading slots; inert without the pool |
+| `LK_POOL_SPLIT_PROBE` | pool | log the frozen split (claim/ready/snapshot counts) per pool layer for batches of ≤32 routed ids; skipped inside CUDA-graph capture |
 | `LK_SPEC_PROBE` | spec | CUDA-event timed draft/verify stages |
 | `LK_PLE_PROBE` | ple | PLE ngram-row temporal locality + traffic probe (`LK_PLE_PROBE_DUMP=<path>` dumps rows) |
 | `LK_PP_DEBUG` | prefill | extra tracing inside the prefill staging tier |
-| `LK_POOL_VERIFY` | pool | pump byte-check 1-in-N (read by lk_moe) |
 | `LK_DECODE_TS` / `LK_TS_SKIPGEMM` | host decode | decode-path timestamp trace / skip-the-gemm A/B (read by lk_moe) |
 | `LK_MBOX_STOPFILE` | mbox | stop-file for orderly teardown (read by lk_moe) |
-| `LK_STAGING_M_TILE` | staging | internal | prefill staging M-tile (lk_moe python, default 32) |
 | `LK_DISABLE_QSA_SHARE` | draft | draft worker: disable QSA share (A/B isolation only) |
 | `SGLANG_RS_DEBUG` | upstream | rejection-sampling traces; upstream sglang knob, kept as-is |
 
@@ -283,25 +292,26 @@ Models:
 
 Legend: ✅ tested · `ok` supported, not yet tested · blank = to be filled.
 
-| Model | sm80 | sm86 | sm89 | sm90 | sm100 | sm120+ | Launch |
-|-------|:----:|:----:|:----:|:----:|:-----:|:------:|--------|
-| [Qwen3.8-Flash-Next](https://huggingface.co/lovedheart/Qwen3.8-Flash-Next-NVFP4-W4A16-ATTN-FP8-MTP-NVFP4) | ok | ✅ | ok | ok | ok | ✅ | [launch](launch/sglang_serve_qwen38_tp2_3090.sh)  |
-| [DeepSeek-V4.1-Flash](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash) | ok | ✅ | ok | ok | ok | ✅ | [launch](launch/sglang_serve_dsv41_tp2_3090.sh) · |
-| [DeepSeek-V4-Flash-0731](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-0731) | ok | ✅ | ok | ok | ok | ✅ | [launch](launch/sglang_serve_0731_tp2_3090.sh) |
-| [GLM-5.3-Flash-NVFP4](https://huggingface.co/nvidia/GLM-5.3-Flash-NVFP4) | ok | ✅ | ok | ok | ok | ✅ | [launch](launch/sglang_serve_glm53_tp2_3090.sh) |
-| [Qwen3.6-35B-A3B](https://huggingface.co/nvidia/Qwen3.6-35B-A3B-NVFP4) | ok | ✅ | ok | ok | ok | ✅ | [launch](launch/sglang_serve_qwen36_tp2_3090.sh) |
-| Qwen3-Coder-Next / 30B-A3B | | | | | | | |
-| gemma-4-26B-A4B-it | | | | | | | |
-| NVIDIA-Nemotron-3-Super-120B-A12B-BF16 | | | | | | | |
-| Qwen3.5-35B-A3B | | | | | | | |
-| Qwen3.5-122B-A10B | | | | | | | |
-| Qwen3.5-397B-A17B | | | | | | | |
-| Qwen3-VL-30B | | | | | | | |
-| MiniMax-M2.7 / 2.5 / 2.1 | | | | | | | |
-| GLM-5.2-NVFP4 | | | | | | | |
-| GLM-5.1 / 5.0-FP8 | | | | | | | |
-| GLM-4.7(-Flash) / 4.6V | | | | | | | |
-| Kimi k2.6 / k2.5 | | | | | | | |
+| Model | sm80 | sm86 | sm89 | sm90 | sm100 | sm120+ | Launch | NVMe |
+|-------|:----:|:----:|:----:|:----:|:-----:|:------:|--------|------|
+| [Qwen3.8-Flash-Next](https://huggingface.co/lovedheart/Qwen3.8-Flash-Next-NVFP4-W4A16-ATTN-FP8-MTP-NVFP4) | ok | ✅ | ok | ok | ok | ✅ | [launch](launch/sglang_serve_qwen38_tp2_3090.sh)  | [PLE ON NVME](launch/sglang_serve_qwen38_mtp_tp4_nvme.sh) |
+| [DeepSeek-V4.1-Flash](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash) | ok | ✅ | ok | ok | ok | ✅ | [launch](launch/sglang_serve_dsv41_tp2_3090.sh) · | [ENGRAM ON NVME](launch/sglang_serve_dsv41_tp2_3090_nvme.sh) |
+| [DeepSeek-V4.1-Flash-1017](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017) | ok | ✅ | ok | ok | ok | ✅ | [launch](launch/sglang_serve_dsv41_tp2_3090.sh) | [ENGRAM ON NVME](launch/sglang_serve_dsv41_tp2_3090_nvme.sh) |
+| [DeepSeek-V4-Flash-0731](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-0731) | ok | ✅ | ok | ok | ok | ✅ | [launch](launch/sglang_serve_0731_tp2_3090.sh) | — |
+| [GLM-5.3-Flash-NVFP4](https://huggingface.co/nvidia/GLM-5.3-Flash-NVFP4) | ok | ✅ | ok | ok | ok | ✅ | [launch](launch/sglang_serve_glm53_tp2_3090.sh) | — |
+| [Qwen3.6-35B-A3B](https://huggingface.co/nvidia/Qwen3.6-35B-A3B-NVFP4) | ok | ✅ | ok | ok | ok | ✅ | [launch](launch/sglang_serve_qwen36_tp2_3090.sh) | — |
+| Qwen3-Coder-Next / 30B-A3B | | | | | | | | |
+| gemma-4-26B-A4B-it | | | | | | | | |
+| NVIDIA-Nemotron-3-Super-120B-A12B-BF16 | | | | | | | | |
+| Qwen3.5-35B-A3B | | | | | | | | |
+| Qwen3.5-122B-A10B | | | | | | | | |
+| Qwen3.5-397B-A17B | | | | | | | | |
+| Qwen3-VL-30B | | | | | | | | |
+| MiniMax-M2.7 / 2.5 / 2.1 | | | | | | | | |
+| GLM-5.2-NVFP4 | | | | | | | | |
+| GLM-5.1 / 5.0-FP8 | | | | | | | | |
+| GLM-4.7(-Flash) / 4.6V | | | | | | | | |
+| Kimi k2.6 / k2.5 | | | | | | | | |
 
 Quant formats:
 

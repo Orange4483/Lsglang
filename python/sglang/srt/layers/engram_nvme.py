@@ -35,7 +35,6 @@ from sglang.kernels.ops.quantization.fp8_emulate import (
 )
 from sglang.srt.utils import logger
 from sglang.srt.utils.common import lk_nvme_cache_bytes, lk_nvme_direct, is_lk_engram_nvme_enabled
-from sglang.srt.environ import envs
 
 # e8m0 has no zero: the exponent byte 0 encodes 2**-127.
 _E8M0_ZERO = 2.0**-127
@@ -246,11 +245,17 @@ class NvmeEngramStore:
             "Captured NVMe Engram storage is owned by the worker until exit"
         )
 
-    def finish_load(self):
+    def finish_load(self, label: str = ""):
+        # ``checkpoint_table`` already parsed the safetensors header for the
+        # weight/scale pair, so an empty tally means the loader skipped the
+        # tensors (storage-backed, RAM-zero). Anything else must have loaded
+        # and been shape-checked, but must not be partial.
+        if self._loaded == set():
+            return
         if self._loaded != {"weight", "scale"}:
             raise ValueError(
-            "NVMe Engram checkpoint did not load both weight and scale"
-        )
+                "NVMe Engram checkpoint did not load both weight and scale"
+            )
 
     def stats(self):
         import lk_moe
