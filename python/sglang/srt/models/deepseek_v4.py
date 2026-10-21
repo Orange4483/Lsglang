@@ -295,9 +295,14 @@ def _super_chunk_hc_bounds(forward_batch, rows: int):
     if forward_batch is None or get_is_capture_mode():
         return None
     from sglang.srt.layers.attention.super_chunk_backend import (
+        super_chunk_in_late_tail,
         super_chunk_token_plan,
     )
 
+    if super_chunk_in_late_tail(forward_batch):
+        # Decoder SWA bounded replay late layers: rows are the tail gather,
+        # not the plan's full extend (expected, not a fallback).
+        return None
     plan = super_chunk_token_plan(forward_batch)
     if plan is None or len(plan) < 2 or plan[-1][1] != rows:
         if rows > 1024 and not getattr(_super_chunk_hc_bounds, "_dbg", False):
@@ -334,9 +339,13 @@ def _super_chunk_attn_plan(forward_batch, rows: int, x_quant=None):
     if is_in_breakable_cuda_graph():
         return None
     from sglang.srt.layers.attention.super_chunk_backend import (
+        super_chunk_in_late_tail,
         super_chunk_token_plan,
     )
 
+    if super_chunk_in_late_tail(forward_batch):
+        # Decoder SWA bounded replay late layers (see _super_chunk_hc_bounds).
+        return None
     plan = super_chunk_token_plan(forward_batch)
     if plan is None or len(plan) < 2 or plan[-1][1] != rows:
         if rows > 1024 and not getattr(_super_chunk_attn_plan, "_dbg", False):
@@ -4125,6 +4134,21 @@ class DeepseekV4Model(nn.Module):
         cp_extend = (
             is_cp_active(forward_batch) and forward_batch.forward_mode.is_extend()
         )
+        # The vision select below needs the pre-engram rows. A text prompt in a
+        # vision-capable model has no image token, so skip both the select and
+        # the second CAP-wide buffer (checked once per eager extend forward).
+        vision_engram_select = (
+            self.config.model_type == "deepseek_v41" and self.config.vision_n_layers > 0
+        )
+        engram_has_images = None
+        if (
+            vision_engram_select
+            and forward_batch.forward_mode.is_extend()
+            and not get_is_capture_mode()
+        ):
+            engram_has_images = bool(
+                (input_ids == self.config.image_token_id).any().item()
+            )
         if self.engram_hasher is not None:
             if cp_extend:
                 # n-gram hashing needs each token's predecessors: hash the whole prompt
@@ -4247,17 +4271,18 @@ class DeepseekV4Model(nn.Module):
                     )
             engram = self.layers[i].engram
             if engram is not None:
-                before_engram = state.residual
+                needs_vision_select = (
+                    vision_engram_select and engram_has_images is not False
+                )
+                before_engram = state.residual if needs_vision_select else None
                 hidden_states = engram(
                     state.residual,
                     hash_ids[:, engram.layer_hash_index],
                     forward_batch,
                     cp_all_tokens=cp_extend,
+                    inplace=not needs_vision_select,
                 )
-                if (
-                    self.config.model_type == "deepseek_v41"
-                    and self.config.vision_n_layers > 0
-                ):
+                if needs_vision_select:
                     hidden_states = torch.where(
                         (input_ids == self.config.image_token_id)[:, None, None],
                         before_engram,
@@ -4628,9 +4653,54 @@ class DeepseekV4Model(nn.Module):
 
         pre_hc_head = hidden_states.flatten(1)
 
+        from sglang.srt.layers.attention.super_chunk_backend import (
+            super_chunk_in_late_tail,
+            super_chunk_token_plan,
+        )
+
+        plan = None
+        if not super_chunk_in_late_tail(forward_batch):
+            plan = super_chunk_token_plan(forward_batch)
+        if plan is not None and (len(plan) < 2 or plan[-1][1] != pre_hc_head.shape[0]):
+            plan = None
         if self.hc_pre_from_prev_sublayer:
             from sglang.kernels.ops.layernorm.mhc import hc_combine
 
+        if plan is not None:
+            # Super-chunk: the head combine is row-local, so loop it. The
+            # monolithic pre_hc_head.float() is [CAP, hc_mult*H] fp32 (1.25 GiB
+            # at CAP=16K); per-segment it is one 1024-row slice.
+            out = torch.empty(
+                (pre_hc_head.shape[0], pre_hc_head.shape[1] // self.hc_mult),
+                dtype=hidden_states.dtype,
+                device=hidden_states.device,
+            )
+            for lo, hi, _child_fb in plan:
+                if self.hc_pre_from_prev_sublayer:
+                    hc_combine(
+                        pre_hc_head[lo:hi].float(),
+                        last_pre[lo:hi],
+                        self.hc_mult,
+                        hidden_states.dtype,
+                        out=out[lo:hi],
+                    )
+                else:
+                    out[lo:hi] = self.hc_head(
+                        hidden_states[lo:hi],
+                        self.hc_head_fn,
+                        self.hc_head_scale,
+                        self.hc_head_base,
+                    )
+            hidden_states = out
+            if not getattr(self, "_hc_head_sc_logged", False):
+                self._hc_head_sc_logged = True
+                logger.info(
+                    "[sc-dbg] hc-head LOOP active plan=%d rows=%d chunk_max=%d",
+                    len(plan),
+                    pre_hc_head.shape[0],
+                    max(hi - lo for lo, hi, _ in plan),
+                )
+        elif self.hc_pre_from_prev_sublayer:
             hidden_states = hc_combine(
                 pre_hc_head.float(), last_pre, self.hc_mult, hidden_states.dtype
             )

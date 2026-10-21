@@ -1197,8 +1197,62 @@ class Engram(nn.Module):
         forward_batch: Optional[ForwardBatch] = None,
         *,
         cp_all_tokens: bool = False,
+        inplace: bool = False,
     ) -> torch.Tensor:
         """x [T, hc_mult, dim]; hash_ids [T, n_hash_cols] for this layer."""
+        # Super-chunk: the lookup/wkv/gate are row-local, so run them per
+        # sub-chunk. Without this the hc-shaped x [T, hc_mult, dim] and the
+        # wkv key/value [T, (hc_mult+1)*dim] stay CAP-wide (640 MiB + 800 MiB
+        # at CAP=16K) even though attention/shared already loop at 1024.
+        # CP all-gathers the whole local row range, so it keeps one pass.
+        plan = None
+        if not cp_all_tokens:
+            from sglang.srt.layers.attention.super_chunk_backend import (
+                super_chunk_token_plan,
+            )
+
+            plan = super_chunk_token_plan(forward_batch)
+            if plan is not None and (len(plan) < 2 or plan[-1][1] != x.shape[0]):
+                plan = None
+        if plan is None:
+            return self._forward_rows(
+                x, hash_ids, forward_batch, cp_all_tokens=cp_all_tokens
+            )
+        if not getattr(self, "_super_chunk_logged", False):
+            self._super_chunk_logged = True
+            logger.info(
+                "[sc-dbg] engram LOOP active plan=%d rows=%d chunk_max=%d",
+                len(plan),
+                x.shape[0],
+                max(hi - lo for lo, hi, _ in plan),
+            )
+        if inplace:
+            # The caller replaces its residual with the return value and does
+            # not need the pre-engram rows, so write the gated segment back
+            # (peak = x + one chunk, never a second CAP-wide buffer).
+            for lo, hi, _child_fb in plan:
+                tok = slice(lo, hi)
+                x[tok].copy_(self._forward_rows(x[tok], hash_ids[tok], forward_batch))
+            return x
+        out = None
+        for lo, hi, _child_fb in plan:
+            tok = slice(lo, hi)
+            seg = self._forward_rows(x[tok], hash_ids[tok], forward_batch)
+            if out is None:
+                out = torch.empty(
+                    (x.shape[0], *seg.shape[1:]), dtype=seg.dtype, device=seg.device
+                )
+            out[tok] = seg
+        return out
+
+    def _forward_rows(
+        self,
+        x: torch.Tensor,
+        hash_ids: torch.Tensor,
+        forward_batch: Optional[ForwardBatch] = None,
+        *,
+        cp_all_tokens: bool = False,
+    ) -> torch.Tensor:
         # The lookup runs first even for an idle DP-attention batch: under DP
         # attention it is a collective every rank has to join.
         emb = self.embed(hash_ids, forward_batch, cp_all_tokens=cp_all_tokens)

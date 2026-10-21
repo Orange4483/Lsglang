@@ -565,10 +565,15 @@ class Fp8LinearMethod(LinearMethodBase):
             and self.quant_config.weight_block_size[1] == 32
             and get_bool_env_var("SGLANG_SM8X_MARLIN_GROUP32", default="true")
         )
-        # Marlin is a decode-shape kernel; large-M (prefill) calls stay on the
-        # Triton block-fp8 GEMM, which reads the plain weight kept on layer.
-        self.marlin_group32_max_m = get_int_env_var(
-            "SGLANG_SM8X_MARLIN_GROUP32_MAX_M", 16
+        self.marlin_group32_only = self.use_marlin_group32 and get_bool_env_var(
+            "SGLANG_SM8X_MARLIN_GROUP32_ONLY", default="false"
+        )
+        # ONLY mode sends every M (including prefill) through Marlin, so the
+        # plain block-fp8 weight is no longer needed on GPU after the repack.
+        self.marlin_group32_max_m = (
+            1 << 30
+            if self.marlin_group32_only
+            else get_int_env_var("SGLANG_SM8X_MARLIN_GROUP32_MAX_M", 16)
         )
 
         self.use_mxfp8 = getattr(self.quant_config, "use_mxfp8", False)
@@ -796,6 +801,8 @@ class Fp8LinearMethod(LinearMethodBase):
             # The model reads .weight / .weight_scale_inv directly.
             return
         weight = layer.weight
+        if not weight.is_cuda:
+            return
         if weight.dtype != torch.float8_e4m3fn:
             return
         n, k = layer.weight.shape
@@ -862,8 +869,13 @@ class Fp8LinearMethod(LinearMethodBase):
         # loop replays these exact launches; a cold cuModuleLoadData on one TP
         # rank while its peer waits in NCCL is the 2026-10-18 capture-hang
         # shape. Inputs are zeros and outputs/workspace are discarded, so this
-        # only touches the JIT cache.
-        for m in (1, 2, 6, 12, 16):
+        # only touches the JIT cache. ONLY mode also warms the prefill M
+        # buckets, otherwise the first long prefill JITs at the lowest free
+        # memory (the 09:38 OOM footprint).
+        prewarm_ms = (1, 2, 6, 12, 16)
+        if self.marlin_group32_only:
+            prewarm_ms += (1024, 4096, 8192, 16384)
+        for m in prewarm_ms:
             if m > self.marlin_group32_max_m:
                 continue
             x = torch.zeros((m, k), dtype=torch.bfloat16, device=weight.device)
@@ -877,6 +889,29 @@ class Fp8LinearMethod(LinearMethodBase):
                 bias=None,
             )
         torch.cuda.synchronize(weight.device)
+
+        if self.marlin_group32_only:
+            # Every M (including prefill) now dispatches to Marlin, so the
+            # plain block-fp8 weight/scale no longer need GPU residency.
+            # Keep a CPU backup for shape/dtype readers and the state dict;
+            # reject online updates because they cannot refresh the repack.
+            layer.weight = torch.nn.Parameter(
+                weight.detach().to("cpu", copy=True), requires_grad=False
+            )
+            layer.weight_scale_inv = torch.nn.Parameter(
+                scale.detach().to("cpu", copy=True), requires_grad=False
+            )
+            layer._derived_weight_cache_error = (
+                "SGLANG_SM8X_MARLIN_GROUP32_ONLY offloads the plain block-fp8 "
+                "weight to CPU after the Marlin repack; online weight updates "
+                "cannot refresh the repacked copy. Restart to change weights."
+            )
+            # Drop the now-dead GPU locals (plain weight/scale, repack temps,
+            # last prewarm input) and return their blocks to the device. Without
+            # this the caching allocator still reports them as used, which is
+            # enough to reproduce the 09:38 prefill OOM.
+            del x, qweight, scales_nk, scale_bf16, weight, scale
+            torch.cuda.empty_cache()
 
     def process_weights_after_loading_block_quant(self, layer: Module) -> None:
         use_deepgemm_runner = (

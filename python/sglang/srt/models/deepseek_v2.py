@@ -1769,6 +1769,31 @@ class DeepseekV2MoE(nn.Module):
 
         return final_hidden_states
 
+    def _shared_experts_super_chunk_plan(self, hidden_states):
+        """Active sub-chunk plan for this MLP forward, else None.
+
+        Same contract as the model-side attention/HC loops: only the full-row
+        call takes the plan (recursive segment calls see rows != plan total and
+        stay monolithic). Read from the ambient forward context because
+        forward_normal carries no forward_batch.
+        """
+        from sglang.srt.layers.attention.super_chunk_backend import (
+            super_chunk_token_plan,
+        )
+
+        plan = super_chunk_token_plan(None)
+        if plan is None or len(plan) < 2 or plan[-1][1] != hidden_states.shape[0]:
+            return None
+        if not getattr(self, "_shared_super_chunk_logged", False):
+            self._shared_super_chunk_logged = True
+            logger.info(
+                "[sc-dbg] shared-expert LOOP active plan=%d rows=%d chunk_max=%d",
+                len(plan),
+                hidden_states.shape[0],
+                max(hi - lo for lo, hi, _ in plan),
+            )
+        return plan
+
     def _forward_shared_experts(
         self,
         hidden_states,
@@ -1779,6 +1804,35 @@ class DeepseekV2MoE(nn.Module):
             if pre_quant_input is None and _is_hip:
                 # SGLANG_HIP_FFN_NORM_MXFP8: the FFN norm launch's fp8 + ue8m0 of these rows
                 pre_quant_input = getattr(hidden_states, "_hip_mxfp8_operand", None)
+            plan = self._shared_experts_super_chunk_plan(hidden_states)
+            if plan is not None:
+                # Super-chunk (the qwen3_5/glm5 GDN-loop pattern): the dense
+                # shared MLP runs per sub-chunk so its [CAP, 2*intermediate]
+                # gate/up transient never outlives its chunk; rows are
+                # independent, so the segment outputs stream into one full-row
+                # buffer (peak = buffer + one chunk).
+                out = None
+                for lo, hi, _child_fb in plan:
+                    tok = slice(lo, hi)
+                    if pre_quant_input is None:
+                        seg_pq = None
+                    elif torch.is_tensor(pre_quant_input):
+                        seg_pq = pre_quant_input[tok]
+                    else:
+                        seg_pq = tuple(v[tok] for v in pre_quant_input)
+                    seg = self._forward_shared_experts(
+                        hidden_states[tok],
+                        gemm_output_zero_allocator,
+                        pre_quant_input=seg_pq,
+                    )
+                    if out is None:
+                        out = torch.empty(
+                            (hidden_states.shape[0], *seg.shape[1:]),
+                            dtype=seg.dtype,
+                            device=seg.device,
+                        )
+                    out[tok] = seg
+                return out
             if pre_quant_input is not None:
                 # SGLANG_OPT_MOE_QUANT_ONCE: (q, s) rows may be padded to a
                 # multiple of 4; the padded rows flow through the MLP (all ops

@@ -299,6 +299,8 @@ class SuperChunkAttnBackend(AttentionBackend):
         self._active = False
         self._warned_kwargs = set()
         self._warned_unknown_kwargs = set()
+        self._warned_reasons = set()
+        self._dbg_active_logged = False
 
     @classmethod
     def init_new(
@@ -341,6 +343,19 @@ class SuperChunkAttnBackend(AttentionBackend):
         for child in self._child_backends:
             child.set_mtp_shared_sparse_indices(state)
 
+    def _primary_in_late_layer_tail(self) -> bool:
+        """True while the model runs decoder SWA bounded replay late layers.
+
+        enter_late_layer_tail swaps the primary's full-row metadata for the
+        tail metadata (identity check: no extra state on the primary). In that
+        window the model hands the backend tail-gathered rows, which no
+        token-axis child view can reproduce; forward() delegates to primary
+        and model-side plans stop (their rows no longer match the plan).
+        """
+        md = getattr(self.primary, "forward_metadata", None)
+        tail = getattr(self.primary, "tail_forward_metadata", None)
+        return md is not None and md is tail
+
     def super_chunk_plan(self):
         """[(lo, hi, child_forward_batch)] for the active forward, else None.
 
@@ -352,6 +367,8 @@ class SuperChunkAttnBackend(AttentionBackend):
         wrapper-level loop below, which slices what it is handed.
         """
         if not self._active or self._child_batches is None:
+            return None
+        if self._primary_in_late_layer_tail():
             return None
         return [
             (lo, hi, self._child_batches[i])
@@ -366,6 +383,14 @@ class SuperChunkAttnBackend(AttentionBackend):
             self._active = False
             self._child_batches = None
             self._child_bounds = None
+            if reason not in self._warned_reasons:
+                self._warned_reasons.add(reason)
+                logger.warning(
+                    "[sc-dbg] disabled reason=%s rows=%s inner=%s",
+                    reason,
+                    forward_batch.extend_num_tokens,
+                    self.inner_size,
+                )
             self.primary.init_forward_metadata(forward_batch=forward_batch)
             return
 
@@ -376,20 +401,22 @@ class SuperChunkAttnBackend(AttentionBackend):
             self._ensure_child(i).init_forward_metadata(child_fb)
         # Primary metadata too: the per-call safe-side fallback replays the
         # whole forward on primary and must find its metadata in place.
+        # Decoder SWA bounded replay builds a tail metadata on the primary as
+        # well; it is NOT a reason to disable the wrapper. The projection
+        # loops run over the full super-chunk for the early layers, then the
+        # model swaps onto the tail at late_layer_start: super_chunk_plan()
+        # goes None and forward() delegates to the primary (tail-row q cannot
+        # be sliced by token-axis child views).
         self.primary.init_forward_metadata(forward_batch=forward_batch)
-        tail_md = getattr(self.primary, "tail_forward_metadata", None)
-        if getattr(getattr(tail_md, "late_layer_tail", None), "token_indices",
-                   None) is not None:
-            # dsv4 late-layer tail: the model swaps full-row metadata onto the
-            # primary at late_layer_start; the late layers' q is gathered to
-            # tail rows, which no token-axis child slice can reproduce
-            # (sparse prefill would mix sub-chunk q rows with full cache
-            # rows). Fall back to the whole-forward primary path.
-            self._active = False
-            self._child_batches = None
-            self._child_bounds = None
-            return
         self._active = True
+        if not self._dbg_active_logged:
+            self._dbg_active_logged = True
+            logger.info(
+                "[sc-dbg] wrapper active rows=%s chunks=%d inner=%s",
+                forward_batch.extend_num_tokens,
+                len(bounds),
+                self.inner_size,
+            )
 
     def forward(
         self,
@@ -405,6 +432,18 @@ class SuperChunkAttnBackend(AttentionBackend):
         b: Optional[torch.Tensor] = None,
         **kwargs,
     ):
+        if self._primary_in_late_layer_tail():
+            # Decoder SWA bounded replay tail: q/k/v are the tail-gathered
+            # rows and the primary already holds the matching metadata.
+            return self.primary.forward(
+                q, k, v, layer, forward_batch, save_kv_cache=save_kv_cache,
+                **(
+                    {"mixed_qkv": mixed_qkv, "a": a, "b": b}
+                    if mixed_qkv is not None
+                    else {}
+                ),
+                **kwargs,
+            )
         child_index = getattr(forward_batch, "super_chunk_child_index", None)
         if child_index is not None:
             # Model-side projection loop (super_chunk_plan): the tensors are
@@ -582,6 +621,41 @@ class SuperChunkAttnBackend(AttentionBackend):
         return getattr(self.primary, name)
 
 
+def _super_chunk_backend(forward_batch):
+    """The backend carrying the plan: fb.attn_backend, else the ambient one.
+
+    Draft-extend wiring keeps the wrapper on the ambient ForwardContext (what
+    RadixAttention dispatches through) instead of fb.attn_backend; without this
+    fallback the model loop would go None while the wrapper still loops,
+    materialising CAP-sized projections outside the circle. ``forward_batch``
+    may be None for callers that only know the ambient context.
+    """
+    backend = getattr(forward_batch, "attn_backend", None)
+    if backend is not None:
+        return backend
+    from sglang.srt.model_executor.forward_context import (
+        get_forward_context,
+        has_forward_context,
+    )
+
+    return get_forward_context().attn_backend if has_forward_context() else None
+
+
+def super_chunk_in_late_tail(forward_batch) -> bool:
+    """True while decoder SWA bounded replay has swapped onto tail metadata.
+
+    Model-side loops stop here: their plan was built for full extend rows, and
+    the late layers receive tail-gathered rows instead (rows mismatch is the
+    guard, this check keeps the expected stop out of the FALLBACK diagnostics).
+    """
+    backend = _super_chunk_backend(forward_batch)
+    if backend is None:
+        return False
+    md = getattr(backend, "forward_metadata", None)
+    tail = getattr(backend, "tail_forward_metadata", None)
+    return md is not None and md is tail
+
+
 def super_chunk_token_plan(forward_batch: ForwardBatch):
     """Model-layer entry point: the active sub-chunk plan or None.
 
@@ -591,22 +665,8 @@ def super_chunk_token_plan(forward_batch: ForwardBatch):
     with a child view route back through SuperChunkAttnBackend.forward to the
     matching child backend without any further slicing.
     """
-    backend = getattr(forward_batch, "attn_backend", None)
+    backend = _super_chunk_backend(forward_batch)
     plan_fn = getattr(backend, "super_chunk_plan", None)
-    if plan_fn is None:
-        # Draft-extend wiring keeps the wrapper on the ambient ForwardContext
-        # (what RadixAttention dispatches through) instead of fb.attn_backend;
-        # without this fallback the model loop would go None while the wrapper
-        # still loops, materialising CAP-sized projections outside the circle.
-        from sglang.srt.model_executor.forward_context import (
-            get_forward_context,
-            has_forward_context,
-        )
-
-        if has_forward_context():
-            plan_fn = getattr(
-                get_forward_context().attn_backend, "super_chunk_plan", None
-            )
     return plan_fn() if plan_fn is not None else None
 
 

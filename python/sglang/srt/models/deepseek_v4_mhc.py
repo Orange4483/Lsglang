@@ -22,6 +22,7 @@ TODO: move dsv4 MHC into the same abstraction
 
 from __future__ import annotations
 
+import logging
 from typing import Any, Callable, NamedTuple, Optional, Tuple, TypeAlias, Union
 
 import msgspec
@@ -44,6 +45,9 @@ _is_gfx95_supported = is_gfx95_supported()
 _is_hip = is_hip()
 _is_npu = is_npu()
 _is_xpu = is_xpu()
+
+logger = logging.getLogger(__name__)
+_SC_POST_LOGGED = False
 
 # ---------------------------------------------------------------------------
 # What a layer hands this module
@@ -462,6 +466,37 @@ def post(
     """``R'[i] = post[i] * x + sum_j comb[j][i] * R[j]``, by whichever kernel fits."""
     if x.shape[0] == 0:
         return torch.empty((0, cfg.mult, x.shape[-1]), dtype=x.dtype, device=x.device)
+
+    # Super-chunk: this is row-local, so run it per sub-chunk and write the
+    # result back over `residual` (the caller replaces that stream with the
+    # return value). The monolithic empty_like(residual) is [CAP, mult, H]
+    # bf16: 640 MiB at CAP=16K, and it is the post path's largest transient.
+    from sglang.srt.layers.attention.super_chunk_backend import (
+        super_chunk_in_late_tail,
+        super_chunk_token_plan,
+    )
+
+    plan = None
+    if not super_chunk_in_late_tail(None):
+        plan = super_chunk_token_plan(None)
+    if plan is not None and (len(plan) < 2 or plan[-1][1] != x.shape[0]):
+        plan = None
+    if plan is not None:
+        for lo, hi, _child_fb in plan:
+            tok = slice(lo, hi)
+            residual[tok].copy_(
+                post(cfg, x[tok], residual[tok], post_mix[tok], comb[tok])
+            )
+        global _SC_POST_LOGGED
+        if not _SC_POST_LOGGED:
+            _SC_POST_LOGGED = True
+            logger.info(
+                "[sc-dbg] mhc-post LOOP active plan=%d rows=%d chunk_max=%d",
+                len(plan),
+                x.shape[0],
+                max(hi - lo for lo, hi, _ in plan),
+            )
+        return residual
 
     if _is_npu:
         if not is_npu_arch35():

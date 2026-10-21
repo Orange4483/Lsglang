@@ -265,8 +265,22 @@ def dense_prefill_topk(
 # ---------- torch ----------
 
 
-# Arbitrary cap on one bf16 [rows, heads, lc] score chunk; transients run ~3x this.
+# Hard cap on one bf16 [rows, heads, lc] score chunk; transients run ~3x this.
+# The effective budget is also capped by the indexer's free-memory budget: the
+# hardcoded 1 GiB tile is 768 MiB at lc~24K on a 24 GB card, where the KV pool
+# owns most of the card and the transient peak (relu/mul copies) OOMs at 32K.
 _TORCH_SCORE_BUDGET_BYTES = 1 << 30
+
+
+def _torch_score_budget_bytes() -> int:
+    from sglang.srt.layers.attention.mqa_logits_utils import mqa_logits_budget_bytes
+
+    return min(
+        _TORCH_SCORE_BUDGET_BYTES,
+        mqa_logits_budget_bytes(
+            device_index=torch.cuda.current_device(), allow_sync=True
+        ),
+    )
 
 
 class RequestScores(msgspec.Struct, frozen=True):
@@ -341,8 +355,9 @@ def _score_chunks(
     request: RequestScores,
 ) -> Iterator[ChunkScores]:
     lc, j = request.lc, request.columns
-    # Chunk rows so the [rows, heads, lc] bf16 scores stay under the budget.
-    rows_per_chunk = max(1, _TORCH_SCORE_BUDGET_BYTES // (q.shape[1] * lc * 2))
+    # Chunk rows so the [rows, heads, lc] bf16 scores stay under the budget,
+    # capped by current free memory (the KV pool already owns most of it).
+    rows_per_chunk = max(1, _torch_score_budget_bytes() // (q.shape[1] * lc * 2))
     for start in range(0, request.tok.numel(), rows_per_chunk):
         rows = slice(start, start + rows_per_chunk)
         tok_c, lens_c = request.tok[rows], request.lens[rows]
