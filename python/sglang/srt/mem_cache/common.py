@@ -272,24 +272,20 @@ _CHUNKED_RADIX_INSERT_DISABLED: Optional[bool] = None
 def configure_chunked_radix_insert(model_config) -> bool:
     """Resolve once: the chunked-prefill per-chunk radix insert is a race
     surface (retract/abort can free pages the tree already references; the
-    QSA compressed slot full_slot // ratio then reads another request's
-    data -> persistently poisoned prefixes, upstream issue #38319). Auto-on
-    for QSA compressed models; the env only overrides the auto decision."""
+    compressed slot full_slot // ratio then reads another request's
+    data -> persistently poisoned prefixes, upstream issue #38319). It only
+    ever published early what release_kv_cache inserts at completion, so it
+    is now disabled for every model by default; the env overrides the
+    decision either way (set it to 0 to opt the early publish back in)."""
     global _CHUNKED_RADIX_INSERT_DISABLED
     if _CHUNKED_RADIX_INSERT_DISABLED is None:
         explicit = envs.SGLANG_DISABLE_CHUNKED_RADIX_INSERT.get()
         if explicit is None:
-            from sglang.srt.layers.attention.qsa.config import is_qwen_qsa
-
-            _CHUNKED_RADIX_INSERT_DISABLED = is_qwen_qsa(
-                getattr(model_config, "hf_text_config", None)
+            _CHUNKED_RADIX_INSERT_DISABLED = True
+            logger.info(
+                "chunked-prefill radix insert disabled by default (upstream "
+                "issue #38319); the insert is deferred to request completion"
             )
-            if _CHUNKED_RADIX_INSERT_DISABLED:
-                logger.info(
-                    "chunked-prefill radix insert disabled for this QSA "
-                    "compressed model (upstream issue #38319); the insert is "
-                    "deferred to request completion"
-                )
         else:
             _CHUNKED_RADIX_INSERT_DISABLED = explicit
     return _CHUNKED_RADIX_INSERT_DISABLED
