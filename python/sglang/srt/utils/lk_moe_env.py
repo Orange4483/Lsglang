@@ -184,6 +184,15 @@ def get_prefill_wave_experts() -> int:
     return get_int_env_var("LK_GPU_PREFILL_WAVE_EXPERTS", -1)
 
 
+def get_prefill_d_slots() -> int:
+    # CUTLASS act slice window in slot rows (act VRAM decoupling): 0
+    # (default) = one window per pass (classic full layout, bitwise); >0 =
+    # the four act regions (reordered input / f32 D / GU / down-out) hold
+    # one window and reorder->gemm->fuse->down->sum pipelines per window
+    # inside each SUB_M pass. Ignored by triton.
+    return get_int_env_var("LK_GPU_PREFILL_D_SLOTS", 0)
+
+
 def get_model_type_from_layer_name(layer_name: str) -> str:
     if not layer_name:
         return "main"

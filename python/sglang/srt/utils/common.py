@@ -141,6 +141,7 @@ from sglang.srt.utils.lk_moe_env import (  # noqa: F401  (compat re-export)
     get_pool_slots,
     get_pool_window,
     get_prefill_wave_experts,
+    get_prefill_d_slots,
     get_super_chunk_size,
     get_verify_resident,
     get_verify_skip_miss,

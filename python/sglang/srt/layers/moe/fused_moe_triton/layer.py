@@ -106,7 +106,7 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 logger = logging.getLogger(__name__)
 
-from sglang.srt.utils.common import is_lk_moe_feature_enabled, is_lk_pool_enabled, get_pool_log, get_verify_resident, get_verify_skip_miss, get_hf_mbox, get_pool_inflight, is_lk_prefill_debug, is_lk_moe_gpu_resident_layer, get_gpu_prefetch_window, get_gpu_prefill_min_tokens, get_gpu_prefill_engine, get_pool_window, get_super_chunk_size, get_bool_env_var, is_lk_gpu_prefill_enabled, get_model_type_from_layer_name, is_lk_pool_layer, get_pool_slots, is_lk_pool_decode_enabled, lk_route_probe_enabled, get_prefill_wave_experts
+from sglang.srt.utils.common import is_lk_moe_feature_enabled, is_lk_pool_enabled, get_pool_log, get_verify_resident, get_verify_skip_miss, get_hf_mbox, get_pool_inflight, is_lk_prefill_debug, is_lk_moe_gpu_resident_layer, get_gpu_prefetch_window, get_gpu_prefill_min_tokens, get_gpu_prefill_engine, get_pool_window, get_super_chunk_size, get_bool_env_var, is_lk_gpu_prefill_enabled, get_model_type_from_layer_name, is_lk_pool_layer, get_pool_slots, is_lk_pool_decode_enabled, lk_route_probe_enabled, get_prefill_wave_experts, get_prefill_d_slots
 from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import CompressedTensorsFusedMoEMethod
 from sglang.srt.model_executor.runner import get_is_capture_mode
 if is_lk_moe_feature_enabled():
@@ -584,6 +584,7 @@ class FusedMoE(torch.nn.Module):
         
         self.gpu_prefetch_window = get_gpu_prefetch_window()
         self.prefill_wave_experts = get_prefill_wave_experts()
+        self.prefill_d_slots = get_prefill_d_slots()
         self.lk_moe = None
         self.lk_moe_config = None 
         self.model_type = get_model_type_from_layer_name(self.layer_name)
@@ -2102,6 +2103,7 @@ class FusedMoE(torch.nn.Module):
         cfg.prefill_min_tokens = self.gpu_prefill_min_tokens
         cfg.prefill_window = self.gpu_prefetch_window
         cfg.prefill_wave_experts = self.prefill_wave_experts
+        cfg.prefill_d_slots = self.prefill_d_slots
         cfg.pool_window = get_pool_window()
         cfg.pool_inflight = get_pool_inflight()
         cfg.pool_log = get_pool_log()
