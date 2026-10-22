@@ -3,6 +3,7 @@
 # Adapted from https://github.com/vllm-project/vllm/blob/a6221a144af772fd1a68fe7e627935dc53e81738/vllm/model_executor/layers/fused_moe/layer.py
 
 import logging
+import os
 from enum import Enum
 from functools import cached_property
 from typing import Dict, List, Optional, Tuple
@@ -105,6 +106,7 @@ _is_npu = is_npu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 logger = logging.getLogger(__name__)
+_LK_PP_DEBUG = os.getenv("LK_PP_DEBUG", "0") not in ("", "0")
 
 from sglang.srt.utils.common import is_lk_moe_feature_enabled, is_lk_pool_enabled, get_pool_log, get_verify_resident, get_verify_skip_miss, get_hf_mbox, get_pool_inflight, is_lk_prefill_debug, is_lk_moe_gpu_resident_layer, get_gpu_prefetch_window, get_gpu_prefill_min_tokens, get_gpu_prefill_engine, get_pool_window, get_super_chunk_size, get_bool_env_var, is_lk_gpu_prefill_enabled, get_model_type_from_layer_name, is_lk_pool_layer, get_pool_slots, is_lk_pool_decode_enabled, lk_route_probe_enabled, get_prefill_wave_experts, get_prefill_d_slots
 from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import CompressedTensorsFusedMoEMethod
@@ -2670,6 +2672,28 @@ class FusedMoE(torch.nn.Module):
         out = gout.to(hidden_states.dtype)
         if self.check_nan_in_output:
             torch.nan_to_num(out, nan=0.0, out=out)
+        if _LK_PP_DEBUG:
+            # Diagnostic only (LK_PP_DEBUG=1): compare the GPU-tier result to
+            # the CPU tier for the same layer/tokens. First call per layer.
+            seen = getattr(self, "_ppdbg_seen", None)
+            if seen is None:
+                seen = self._ppdbg_seen = set()
+            if self.layer_id not in seen:
+                seen.add(self.layer_id)
+                try:
+                    with torch.inference_mode():
+                        ref = self._cpu_prefill(hidden_states, topk_weights, topk_ids)
+                    d = (out.float() - ref.float()).abs()
+                    peak = ref.float().abs().amax().clamp_min(1e-9)
+                    logger.warning(
+                        "[ppdbg] layer=%s M=%d relmax=%.3e absmax=%.3e "
+                        "gpu_peak=%.3e cpu_peak=%.3e",
+                        self.layer_id, hidden_states.size(0),
+                        (d.amax() / peak).item(), d.amax().item(),
+                        out.float().abs().amax().item(), peak.item())
+                except Exception:
+                    logger.exception("[ppdbg] cpu-vs-gpu compare failed layer=%s",
+                                     self.layer_id)
         return out
             
     
