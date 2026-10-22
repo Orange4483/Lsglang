@@ -55,7 +55,7 @@ coordinates automatically with modes 2-5.
 
 ### Installation
 
-Prerequisite: **CUDA 13.2.1** (driver + toolkit) — matches the `torch==2.13.0` CUDA build below.
+Prerequisite: **CUDA 13.2.1** (driver + toolkit) — matches the `torch==2.14.1` CUDA build below.
 
 ```bash
 conda create -n Lsglang python==3.12.11 && conda activate Lsglang
@@ -72,7 +72,7 @@ From source:
 git clone https://github.com/guqiong96/Lsglang.git
 cd Lsglang
 pip install -U setuptools wheel scikit-build-core cmake
-pip install torchaudio triton torchvision torch==2.13.0
+pip install torchaudio triton torchvision torch==2.14.1
 pip install grpcio-tools wheel-stub
 MAX_JOBS=32 NVCC_THREADS=1 CMAKE_BUILD_TYPE=Release \
 CMAKE_ARGS="-DCMAKE_BUILD_TYPE=Release" \
@@ -151,7 +151,7 @@ LK_MOE_HYBRID_ENABLED=1                     master
  ├─ pool on            LK_POOL_SLOTS (e.g. 64)      (dual knob: value itself is the switch, 0 = off)
  │   └─ pool decode    LK_POOL_DECODE=1     (unset = follows pool on; explicit `1`/`0` wins)
  ├─ GPU prefill on     LK_GPU_PREFILL_MIN_TOKENS (e.g. 1024)   (dual knob, same rule)
- │   ├─ engine         LK_GPU_PREFILL_ENGINE=cutlass|triton (default cutlass)
+ │   ├─ engine         LK_GPU_PREFILL_ENGINE=cutlass|triton (default triton)
  │   ├─ wave           LK_GPU_PREFILL_WAVE_EXPERTS (cutlass only; -1 auto / 0 single-shot / >0 cap)
  │   └─ super mix      LK_GPU_PREFILL_SUB_M (e.g. 16384)  (>0 super-chunk staging; 0 = per-chunk)
  ├─ nvme filler on    LK_NVME_DIRECT=1          (needs the feature's own backend flag: --ple-offload-backend nvme / engram host table;
@@ -192,7 +192,7 @@ LK_MOE_HYBRID_ENABLED=0  →  every branch above unreachable = original sglang
 | Env var | Type | Default | Description |
 |--------|------|--------|------|
 | `LK_GPU_PREFILL_MIN_TOKENS` | prefill | 0 = off | **tier switch AND batch gate**: the value itself switches (e.g. 1024 turns the tier on; `0` = pure CPU prefill) = minimum token batch for the GPU path; not enabled by default (0 on 16 GB cards) |
-| `LK_GPU_PREFILL_ENGINE` | prefill | `cutlass` | engine selector (does not power the tier): `cutlass` = restored C++ grouped-GEMM, or `triton` = staging ring + Triton group-GEMM; forwarded via cfg, the C++ library itself does not read this env |
+| `LK_GPU_PREFILL_ENGINE` | prefill | `triton` | engine selector (does not power the tier): `triton` = staging ring + Triton group-GEMM (fp32 activations, matches the CPU reference), or `cutlass` = restored C++ grouped-GEMM (bf16 intermediates; NOT default — its extra bf16 rounding drifts long-context logits and flips borderline EOS); forwarded via cfg, the C++ library itself does not read this env |
 | `LK_GPU_PREFILL_WAVE_EXPERTS` | prefill | `-1` auto | CUTLASS wave width only (triton ignores it), applied inside each `SUB_M` pass: `-1` = largest wave that fits the borrow slab (clamped to E), `0` = single-shot, `>0` = explicit cap; waves are bit-exact with single-shot |
 | `LK_GPU_PREFILL_SUB_M` | prefill | 0 | super-mix staging size (tokens); only meaningful while the tier is on (`LK_GPU_PREFILL_MIN_TOKENS > 0`): `>0` enables super-chunk staging (e.g. 16384), `0` = per-chunk staging |
 | `LK_GPU_PREFETCH_WINDOW` | prefill | `1` | staging-ring blocks in flight (triton only; cutlass ignores it); `1` = serialized (default); `2` = ping-pong (copy overlaps gemm, needs fast PCIe to pay off) |

@@ -115,10 +115,14 @@ def get_gpu_prefill_engine() -> str:
     # tier itself -- the GPU-prefill tier still powers on only via
     # LK_GPU_PREFILL_MIN_TOKENS>0 under the master switch). Chooses WHICH
     # GPU-prefill implementation a powered tier uses:
-    #   "cutlass" (default) = restored CUTLASS grouped-GEMM engine
-    #   "triton"            = staging group-GEMM over pool slots (legacy)
+    #   "triton" (default)  = staging group-GEMM over pool slots (legacy,
+    #                         fp32 activations, matches the CPU reference)
+    #   "cutlass"           = restored CUTLASS grouped-GEMM engine (bf16
+    #                         intermediates; NOT default: its extra bf16
+    #                         rounding drifts long-context logits and flips
+    #                         borderline EOS -- see journal 2026-10-22)
     # Inert unless the tier is on. Forwarded to lk_moe via cfg.use_gpu_prefill.
-    val = get_str_env_var("LK_GPU_PREFILL_ENGINE", "cutlass").strip().lower()
+    val = get_str_env_var("LK_GPU_PREFILL_ENGINE", "triton").strip().lower()
     return "cutlass" if val == "cutlass" else "triton"
 
 def get_pool_window() -> int:

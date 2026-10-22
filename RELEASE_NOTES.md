@@ -11,8 +11,10 @@ Everything on top of upstream is the lk_moe integration and its upgrades.
   sliding-window / recurrent-state layers), diffusion pipeline work, Rust
   gRPC/router extensions, scheduler and MemCache refactors, plus the
   DeepSeek-V4.1 late-layer pinned-row perf path.
-- **CUTLASS GPU-prefill engine is now the default**
-  (`LK_GPU_PREFILL_ENGINE=cutlass`): restored C++ grouped-GEMM path with
+- **CUTLASS GPU-prefill engine** selectable
+  (`LK_GPU_PREFILL_ENGINE=cutlass`; HOTFIX 2026-10-22: default reverted to
+  `triton` — the cutlass engine's bf16 intermediates drift long-context
+  logits and flip borderline EOS; see journal 2026-10-22): restored C++ grouped-GEMM path with
   unbounded pool-row borrowing (the `LK_GPU_PREFILL_BORROW_MB` budget is gone),
   one freeze window per prefill forward, whole-slab block planning, and wave
   width control (`LK_GPU_PREFILL_WAVE_EXPERTS=-1` auto / `0` single-shot /
