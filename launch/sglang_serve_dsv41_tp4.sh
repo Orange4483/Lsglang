@@ -54,5 +54,4 @@ sglang serve \
   --chunked-prefill-size 1024 \
   --max-total-tokens 262144 \
   --mem-fraction-static 0.80 \
-  --swa-full-tokens-ratio 0.1 \
   --speculative-attention-mode decode
