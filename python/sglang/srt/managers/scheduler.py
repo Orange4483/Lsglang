@@ -3707,6 +3707,38 @@ class Scheduler(
         for tokenized_req in recv_req:
             self.handle_embedding_request(tokenized_req)
 
+    def reclaim_swa_for_chunked_req(self, req: Req) -> None:
+        """Free a continuing chunk's out-of-window SWA slots *before* its budget.
+
+        The SWA admission check cannot see the slots this request already holds:
+        a mid-chunk prefix is not inserted into the radix tree (see the
+        mid-chunk-insert default), so they count as neither available nor
+        evictable, and ``PrefillAdder.add_chunked_req`` -> ``fit_chunk`` answers
+        None -- which parks the chunk and stops the request forever, with no
+        batch and nothing in the log. The reclaim inside ``alloc_for_extend``
+        cannot help there: it only runs once a batch exists, which is exactly
+        what the park prevents. Reclaiming here restores the frontier to
+        ``swa_dead_lo`` + window, so the chunk is admitted and the decode-side
+        reclaim takes over from the first step.
+
+        Same frontier gates as the extend branch of ``maybe_evict_swa``; the
+        tree helper still refuses to go below ``swa_dead_lo`` and keeps
+        ``max(window, page_size)`` plus the retain floor.
+        """
+        if not self.tree_cache.supports_swa():
+            return
+        pre_len = ScheduleBatch.swa_chunk_reclaim_frontier(
+            req, req.prefix_len, self.enable_overlap
+        )
+        if pre_len is None:
+            return
+        allocator = self.token_to_kv_pool_allocator
+        allocator.free_group_begin()
+        try:
+            self.tree_cache.evict_sliding_windows(req, pre_len, eviction_interval=1)
+        finally:
+            allocator.free_group_end()
+
     def stash_chunked_request(self, req: Req):
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             self.checkpoint_disagg_prefill(req)
@@ -4128,6 +4160,10 @@ class Scheduler(
 
         if self.chunked_req is not None:
             self.chunked_req.init_next_round_input()
+            # Reclaim out-of-window SWA before the adder negotiates this chunk:
+            # the SWA budget cannot see the slots this request already holds, so
+            # checking first would park the chunk (see the method docstring).
+            self.reclaim_swa_for_chunked_req(self.chunked_req)
             adder.chunked_req_limit = self.policy.shortest_prefill_chunk_limit(
                 self.chunked_req,
                 self.waiting_queue,

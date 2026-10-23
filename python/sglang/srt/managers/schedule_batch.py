@@ -3970,6 +3970,29 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             >= req.kv.get_evicted_seqlen(ComponentType.SWA) + eviction_interval
         )
 
+    @staticmethod
+    def swa_chunk_reclaim_frontier(
+        req: Req, pre_len: int, enable_overlap: bool
+    ) -> Optional[int]:
+        """How far a chunked-prefill pass may reclaim SWA, or None for "not now".
+
+        Shared by the two places that reclaim mid-prefill: the extend branch of
+        ``maybe_evict_swa`` (at allocation time) and the scheduler's pre-budget
+        reclaim for a continuing chunk.  Under the overlap scheduler the previous
+        extend batch can still be running while this chunk is being scheduled, so
+        the first two chunks reclaim nothing and, from the third on, the frontier
+        is discounted by one chunk; without overlap the committed prefix is the
+        frontier.  Both callers stay on the safe side of that because
+        ``evict_sliding_windows`` never goes below ``swa_dead_lo``.
+        """
+        if not enable_overlap:
+            return pre_len
+        # The second extend batch is scheduling while the first still runs.
+        if req.extend_batch_idx < 2:
+            return None
+        chunked_prefill_size = get_schedule().chunked_prefill_size
+        return pre_len - chunked_prefill_size if chunked_prefill_size > 0 else pre_len
+
     def maybe_evict_swa(self):
         if self.tree_cache.supports_swa():
             sliding_window_size = self.tree_cache.sliding_window_size
@@ -4021,19 +4044,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     # token until the first decode step, which made the SWA pool
                     # -- not max_total_tokens or context_len -- the longest
                     # prompt a server could serve at all.
-                    pre_len = self.prefix_lens[idx]
-                    if self.enable_overlap:
-                        # In chunked prefill case, when the second extend batch is scheduling, the first extend batch is still running, so we cannot evict swa tokens
-                        if req.extend_batch_idx < 2:
-                            continue
-                        else:
-                            pre_len = (
-                                pre_len - get_schedule().chunked_prefill_size
-                                if get_schedule().chunked_prefill_size > 0
-                                else pre_len
-                            )
-                            self._evict_swa(req, pre_len)
-                    else:
+                    pre_len = self.swa_chunk_reclaim_frontier(
+                        req, self.prefix_lens[idx], self.enable_overlap
+                    )
+                    if pre_len is not None:
                         self._evict_swa(req, pre_len)
             self.token_to_kv_pool_allocator.free_group_end()
 
