@@ -151,7 +151,7 @@ LK_MOE_HYBRID_ENABLED=1                     master
  ├─ pool on            LK_POOL_SLOTS (e.g. 64)      (dual knob: value itself is the switch, 0 = off)
  │   └─ pool decode    LK_POOL_DECODE=1     (unset = follows pool on; explicit `1`/`0` wins)
  ├─ GPU prefill on     LK_GPU_PREFILL_MIN_TOKENS (e.g. 1024)   (dual knob, same rule)
- │   ├─ engine         LK_GPU_PREFILL_ENGINE=cutlass|triton (default triton)
+ │   ├─ engine         LK_GPU_PREFILL_ENGINE=cutlass|triton (default cutlass; triton = opt-out)
  │   ├─ wave           LK_GPU_PREFILL_WAVE_EXPERTS (cutlass only; -1 auto / 0 single-shot / >0 cap)
  │   └─ super mix      LK_GPU_PREFILL_SUB_M (e.g. 16384)  (>0 super-chunk staging; 0 = per-chunk)
  ├─ nvme filler on    LK_NVME_DIRECT=1          (needs the feature's own backend flag: --ple-offload-backend nvme / engram host table;
@@ -192,9 +192,10 @@ LK_MOE_HYBRID_ENABLED=0  →  every branch above unreachable = original sglang
 | Env var | Type | Default | Description |
 |--------|------|--------|------|
 | `LK_GPU_PREFILL_MIN_TOKENS` | prefill | 0 = off | **tier switch AND batch gate**: the value itself switches (e.g. 1024 turns the tier on; `0` = pure CPU prefill) = minimum token batch for the GPU path; not enabled by default (0 on 16 GB cards) |
-| `LK_GPU_PREFILL_ENGINE` | prefill | `triton` | engine selector (does not power the tier): `triton` = staging ring + Triton group-GEMM (fp32 activations, matches the CPU reference), or `cutlass` = restored C++ grouped-GEMM (bf16 intermediates; NOT default — its extra bf16 rounding drifts long-context logits and flips borderline EOS); forwarded via cfg, the C++ library itself does not read this env |
+| `LK_GPU_PREFILL_ENGINE` | prefill | `cutlass` | engine selector (does not power the tier): `cutlass` = restored C++ grouped-GEMM (bf16 intermediates, faster on long prompts), or `triton` = staging ring + Triton group-GEMM (fp32 activations, matches the CPU reference) — the opt-out when long-context logits or borderline EOS matter; forwarded via cfg, the C++ library itself does not read this env |
 | `LK_GPU_PREFILL_WAVE_EXPERTS` | prefill | `-1` auto | CUTLASS wave width only (triton ignores it), applied inside each `SUB_M` pass: `-1` = largest wave that fits the borrow slab (clamped to E), `0` = single-shot, `>0` = explicit cap; waves are bit-exact with single-shot |
-| `LK_GPU_PREFILL_SUB_M` | prefill | 0 | super-mix staging size (tokens); only meaningful while the tier is on (`LK_GPU_PREFILL_MIN_TOKENS > 0`): `>0` enables super-chunk staging (e.g. 16384), `0` = per-chunk staging |
+| `LK_GPU_PREFILL_D_SLOTS` | prefill | 0 = off | CUTLASS engine only (triton ignores it): split each prefill into narrower passes so the prefill itself holds less VRAM, at the cost of extra kernel launches; the result is unchanged. The value counts routed entries (tokens × top_k), so to size it by tokens set tokens × top_k; it shows up as the `act=` figure in the `[pool] wave width auto` boot line. 0, or a value wide enough to cover the whole batch, keeps the original single-pass behaviour |
+| `LK_GPU_PREFILL_SUB_M` | prefill | 0 | super-mix staging size (tokens); only meaningful while the tier is on (`LK_GPU_PREFILL_MIN_TOKENS > 0`): `>0` enables super-chunk staging (e.g. 16384), `0` = per-chunk staging. Bigger values move more of each expert's weights per token (faster) but raise the token budget of a single forward - the `CAP=` in the `Super-chunk prefill wrapper active` boot line - and with it the scratch that scales with that budget, incl. a pre-reserved output buffer of ~ SUB_M × hidden × 4 bytes per rank that is already counted against the KV budget; halving it roughly halves that scratch |
 | `LK_GPU_PREFETCH_WINDOW` | prefill | `1` | staging-ring blocks in flight (triton only; cutlass ignores it); `1` = serialized (default); `2` = ping-pong (copy overlaps gemm, needs fast PCIe to pay off) |
 | `LK_GPU_RESERVE_GB` | prefill | 0 | GB of KV budget reserved for lk_moe device-side staging |
 

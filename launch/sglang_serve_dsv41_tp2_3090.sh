@@ -11,9 +11,6 @@ else
     # session teardown could kill (EPIPE would take the engine down)
     exec >> "$LOG" 2>&1
 fi
-export LOG=${LOG:-/tmp/opencode/serve_logs/$(basename "$0" .sh)_$(date +%m%d_%H%M%S).log}
-mkdir -p /tmp/opencode/serve_logs
-exec > >(tee -a "$LOG") 2>&1
 # DeepSeek-V4.1-Flash-1017 · 2× RTX 3090 (SM86), TP2, plain decode.
 
 CUDA_DEVICE_ORDER=PCI_BUS_ID \
@@ -26,8 +23,9 @@ OMP_NUM_THREADS=1 \
 LK_THREAD_BINDING=NUMA_NODE \
 LK_GPU_PREFETCH_WINDOW=1 \
 LK_GPU_PREFILL_MIN_TOKENS=1024 \
-LK_GPU_PREFILL_ENGINE=triton \
+LK_GPU_PREFILL_ENGINE=cutlass \
 LK_GPU_PREFILL_SUB_M=16384 \
+LK_GPU_PREFILL_D_SLOTS=16384 \
 LK_NUMA_INTERLEAVE=1 \
 LK_POWER_SAVING=1 \
 LK_GPU_RESIDENT_MOE_LAYERS="" \

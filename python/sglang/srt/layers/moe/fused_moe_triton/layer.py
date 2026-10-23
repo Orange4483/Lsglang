@@ -2408,7 +2408,7 @@ class FusedMoE(torch.nn.Module):
             return
         self._gpu_prefill_driver = None
         if self.is_gpu_prefill_layer:
-            # Engine selector (LK_GPU_PREFILL_ENGINE, default triton): a GPU-
+            # Engine selector (LK_GPU_PREFILL_ENGINE, default cutlass): a GPU-
             # prefill layer that cannot go GPU is a broken boot, not a CPU
             # layer -- probe failure raises and the boot dies with it.
             if get_gpu_prefill_engine() == "cutlass":
