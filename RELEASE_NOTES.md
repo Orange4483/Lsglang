@@ -1,118 +1,162 @@
-# lsglang v1.6.2 — CUTLASS GPU-Prefill by Default, Long-Context Correctness
+# lsglang v1.6.2 — Long-Context Correctness, Deterministic Output, Faster Prefill
 
 **Base:** upstream sglang main @ `06342acad2` (1,387 commits since the v1.6.0
 base `583fada954`); **lk_moe v2.7.2**.
 
 Everything on top of upstream is the lk_moe integration and its upgrades.
 
-## Highlights
+## Problems This Release Fixes
 
-- **CUTLASS GPU-prefill is the default engine** (`LK_GPU_PREFILL_ENGINE`; unset
-  or an unrecognized value select it, `=triton` opts out to the staging
-  group-GEMM path). Whole-slab block planning, one freeze window per prefill
-  forward, unbounded pool-row borrowing (the `LK_GPU_PREFILL_BORROW_MB` budget
-  is gone), wave width control (`LK_GPU_PREFILL_WAVE_EXPERTS`: `-1` auto / `0`
-  single-shot / `>0` cap) and a slot-window activation-slice pipeline
-  (`LK_GPU_PREFILL_D_SLOTS`, act slice decoupled from `SUB_M`). It is safe to
-  default now: the engine computes in fp32 (its earlier bf16 intermediates
-  drifted long-context logits and flipped borderline EOS) and its output
-  accumulator is booked inside the lk_moe VRAM ledger instead of an off-book
-  torch scratch. Every production launch script pins the engine and sets
-  `LK_GPU_PREFILL_D_SLOTS=16384`.
-- **Multi-wave prefill is correct at wide expert counts** — every wave's
-  staging rows are published, and act residency is keyed on the slice rather
-  than on the first wave. This is the DeepSeek-V4.1 (E=384 -> auto width 66 ->
-  6 waves) long-context corruption; verified online at 13,236 tok through the
-  chat needle suite (24/24) and at the 24.6k-token wall.
-- **GPU expert pool** — deterministic split (`LK_POOL_DET_SPLIT`: frozen
-  snapshot + copy-fence wait before the GPU half reads slots), two-phase lease
-  with a publish-side ledger, NVFP4 scale-stride fix (real-weight rel 0.86 ->
-  1.2e-6), expert-pool park around CUDA-graph capture/replay. `LK_POOL_SLOTS=0`
-  now enables prefill-only staging on its own instead of disabling GPU prefill.
-- **Upstream main sync** — unified memory (asymmetric KV rows, fused draft /
-  sliding-window / recurrent-state layers), scheduler and MemCache refactors,
-  Rust gRPC/router extensions, diffusion pipeline work, plus the DeepSeek-V4.1
+- **Long prompts no longer stall silently.** On sliding-window models (in this
+  tree: DeepSeek-V4.1), the longest prompt you could send was decided by an
+  internal sliding-window slot budget, not by `--max-total-tokens` or the model
+  context. At `--max-total-tokens 262144` with `--swa-full-tokens-ratio 0.1` a
+  request past **25,856 tokens** was accepted, prefilled up to that point, and
+  then waited forever -- no error, no log line, the client just hangs. Window
+  slots are now reclaimed while the prompt is still being prefilled, so the
+  ceiling is the configured context budget again. No knob to set -- it applies
+  on upgrade, and it only affects sliding-window models.
+- **Repeated / runaway output and run-to-run differences on Qwen3.8 and
+  DeepSeek V4.x.** Async host-to-device copies could read a host buffer that
+  had already been recycled underneath them. All 11 such sites now stage
+  through a deep parked ring, which removes that whole family of symptoms
+  (greedy decoding producing loops, the same prompt answering differently).
+- **Servers that deadlocked at startup on mixed GPU models (TP4, 3090 +
+  5060Ti).** CUDA-graph capture is now decided by a group-consensus arch check
+  instead of per rank, so a heterogeneous group either captures together or
+  runs eager together.
+- **The first request paid a multi-second JIT stall** on DeepSeek V4.x. The
+  sampling kernel and the small decode/prefill shapes are now prewarmed at
+  model load.
+- **The determinism switch did nothing.** `LK_POOL_DET_SPLIT=1` looked armed but
+  its GPU-side wait was never actually reached, so results were no more
+  reproducible than with the knob off. It now takes effect -- and fails loudly
+  at startup on a build that cannot honour it, instead of pretending.
+- **Silently missing expert contributions.** When a decode step fell outside
+  the expert pool's coverage, the CPU half could skip experts the GPU half had
+  not actually computed for that step. In the worst case a token's MoE output
+  was missing half of its experts, with nothing logged.
+
+## What Got Better
+
+- **Prefill throughput on long prompts.** The CUTLASS grouped-GEMM engine is the
+  default (set `LK_GPU_PREFILL_ENGINE=triton` to opt out). It plans whole slabs
+  at a time, pipelines the activation region through a bounded window
+  (`LK_GPU_PREFILL_D_SLOTS`) instead of allocating scratch off the books, and
+  sizes its waves automatically (`LK_GPU_PREFILL_WAVE_EXPERTS=-1`) -- measured
+  here at 6 waves for a 384-expert model with no change in output vs the CPU
+  reference (24/24 retrieval through 13k tokens, 24.6k tokens at the old wall).
+- **Decode throughput on SM8x cards** (3090 class): block-FP8 group-32 Marlin
+  W8A16 kernels, prewarmed before graph capture, plus a fused inverse-RoPE path
+  in the DeepSeek-V4 decode attention.
+- **Deterministic FP8** (`SGLANG_DETERMINISTIC_FP8`): fixed split-K and a bypass
+  of the SM12x code path, so FP8 layers stop reordering reductions between runs.
+- **Weight loading without host-RAM residency**: DeepSeek-V4.1 Engram and
+  Qwen3.8 PLE tables stream from NVMe into the VRAM hot cache; boot cost no
+  longer scales with checkpoint size. Each TP rank now reads exactly the rows it
+  owns.
+- **Cache correctness**: mid-chunk radix-tree insertion is disabled by default
+  (an aborted request could leave freed pages referenced); recycled Mamba
+  ping-pong slots are cleared lazily so stale state cannot leak into the tree;
+  sparse-attention top-k ties are broken by index order so retrieval is stable.
+- **Upstream**: 1,387 commits of sglang main folded in -- unified memory pool
+  (asymmetric KV rows, fused draft / sliding-window / recurrent-state layers),
+  scheduler and MemCache refactors, Rust gRPC/router work, and the DeepSeek-V4.1
   late-layer pinned-row perf path.
-- **SM8x performance** — dense block-FP8 group-32 Marlin W8A16 decode
-  (dual-retain repack, M<=16, kernels prewarmed before capture), deterministic
-  FP8 (`SGLANG_DETERMINISTIC_FP8`: fixed split-K, SM12x facade bypass), and the
-  inverse RoPE fused into the DeepSeek-V4 bf16 `wo_a` einsum on SM8 decode.
-- **NVMe weight offload** — DeepSeek-V4.1 Engram and Qwen3.8 PLE tables are
-  read from NVMe into the VRAM hot cache through a pinned ring; the full tables
-  never enter host memory, so boot cost is independent of checkpoint size.
-- **Determinism / quality** — run-deterministic persistent mix reduction, QSA
-  top-k ordering, chunked-radix insert deferred to request completion
-  (upstream #38319 race), deferred clears for recycled mamba ping-pong slots,
-  and the custom-allreduce pull path for captured graphs on weak-P2P hosts.
 
-## Fixes
+## What You Need To Change
 
-- Pool decode's deterministic-split fence actually waits: the pool layer info
-  now carries the layer id it was missing, so `pool_wait_fence` no longer dies
-  on a `KeyError` that the caller swallowed (the knob looked armed and was not).
-  A request to publish the flag on a build without it now fails at boot instead
-  of leaving python waiting on fences C++ never claims.
-- An uncovered decode batch clears `pool_gpu_report`. The flag is sticky, so
-  one batch past `max_running_requests` used to leave the C++ side skipping the
-  resident experts while the GPU half had not run for it — dropped expert
-  contributions, silently (measured: such a row loses exactly half its MoE
-  output).
-- Pinned-host race eliminated tree-wide: async H2D sources park in a 16-deep
-  ring (`park_pinned`/`h2d_async`); 11 sites — kills the greedy
-  non-determinism / runaway-loop family (Qwen3.8, DeepSeek V4.x; cf. upstream
-  #37343/#35632/#38319/#43956).
-- Heterogeneous TP4 capture deadlock: graph eligibility via group-consensus
-  arch check (`_tp_all`), capture gate `>=10` -> `>=8`.
-- First-request JIT stall on DeepSeek V4.x: flashinfer sampling kernel
-  prewarmed at model load (V4 + dspark); boot-time prewarm also covers SWA page
-  release, QSA graph metadata, small-copy variants, and bs=1 decode.
-- Mid-chunk radix insert defaults off for all models (abort dangled freed
-  pages, #38319).
-- Engram NVMe: each TP rank now serves the exact `shard_range` rows it owns.
+Nothing to stay on the safe path: the defaults are conservative and the GPU
+prefill tier stays off until you switch it on. To reproduce what this build was
+validated with (any of the 16 launch scripts already encodes it):
 
-- Out-of-window SWA slots are now reclaimed **during** a chunked prefill instead
-  of only from the first decode step onward. With a prefix-sharing (radix) cache
-  the old gate held one SWA slot per prompt token for the whole prefill, so the
-  SWA pool -- not `max_total_tokens` or `context_len` -- decided the longest
-  prompt a server could serve at all: at 262144 tokens with
-  `--swa-full-tokens-ratio 0.1` that frontier sat at 25,856 tokens, and a longer
-  request prefilled up to it and then waited forever with no error and nothing
-  in the log. No knob: the frontier helper already frees nothing below
-  `swa_dead_lo` (tree-owned prefix + eviction shield) and keeps
-  `max(window, page_size)` plus the retain floor, so the reclaimed range leaves
-  tombstones in the tree rather than wrong matches.
+```sh
+LK_GPU_PREFILL_MIN_TOKENS=1024      # this value is the switch: 0 (default) = CPU prefill
+LK_GPU_PREFILL_SUB_M=16384          # super-chunk size; the value is also the switch
+LK_GPU_PREFILL_ENGINE=cutlass       # only matters when the tier is on
+LK_GPU_PREFILL_D_SLOTS=16384        # pipelined act window (0 = one window per pass)
+LK_POOL_SLOTS=12                    # resident expert slots per MoE layer
+```
 
-## New knobs
+| Variable | Default | Effect |
+|---|---|---|
+| `LK_GPU_PREFILL_MIN_TOKENS` | **0 (tier off)** | Batch size at which GPU prefill engages; setting it > 0 is what turns the tier on. |
+| `LK_GPU_PREFILL_SUB_M` | **0 (off)** | Super-chunk for long prefills; > 0 enables the super-chunk loop. |
+| `LK_GPU_PREFILL_ENGINE` | `cutlass` | Which GPU-prefill implementation a powered tier uses. `triton` = legacy staging path (fp32 activations, the reference the CPU tier agrees with). Inert when the tier is off. |
+| `LK_GPU_PREFILL_D_SLOTS` | **0 = one window per pass** | > 0 pipelines reorder/gemm/fuse per window inside each pass, cutting activation VRAM. Ignored by triton. |
+| `LK_GPU_PREFILL_WAVE_EXPERTS` | `-1` = auto | Wave width: `0` single-shot, `>0` explicit cap, `-1` size it from the slab. Ignored by triton. |
+| `LK_GPU_PREFETCH_WINDOW` | **1** | Staging ring depth: `2` overlaps host-to-device with the gemm -- only pays off on fast PCIe. Ignored by cutlass. |
+| `LK_POOL_SLOTS` | 0 | Resident expert slots per MoE layer; the value is the switch, and it also turns on the concurrent CPU+GPU decode half unless `LK_POOL_DECODE=0`. |
+| `LK_POOL_DET_SPLIT` | 0 | Freeze the split before the GPU half reads its slots. Now actually enforced; startup aborts if the build cannot honour it. |
 
-- `LK_GPU_PREFILL_D_SLOTS` — cutlass activation-slice window (maps to
-  `cfg.prefill_d_slots`; no env reads inside the library).
-- `LK_PP_DEBUG=1` — compare the GPU prefill tier against the CPU tier per layer.
+Behaviour changes worth knowing: `LK_GPU_PREFILL_BORROW_MB` is gone (row
+borrowing is no longer budgeted), and enabling `LK_POOL_DET_SPLIT` on an older
+build now stops the boot with an error rather than running unenforced.
 
 ## Known Issues
 
-- **Hybrid-SWA reclaim is new and unverified at scale.** The behaviour above
-  ships on by default and has only an offline truth table behind it, not a long
-  production run: verify after the next restart that prompts past the old
-  25,856-token frontier return and that `swa token usage` stops sitting at
-  ~0.99. The failure mode to watch for is over-eviction -- an answer that
-  quotes text from outside the sliding window -- which would mean the frontier
-  helper is reclaiming too close to `swa_dead_lo`.
-- With speculative decoding and the expert pool both on, a batch whose row
-  count is divisible by `draft` is read as one request x `draft` rows, so a
-  plain batch can be mis-split (unreachable without spec; dsv4.1 runs no spec).
-- DeepSeek-V4.1 det512 dynamic split is not yet reproducible; prefill down-GEMM
-  keeps a bf16 hi/lo ~3e-3 tail (plan recorded).
-- lvllm decode GPU half is not yet ported.
-- `reasoning_content` is dropped on `tool_calls` responses with speculative
-  decoding.
-- Three speculative kernels still JIT on the first request (`--warmups
-  prefill_shapes` can absorb them).
+- With speculative decoding and the expert pool both enabled, a decode batch
+  whose row count happens to divide evenly by the draft width can be read as one
+  request with draft rows instead of several requests. Not reachable without
+  speculative decoding.
+- DeepSeek-V4.1 dynamic split at 512-token tracks is still not reproducible; the
+  prefill down-GEMM keeps a ~3e-3 bf16 hi/lo tail.
+- `reasoning_content` is dropped from `tool_calls` responses when speculative
+  decoding is on.
+- Three speculative-decoding kernels still JIT on the first request;
+  `--warmups prefill_shapes` absorbs them.
+
+## Commits
+
+Since v1.6.0 there are 56 commits of ours on top of the upstream base
+(`git log --oneline --first-parent 583fada954..HEAD` for the full list); the
+most recent 12:
+
+```
+1ae927a69f feat(swa): reclaim out-of-window SWA during prefill by default
+d8e24fb154 chore(release): v1.6.2
+f4e8f864d3 chore(launch): default the cutlass engine, pin LK_GPU_PREFILL_D_SLOTS=16384
+997a02ac9c fix(moe): make the pool-decode fence real, clear the gpu-half flag
+a27d5ea5cc feat(swa): reclaim out-of-window SWA during chunked prefill (opt-in)   # superseded by 1ae927a69f
+1945a0a71f fix(engram): serve each TP rank its exact shard_range rows from NVMe
+4f97ab6484 debug(lk_moe): LK_PP_DEBUG=1 compares the GPU prefill tier against the CPU tier per layer
+972824c91d fix(mem_cache): default-disable mid-chunk radix insert for all models (abort dangles freed pages, #38319)
+cbca589a66 feat(lk_moe): LK_GPU_PREFILL_D_SLOTS -> cfg.prefill_d_slots (cutlass act slice window)
+60f6658524 fix(lk_moe): default LK_GPU_PREFILL_ENGINE back to triton   # superseded by f4e8f864d3
+76bd58545f chore(dsv4.1): drop obsolete dspark TP2/TP4 launch scripts
+2783c83388 docs(releasenotes): rewrite as user-facing problems-solved + env table
+```
+
+lk_moe v2.7.1 -> v2.7.2 (16 commits): CUTLASS fp32 intermediates and the
+single N=2I gate/up grouped gemm, the slot-window activation slice pipeline,
+per-window padding fill, **every wave's staging rows published** (this is the
+384-expert long-context fix), the fp32 prefill accumulator booked inside the
+VRAM ledger, a geom reproducer that sweeps wave / d_slots / pool_slots, and an
+atomic `.so` republish that never touches a mapped library.
+
 
 # lsglang v1.6.0 — GPU Expert Pool, NVMe Weight Offload, Super-Mix Prefill
 
 **Base:** upstream sglang @ `583fada954` (main, 2026-09-27)
 **lk_moe:** v2.6.0
 Everything on top of the base is the lk_moe integration and its upgrades.
+
+## What This Release Solves
+
+- **MoE decode is no longer limited to whichever device holds the experts.** The
+  GPU expert pool keeps hot experts resident on the GPU and streams the rest
+  from the host, and a single decode step serves **both halves at the same
+  time**: resident experts through the GPU path, the remainder on CPU. The
+  mailbox decode transport also removes the silent hangs seen on slow hosts at
+  TP4.
+- **Multi-hundred-GiB embedding tables no longer have to fit in host RAM.**
+  NVMe weight offload streams Engram (DSV4.1) and PLE (Qwen3.8) rows from disk
+  into the VRAM hot cache through a pinned ring, so boot time no longer scales
+  with checkpoint size -- a 475 GiB checkpoint boots on a host with far less
+  free RAM than that, and only a small part of its tables is ever resident.
+- **Long prefills (~20k+ tokens) no longer saturate memory** — Super-Mix Prefill
+  processes long prompts through one expert-union staging with a sub-M loop,
+  bounding block-scale temporaries while keeping the GPU pipeline saturated.
 
 ## Model Support
 
@@ -127,41 +171,24 @@ Weight Offload.
 | GLM-5.3 Flash (NVFP4) | ✓ | ✓ | — |
 | DeepSeek V4 Flash (0731) | ✓ | ✓ | — |
 
-## New Features
+## Environment Variables & Tuning
 
-**GPU Expert Cache Pool — CPU and GPU compute in parallel**
-Hot experts stay resident on GPU while the rest stream from CPU, and a decode
-step runs **both halves concurrently**: pool-resident experts through the GPU
-resident-gemv path while the remaining experts compute on CPU — two compute
-engines serving one MoE layer at the same time. Staged GPU/CPU prefill and a
-rewritten CPU expert-decode path; mailbox decode transport (takeover fix: no
-more silent hangs on slow hosts at TP4).
-*Enable:* `LK_POOL_SLOTS=64` (value is the switch: resident slots per MoE
-layer, `0` = off), GPU decode half `LK_POOL_DECODE=1` (default follows pool).
+| Variable | Default | What it does |
+|---|---|---|
+| `LK_POOL_SLOTS` | 0 | GPU expert pool: `>0` turns on concurrent CPU+GPU decode (e.g. `=64` for 64 resident slots per MoE layer), `0` = staging prefill only. |
+| `LK_POOL_DECODE` | auto | Run GPU decode half alongside CPU. Default on when pool is on. |
+| `LK_GPU_PREFILL_MIN_TOKENS` | 1024 | Minimum prompt tokens to use GPU prefill. |
+| `LK_GPU_PREFILL_SUB_M` | 16384 | Sub-M loop for chunked prefill (`0` = per-chunk staging). |
+| `LK_GPU_PREFETCH_WINDOW` | 0 | Overlap H2D copy with GEMM (`2` on fast PCIe). |
+| `LK_ENGRAM_NVME` | 0 | Enable NVMe offload for DeepSeek-V4.1 Engram tables (`1` = on). |
+| `--ple-offload-embedding` | — | Enable NVMe offload for Qwen3.8 PLE tables. |
+| `--ple-offload-backend nvme` | — | Select NVMe backend for PLE offload. |
+| `LK_NVME_DIRECT` | 0 | O_DIRECT reads bypassing page cache, backed by a pinned direct-mapped host cache (`LK_NVME_CACHE_MB`, `LK_NVME_STAGING_MB`). |
 
-**NVMe Weight Offload (new subsystem)**
-- NVMe row filler inside lk_moe: sorted ring -> batched pread -> pinned staging
-  -> H2D, serving both Engram (DSV4.1) and PLE embedding tables (Qwen3.8).
-- Boot cost independent of checkpoint size; multi-hundred-GiB tables never
-  enter RAM — VRAM hot cache + pinned ring only.
-*Enable:* `LK_ENGRAM_NVME=1` (DSV4.1 Engram) or
-`--ple-offload-embedding --ple-offload-backend nvme` (Qwen3.8 PLE).
-Optional: `LK_NVME_DIRECT=1` — O_DIRECT reads bypassing page cache, backed by
-a pinned direct-mapped host cache (`LK_NVME_CACHE_MB`, `LK_NVME_STAGING_MB`).
+## Upgrade Notes
 
-**Super-Mix Prefill**
-Super-chunk scheduler + attention wrapper + per-model plan loops (DSV4,
-Qwen3.8, GLM-5.3): long prefills pass through one expert-union staging with a
-sub-M loop, bounding block-scale temporaries while keeping the GPU-fed pipeline
-saturated.
-*Enable:* `LK_GPU_PREFILL_MIN_TOKENS=1024` + `LK_GPU_PREFILL_SUB_M=16384`
-(value itself switches; `0` = per-chunk staging) together with
-`--chunked-prefill-size`; on fast-PCIe cards add `LK_GPU_PREFETCH_WINDOW=2`
-(copy overlaps GEMM, ping-pong).
-
-## Fixes & Notes
-
-- Environment naming unified under `LK_*`; legacy `LVLLM*` names removed.
+- Environment naming unified under `LK_*`; legacy `LVLLM*` names removed (an
+  old `LVLLM_*` setting is now simply ignored -- move it to the `LK_*` name).
 - Tuning parameters have been optimized and unified — see the
   [README tuning guide](https://github.com/guqiong96/Lsglang/blob/lsglang-v1.6.0/README.md)
   for the full `LK_*` reference and recommended presets per scenario.
