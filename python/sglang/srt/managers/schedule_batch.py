@@ -4012,9 +4012,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                         and req.decode_batch_idx >= sliding_window_size
                     ):
                         self.tree_cache.release_swa_prefix_lock(req)
-                elif (
-                    self.forward_mode.is_extend()
-                    and not self.tree_cache.supports_prefix_sharing()
+                elif self.forward_mode.is_extend() and (
+                    not self.tree_cache.supports_prefix_sharing()
+                    # A tree-backed cache can be reclaimed here too: the helper
+                    # frees nothing below swa_dead_lo (tree prefix + shield) and
+                    # keeps max(window, page) plus the retain floor, so the cost
+                    # is tombstones in the tree, not wrong matches. Off by
+                    # default -- see SGLANG_OPT_SWA_EVICT_IN_PREFILL.
+                    or envs.SGLANG_OPT_SWA_EVICT_IN_PREFILL.get()
                 ):
                     pre_len = self.prefix_lens[idx]
                     if self.enable_overlap:
