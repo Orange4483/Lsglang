@@ -1,38 +1,45 @@
-# lsglang v1.6.1 — Upstream Main Sync, CUTLASS GPU-Prefill, SM8x Determinism
+# lsglang v1.6.2 — CUTLASS GPU-Prefill by Default, Long-Context Correctness
 
-**Base:** upstream sglang main @ `06342acad2` (2026-10-21, 1,387 commits since
-the v1.6.0 base `583fada954`); **lk_moe v2.7.1**.
+**Base:** upstream sglang main @ `06342acad2` (1,387 commits since the v1.6.0
+base `583fada954`); **lk_moe v2.7.2**.
 
 Everything on top of upstream is the lk_moe integration and its upgrades.
 
 ## Highlights
 
-- **Upstream main sync** — unified memory (asymmetric KV rows, fused draft /
-  sliding-window / recurrent-state layers), diffusion pipeline work, Rust
-  gRPC/router extensions, scheduler and MemCache refactors, plus the
-  DeepSeek-V4.1 late-layer pinned-row perf path.
-- **CUTLASS GPU-prefill engine** selectable
-  (`LK_GPU_PREFILL_ENGINE=cutlass`; HOTFIX 2026-10-22: default reverted to
-  `triton` — the cutlass engine's bf16 intermediates drift long-context
-  logits and flip borderline EOS; see journal 2026-10-22): restored C++ grouped-GEMM path with
-  unbounded pool-row borrowing (the `LK_GPU_PREFILL_BORROW_MB` budget is gone),
-  one freeze window per prefill forward, whole-slab block planning, and wave
-  width control (`LK_GPU_PREFILL_WAVE_EXPERTS=-1` auto / `0` single-shot /
-  `>0` cap). Triton staging remains selectable.
+- **CUTLASS GPU-prefill is the default engine** (`LK_GPU_PREFILL_ENGINE`; unset
+  or an unrecognized value select it, `=triton` opts out to the staging
+  group-GEMM path). Whole-slab block planning, one freeze window per prefill
+  forward, unbounded pool-row borrowing (the `LK_GPU_PREFILL_BORROW_MB` budget
+  is gone), wave width control (`LK_GPU_PREFILL_WAVE_EXPERTS`: `-1` auto / `0`
+  single-shot / `>0` cap) and a slot-window activation-slice pipeline
+  (`LK_GPU_PREFILL_D_SLOTS`, act slice decoupled from `SUB_M`). It is safe to
+  default now: the engine computes in fp32 (its earlier bf16 intermediates
+  drifted long-context logits and flipped borderline EOS) and its output
+  accumulator is booked inside the lk_moe VRAM ledger instead of an off-book
+  torch scratch. Every production launch script pins the engine and sets
+  `LK_GPU_PREFILL_D_SLOTS=16384`.
+- **Multi-wave prefill is correct at wide expert counts** — every wave's
+  staging rows are published, and act residency is keyed on the slice rather
+  than on the first wave. This is the DeepSeek-V4.1 (E=384 -> auto width 66 ->
+  6 waves) long-context corruption; verified online at 13,236 tok through the
+  chat needle suite (24/24) and at the 24.6k-token wall.
 - **GPU expert pool** — deterministic split (`LK_POOL_DET_SPLIT`: frozen
   snapshot + copy-fence wait before the GPU half reads slots), two-phase lease
   with a publish-side ledger, NVFP4 scale-stride fix (real-weight rel 0.86 ->
-  1.2e-6), and expert-pool park around CUDA-graph capture/replay. `LK_POOL_SLOTS=0`
+  1.2e-6), expert-pool park around CUDA-graph capture/replay. `LK_POOL_SLOTS=0`
   now enables prefill-only staging on its own instead of disabling GPU prefill.
+- **Upstream main sync** — unified memory (asymmetric KV rows, fused draft /
+  sliding-window / recurrent-state layers), scheduler and MemCache refactors,
+  Rust gRPC/router extensions, diffusion pipeline work, plus the DeepSeek-V4.1
+  late-layer pinned-row perf path.
 - **SM8x performance** — dense block-FP8 group-32 Marlin W8A16 decode
   (dual-retain repack, M<=16, kernels prewarmed before capture), deterministic
   FP8 (`SGLANG_DETERMINISTIC_FP8`: fixed split-K, SM12x facade bypass), and the
   inverse RoPE fused into the DeepSeek-V4 bf16 `wo_a` einsum on SM8 decode.
-- **NVMe weight offload — real NVMe, no host-RAM residency** — DeepSeek-V4.1
-  Engram and Qwen3.8 PLE tables are read from NVMe into the VRAM hot cache
-  through a pinned ring; the full tables never enter host memory (boot cost is
-  independent of checkpoint size). Includes the DeepSeek-V4.1-Flash-1017 model
-  entry and NVMe launch scripts.
+- **NVMe weight offload** — DeepSeek-V4.1 Engram and Qwen3.8 PLE tables are
+  read from NVMe into the VRAM hot cache through a pinned ring; the full tables
+  never enter host memory, so boot cost is independent of checkpoint size.
 - **Determinism / quality** — run-deterministic persistent mix reduction, QSA
   top-k ordering, chunked-radix insert deferred to request completion
   (upstream #38319 race), deferred clears for recycled mamba ping-pong slots,
@@ -40,24 +47,58 @@ Everything on top of upstream is the lk_moe integration and its upgrades.
 
 ## Fixes
 
+- Pool decode's deterministic-split fence actually waits: the pool layer info
+  now carries the layer id it was missing, so `pool_wait_fence` no longer dies
+  on a `KeyError` that the caller swallowed (the knob looked armed and was not).
+  A request to publish the flag on a build without it now fails at boot instead
+  of leaving python waiting on fences C++ never claims.
+- An uncovered decode batch clears `pool_gpu_report`. The flag is sticky, so
+  one batch past `max_running_requests` used to leave the C++ side skipping the
+  resident experts while the GPU half had not run for it — dropped expert
+  contributions, silently (measured: such a row loses exactly half its MoE
+  output).
 - Pinned-host race eliminated tree-wide: async H2D sources park in a 16-deep
-  ring (`park_pinned`/`h2d_async`); 11 sites — kills the greedy non-determinism /
-  runaway-loop family (Qwen3.8, DeepSeek V4.x; cf. upstream #37343/#35632/#38319/#43956).
+  ring (`park_pinned`/`h2d_async`); 11 sites — kills the greedy
+  non-determinism / runaway-loop family (Qwen3.8, DeepSeek V4.x; cf. upstream
+  #37343/#35632/#38319/#43956).
 - Heterogeneous TP4 capture deadlock: graph eligibility via group-consensus
-  arch check (`_tp_all`), capture gate `>=10` → `>=8`.
-- First-request JIT stall on DeepSeek V4.x: flashinfer sampling kernel prewarmed
-  at model load (V4 + dspark); boot-time prewarm also covers SWA page release,
-  QSA graph metadata, small-copy variants, and bs=1 decode.
+  arch check (`_tp_all`), capture gate `>=10` -> `>=8`.
+- First-request JIT stall on DeepSeek V4.x: flashinfer sampling kernel
+  prewarmed at model load (V4 + dspark); boot-time prewarm also covers SWA page
+  release, QSA graph metadata, small-copy variants, and bs=1 decode.
+- Mid-chunk radix insert defaults off for all models (abort dangled freed
+  pages, #38319).
+- Engram NVMe: each TP rank now serves the exact `shard_range` rows it owns.
+
+## New knobs
+
+- `SGLANG_OPT_SWA_EVICT_IN_PREFILL` (default `0`) — reclaim out-of-window SWA
+  slots during a chunked prefill instead of only in decode; see Known Issues.
+- `LK_GPU_PREFILL_D_SLOTS` — cutlass activation-slice window (maps to
+  `cfg.prefill_d_slots`; no env reads inside the library).
+- `LK_PP_DEBUG=1` — compare the GPU prefill tier against the CPU tier per layer.
 
 ## Known Issues
 
+- **Hybrid-SWA context ceiling**: the SWA pool, not `max_total_tokens`, sets the
+  longest servable prompt. At `--max-total-tokens 262144` with
+  `--swa-full-tokens-ratio 0.1` the pool admits **25,856** prompt tokens
+  (`align_page_size(int(full*ratio))` minus admission slack, page_size 256); a
+  longer request keeps prefilling to that frontier and then waits forever with
+  no error and nothing in the log. `SGLANG_OPT_SWA_EVICT_IN_PREFILL=1` removes
+  the ceiling — it is off by default and **not yet verified on a production
+  restart**; the freed range leaves tombstones in the radix tree, so treat it as
+  experimental and watch for answers that cite out-of-window text.
+- With speculative decoding and the expert pool both on, a batch whose row
+  count is divisible by `draft` is read as one request x `draft` rows, so a
+  plain batch can be mis-split (unreachable without spec; dsv4.1 runs no spec).
 - DeepSeek-V4.1 det512 dynamic split is not yet reproducible; prefill down-GEMM
   keeps a bf16 hi/lo ~3e-3 tail (plan recorded).
 - lvllm decode GPU half is not yet ported.
-- `reasoning_content` is dropped on `tool_calls` responses with speculative decoding.
+- `reasoning_content` is dropped on `tool_calls` responses with speculative
+  decoding.
 - Three speculative kernels still JIT on the first request (`--warmups
   prefill_shapes` can absorb them).
-
 
 # lsglang v1.6.0 — GPU Expert Pool, NVMe Weight Offload, Super-Mix Prefill
 
