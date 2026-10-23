@@ -270,6 +270,12 @@ def dense_prefill_topk(
 # hardcoded 1 GiB tile is 768 MiB at lc~24K on a 24 GB card, where the KV pool
 # owns most of the card and the transient peak (relu/mul copies) OOMs at 32K.
 _TORCH_SCORE_BUDGET_BYTES = 1 << 30
+# `scores` keeps more than the tile alive: the einsum result, an fp32 product of
+# it, and the fp32 row sum. Sized 1:1 with the budget, a 1 GiB budget measured a
+# 4.0x tile peak (3.1x with the in-place relu in `scores`) on a 3090 at lc 24K
+# and 96K -- which is the OOM that only shows up deep into a long prompt. Rows
+# are sized for the peak instead.
+_SCORE_BUDGET_TO_TILE_DIVISOR = 3
 
 
 def _torch_score_budget_bytes() -> int:
@@ -356,8 +362,17 @@ def _score_chunks(
 ) -> Iterator[ChunkScores]:
     lc, j = request.lc, request.columns
     # Chunk rows so the [rows, heads, lc] bf16 scores stay under the budget,
-    # capped by current free memory (the KV pool already owns most of it).
-    rows_per_chunk = max(1, _torch_score_budget_bytes() // (q.shape[1] * lc * 2))
+    # capped by current free memory (the KV pool already owns most of it). The
+    # budget is what `scores` may hold, not the tile alone: `scores` keeps the
+    # einsum result plus an fp32 product of it, so a tile budgeted 1:1 turns into
+    # ~3x the budget in peak allocation -- measured 4.0x before the in-place relu
+    # (3.1x after) at lc 24K and 96K on a 3090, and that is what OOMs deep into a
+    # long prompt while the same shape fits at the start of it.
+    rows_per_chunk = max(
+        1,
+        _torch_score_budget_bytes()
+        // (q.shape[1] * lc * 2 * _SCORE_BUDGET_TO_TILE_DIVISOR),
+    )
     for start in range(0, request.tok.numel(), rows_per_chunk):
         rows = slice(start, start + rows_per_chunk)
         tok_c, lens_c = request.tok[rows], request.lens[rows]

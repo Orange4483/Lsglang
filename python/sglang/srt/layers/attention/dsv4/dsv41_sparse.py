@@ -287,5 +287,10 @@ class DeepseekV41Indexer(nn.Module):
     ) -> torch.Tensor:
         """q [t, H, d], k [n, d], weights [t, H] -> [t, n], summed over all heads."""
         s = torch.einsum("bhd,nd->bhn", q, k)
-        s = (s.relu() * weights.unsqueeze(-1)).sum(dim=1)
+        # In place: `_score_chunks` sizes this tile against the indexer budget, so
+        # a relu copy of it is another tile of transient at the exact moment the
+        # card has none (the KV pool owns the rest). Measures 4.0x -> 3.1x the
+        # tile on a 3090; the remaining 2x is the fp32 product below, which the
+        # budget side accounts for.
+        s = (s.relu_() * weights.unsqueeze(-1)).sum(dim=1)
         return s.float()
