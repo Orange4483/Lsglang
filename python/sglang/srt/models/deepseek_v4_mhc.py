@@ -48,6 +48,7 @@ _is_xpu = is_xpu()
 
 logger = logging.getLogger(__name__)
 _SC_POST_LOGGED = False
+_SC_COMBINE_LOGGED = False
 
 # ---------------------------------------------------------------------------
 # What a layer hands this module
@@ -409,6 +410,53 @@ def _combine(
     cfg, norm = hc.cfg, hc.norm
     x, apply_pre = state.residual, state.pre
     quantize = quantized is not None
+
+    # Super-chunk: this is row-local, so run it per sub-chunk, the way `post`
+    # below already does. Monolithic, one call costs a [rows, hidden] bf16 for the
+    # combine plus another for the norm (160 MiB each at 16,384 rows), and
+    # `flatten(1)` is only a view while `x` is contiguous -- a row slice makes it a
+    # [rows, mult * hidden] copy on top. The fused single-kernel form below hides
+    # all of it on sm90/sm100; everywhere else the sub-chunk plan is what bounds
+    # the transient, so the ceiling stays set by the plan's rows rather than by the
+    # configured super-chunk. Not applied where that fused form would have run: a
+    # 1,024-row slice falls outside its row-count gate and would pick a different
+    # kernel than the whole forward does.
+    plan = None
+    if not quantize and not (get_platform().is_blackwell or get_platform().is_sm90):
+        from sglang.srt.layers.attention.super_chunk_backend import (
+            super_chunk_in_late_tail,
+            super_chunk_token_plan,
+        )
+
+        if not super_chunk_in_late_tail(None):
+            plan = super_chunk_token_plan(None)
+            if plan is not None and (len(plan) < 2 or plan[-1][1] != x.shape[0]):
+                plan = None
+    if plan is not None:
+        out = None
+        for lo, hi, _child_fb in plan:
+            tok = slice(lo, hi)
+            rows = _combine(
+                hc,
+                HcState(x[tok], None if apply_pre is None else apply_pre[tok]),
+                None,
+            )
+            if out is None:
+                out = torch.empty(
+                    (x.shape[0],) + rows.shape[1:], dtype=rows.dtype, device=rows.device
+                )
+            out[tok] = rows
+        global _SC_COMBINE_LOGGED
+        if not _SC_COMBINE_LOGGED:
+            _SC_COMBINE_LOGGED = True
+            logger.info(
+                "[sc-dbg] mhc-combine LOOP active plan=%d rows=%d chunk_max=%d",
+                len(plan),
+                x.shape[0],
+                max(hi - lo for lo, hi, _ in plan),
+            )
+        return out
+
     x_flat = x.flatten(1)
 
     if apply_pre is None:
