@@ -79,7 +79,7 @@ dependencies = [
   "sgl-deep-ep==0.1.2.post1",
   "sgl-deep-gemm==0.2.2",
   "sglang-kernel==0.4.10",
-  "lk_moe==2.7.2",
+  "lk_moe==2.7.3",
   "smg-grpc-servicer>=0.9.0",
   "soundfile==0.13.1",
   "tiktoken",

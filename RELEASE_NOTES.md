@@ -1,3 +1,36 @@
+# lsglang v1.6.5 — The NVMe Engram Can No Longer Fail Silently
+
+**Base:** upstream sglang main @ `06342acad2`; **lk_moe v2.7.3**.
+
+## What Changed
+
+- **The NVMe gather gate never releases on timeout** (lk_moe v2.7.3): the
+  300 ms release handed merges stage bytes from an older ring lap -- stale
+  rows entered the model as embeddings (garble), and lost tickets made every
+  later gate burn the full budget (hang-like stalls). The soft limit now only
+  raises a sticky slow-disk warning; a fault that cannot resolve is loud.
+- **Stale rows emit zero, never the slot's previous bytes** (merge kernel).
+- **Faults are checked on every processed tick**, not one tick in sixteen.
+- **The `[engram-nvme]` health line actually prints** (_tick queried an event
+  recorded microseconds ago -- it never read back; graph replay also skipped
+  the old %1024 gate).
+- **`LK_NVME_CACHE_MB` is now a whole-machine budget**, divided over
+  (engram layers x tp) stores at attach; the 256GB-class NVMe target no
+  longer silently multiplies it x4.
+
+## Verified
+
+- Store-level A/B on a 5060Ti with the real 1017 shard: legacy release =
+  82,304 silently wrong rows, zero errors; forever-wait = zero wrong rows,
+  warnings visible.
+- 3090 model-level A/B vs the host-table arm: long-prefill and multi-turn
+  opencode shapes bitwise identical; gsm8k cold 357 s (was 454), decode
+  within 2% of all-RAM, 94% cache hits.
+
+## Commits
+
+Everything added since v1.6.4: `git log --oneline lsglang-v1.6.4..HEAD`.
+
 # lsglang v1.6.4 — Smaller Super-Chunk Transients
 
 **Base:** upstream sglang main @ `06342acad2`; **lk_moe v2.7.2** (unchanged).
