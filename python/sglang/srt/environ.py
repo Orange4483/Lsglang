@@ -722,15 +722,6 @@ class Envs:
     SGLANG_OPT_RELEASE_PREFILL_SWA = EnvBoolWithAlias(
         False, deprecated_name="SGLANG_OPT_SWA_RELEASE_LEAF_LOCK_AFTER_WINDOW"
     )
-    # Reclaim out-of-window SWA slots DURING a (chunked) prefill instead of only
-    # in decode. Without it a prefix-sharing cache pins one SWA slot per prompt
-    # token until the first decode step, so the SWA pool -- not max_total_tokens
-    # or context_len -- becomes the longest prompt the server can serve, and a
-    # request past it stalls in the waiting queue forever. The frontier helper
-    # keeps max(window, page_size), stays above swa_dead_lo (tree prefix +
-    # eviction shield) and honours swa_retain_floor, so only this request's own
-    # out-of-window slots are freed; what they leave in the tree are tombstones.
-    SGLANG_OPT_SWA_EVICT_IN_PREFILL = EnvBool(False)
 
     # ===================================================================
     # PD disaggregation runtime

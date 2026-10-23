@@ -70,25 +70,33 @@ Everything on top of upstream is the lk_moe integration and its upgrades.
   pages, #38319).
 - Engram NVMe: each TP rank now serves the exact `shard_range` rows it owns.
 
+- Out-of-window SWA slots are now reclaimed **during** a chunked prefill instead
+  of only from the first decode step onward. With a prefix-sharing (radix) cache
+  the old gate held one SWA slot per prompt token for the whole prefill, so the
+  SWA pool -- not `max_total_tokens` or `context_len` -- decided the longest
+  prompt a server could serve at all: at 262144 tokens with
+  `--swa-full-tokens-ratio 0.1` that frontier sat at 25,856 tokens, and a longer
+  request prefilled up to it and then waited forever with no error and nothing
+  in the log. No knob: the frontier helper already frees nothing below
+  `swa_dead_lo` (tree-owned prefix + eviction shield) and keeps
+  `max(window, page_size)` plus the retain floor, so the reclaimed range leaves
+  tombstones in the tree rather than wrong matches.
+
 ## New knobs
 
-- `SGLANG_OPT_SWA_EVICT_IN_PREFILL` (default `0`) — reclaim out-of-window SWA
-  slots during a chunked prefill instead of only in decode; see Known Issues.
 - `LK_GPU_PREFILL_D_SLOTS` — cutlass activation-slice window (maps to
   `cfg.prefill_d_slots`; no env reads inside the library).
 - `LK_PP_DEBUG=1` — compare the GPU prefill tier against the CPU tier per layer.
 
 ## Known Issues
 
-- **Hybrid-SWA context ceiling**: the SWA pool, not `max_total_tokens`, sets the
-  longest servable prompt. At `--max-total-tokens 262144` with
-  `--swa-full-tokens-ratio 0.1` the pool admits **25,856** prompt tokens
-  (`align_page_size(int(full*ratio))` minus admission slack, page_size 256); a
-  longer request keeps prefilling to that frontier and then waits forever with
-  no error and nothing in the log. `SGLANG_OPT_SWA_EVICT_IN_PREFILL=1` removes
-  the ceiling — it is off by default and **not yet verified on a production
-  restart**; the freed range leaves tombstones in the radix tree, so treat it as
-  experimental and watch for answers that cite out-of-window text.
+- **Hybrid-SWA reclaim is new and unverified at scale.** The behaviour above
+  ships on by default and has only an offline truth table behind it, not a long
+  production run: verify after the next restart that prompts past the old
+  25,856-token frontier return and that `swa token usage` stops sitting at
+  ~0.99. The failure mode to watch for is over-eviction -- an answer that
+  quotes text from outside the sliding window -- which would mean the frontier
+  helper is reclaiming too close to `swa_dead_lo`.
 - With speculative decoding and the expert pool both on, a batch whose row
   count is divisible by `draft` is read as one request x `draft` rows, so a
   plain batch can be mis-split (unreachable without spec; dsv4.1 runs no spec).

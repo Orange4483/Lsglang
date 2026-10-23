@@ -4012,15 +4012,15 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                         and req.decode_batch_idx >= sliding_window_size
                     ):
                         self.tree_cache.release_swa_prefix_lock(req)
-                elif self.forward_mode.is_extend() and (
-                    not self.tree_cache.supports_prefix_sharing()
-                    # A tree-backed cache can be reclaimed here too: the helper
-                    # frees nothing below swa_dead_lo (tree prefix + shield) and
-                    # keeps max(window, page) plus the retain floor, so the cost
-                    # is tombstones in the tree, not wrong matches. Off by
-                    # default -- see SGLANG_OPT_SWA_EVICT_IN_PREFILL.
-                    or envs.SGLANG_OPT_SWA_EVICT_IN_PREFILL.get()
-                ):
+                elif self.forward_mode.is_extend():
+                    # A tree-backed cache is reclaimable here too: the helper
+                    # frees nothing below swa_dead_lo (tree prefix + eviction
+                    # shield) and keeps max(window, page) plus the retain floor,
+                    # so what it leaves behind are tombstones, not wrong
+                    # matches. Skipping this used to pin one SWA slot per prompt
+                    # token until the first decode step, which made the SWA pool
+                    # -- not max_total_tokens or context_len -- the longest
+                    # prompt a server could serve at all.
                     pre_len = self.prefix_lens[idx]
                     if self.enable_overlap:
                         # In chunked prefill case, when the second extend batch is scheduling, the first extend batch is still running, so we cannot evict swa tokens
