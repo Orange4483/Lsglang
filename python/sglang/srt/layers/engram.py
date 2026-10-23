@@ -55,9 +55,9 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.runtime_context import get_model, get_parallel, get_serving
 from sglang.srt.utils import add_prefix, is_cuda, is_gfx95_supported, is_hip
 from sglang.srt.utils.common import (
-    is_lk_engram_nvme_enabled,
     get_lk_engram_nvme_cache_bytes,
     get_lk_engram_nvme_staging_bytes,
+    is_lk_engram_nvme_enabled,
 )
 from sglang.srt.utils.hf_transformers.tokenizer import get_tokenizer
 
@@ -911,6 +911,10 @@ class EngramEmbedding(nn.Module):
                 dim,
                 get_lk_engram_nvme_cache_bytes(),
                 get_lk_engram_nvme_staging_bytes(),
+                # The filler must serve exactly this rank's shard; re-deriving
+                # the split in the store would drift from shard_range.
+                row_start=self.row_start,
+                shard_rows=self.rows,
             )
             # The rows are served by fd+pread from the same shard; do not
             # materialize the checkpoint copy at load (header was validated in
@@ -1060,6 +1064,8 @@ class EngramEmbedding(nn.Module):
                 # TP contract (see _lookup): each rank serves only its row
                 # shard; unowned rows must read zero so the all-reduce
                 # reassembles exactly once.
+                # The store's file offsets are rebased to its row_start, so
+                # these shard-local ids read this rank's global rows.
                 local = indices - self.row_start
                 owned = (local >= 0) & (local < self.rows)
                 rows = self.nvme_table.lookup(local.masked_fill(~owned, 0))

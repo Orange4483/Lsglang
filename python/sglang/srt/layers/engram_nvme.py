@@ -34,7 +34,11 @@ from sglang.kernels.ops.quantization.fp8_emulate import (
     fp8_native_supported,
 )
 from sglang.srt.utils import logger
-from sglang.srt.utils.common import lk_nvme_cache_bytes, lk_nvme_direct, is_lk_engram_nvme_enabled
+from sglang.srt.utils.common import (
+    is_lk_engram_nvme_enabled,
+    lk_nvme_cache_bytes,
+    lk_nvme_direct,
+)
 
 # e8m0 has no zero: the exponent byte 0 encodes 2**-127.
 _E8M0_ZERO = 2.0**-127
@@ -126,8 +130,7 @@ def validate_configuration(parallel, schedule, spec, graph, host_table):
 
 
 @triton.jit
-def _nvme_lookup(ids_ptr, d_tk_ptr, h_ring_ptr, h_cnt_ptr, stat_ptr,
-                 row_hi, ring_mask):
+def _nvme_lookup(ids_ptr, d_tk_ptr, h_ring_ptr, h_cnt_ptr, stat_ptr, row_hi, ring_mask):
     r = tl.program_id(0)
     id = tl.load(ids_ptr + r)
     h_cnt = h_cnt_ptr.to(tl.pointer_type(tl.int64))
@@ -143,10 +146,20 @@ def _nvme_lookup(ids_ptr, d_tk_ptr, h_ring_ptr, h_cnt_ptr, stat_ptr,
 
 
 @triton.jit
-def _nvme_merge(ids_ptr, out_ptr, d_tk_ptr, h_stamp_ptr, h_stage_ptr, stat_ptr,
-                row_hi, stage_mask,
-                DIM: tl.constexpr, BLK: tl.constexpr,
-                E8M0_ZERO: tl.constexpr, FP8_PTR: tl.constexpr):
+def _nvme_merge(
+    ids_ptr,
+    out_ptr,
+    d_tk_ptr,
+    h_stamp_ptr,
+    h_stage_ptr,
+    stat_ptr,
+    row_hi,
+    stage_mask,
+    DIM: tl.constexpr,
+    BLK: tl.constexpr,
+    E8M0_ZERO: tl.constexpr,
+    FP8_PTR: tl.constexpr,
+):
     r = tl.program_id(0)
     id = tl.load(ids_ptr + r)
     owned = (id >= 0) & (id < row_hi)
@@ -160,14 +173,15 @@ def _nvme_merge(ids_ptr, out_ptr, d_tk_ptr, h_stamp_ptr, h_stage_ptr, stat_ptr,
     base = h_stage_ptr.to(tl.int64) + slot.to(tl.int64) * (DIM + DIM // BLK)
     offs = tl.arange(0, DIM)
     if FP8_PTR:
-        vals = tl.load(base.to(tl.pointer_type(tl.float8e4nv)) + offs,
-                       mask=owned, other=0.0).to(tl.float32)
+        vals = tl.load(
+            base.to(tl.pointer_type(tl.float8e4nv)) + offs, mask=owned, other=0.0
+        ).to(tl.float32)
     else:
-        b = tl.load(base.to(tl.pointer_type(tl.uint8)) + offs, mask=owned,
-                    other=0)
+        b = tl.load(base.to(tl.pointer_type(tl.uint8)) + offs, mask=owned, other=0)
         vals = e4m3fn_u8_to_f32(b)
-    exps = tl.load((base + DIM).to(tl.pointer_type(tl.uint8)) + offs // BLK,
-                   mask=owned, other=0).to(tl.int32)
+    exps = tl.load(
+        (base + DIM).to(tl.pointer_type(tl.uint8)) + offs // BLK, mask=owned, other=0
+    ).to(tl.int32)
     scale = (exps << 23).to(tl.float32, bitcast=True)
     scale = tl.where(exps == 0, E8M0_ZERO, scale)
     out = tl.where(owned, vals * scale, 0.0)
@@ -175,33 +189,52 @@ def _nvme_merge(ids_ptr, out_ptr, d_tk_ptr, h_stamp_ptr, h_stage_ptr, stat_ptr,
 
 
 class NvmeEngramStore:
-    """One Engram layer's rows served by the lk_moe N1 filler (one slot each)."""
+    """One Engram layer's rows served by the lk_moe N1 filler (one slot each).
 
-    def __init__(self, model_path, layer_id, rows, dim, cache_bytes, staging_bytes):
+    ``row_start``/``shard_rows`` are the caller's TP shard in global table rows
+    (``shard_range``): they are the only split rule, so the filler and the
+    lookup kernel agree on which ids this rank owns. Ids stay shard-local end
+    to end (``EngramEmbedding`` subtracts ``row_start``), while the checkpoint
+    offsets point at global row 0, so both file offsets are rebased here once:
+    local id ``i`` preads global row ``row_start + i``.
+    """
+
+    def __init__(
+        self,
+        model_path,
+        layer_id,
+        rows,
+        dim,
+        cache_bytes,
+        staging_bytes,
+        *,
+        row_start: int,
+        shard_rows: int,
+    ):
         import lk_moe
-        from sglang.srt.runtime_context import get_parallel
 
+        if not 0 <= row_start <= row_start + shard_rows <= rows:
+            raise ValueError(
+                f"Engram shard [{row_start}, {row_start + shard_rows}) is not "
+                f"inside the table of {rows} rows"
+            )
         self.rows = rows
+        self.row_hi = shard_rows
         self._loaded = set()
-        try:
-            from sglang.srt.runtime_context import get_parallel
-
-            parallel = get_parallel()
-            tp_size, tp_rank = parallel.tp_size, parallel.tp_rank
-        except Exception:  # unit tests / offline harnesses: no published context
-            tp_size, tp_rank = 1, 0
-        row_start = rows * tp_rank // tp_size
-        row_end = rows * (tp_rank + 1) // tp_size
-        self.row_hi = row_end - row_start
         shard, (w_off, s_off) = checkpoint_table(model_path, layer_id, rows, dim)
+        w_off += row_start * dim
+        s_off += row_start * (dim // 32)  # scale blocks per row, as validated above
         dev = torch.device("cuda")
-        self._h_ring = torch.full((_RING,), -1, dtype=torch.int64,
-                                  device="cpu").pin_memory()
+        self._h_ring = torch.full(
+            (_RING,), -1, dtype=torch.int64, device="cpu"
+        ).pin_memory()
         self._h_cnt = torch.zeros(2, dtype=torch.int64, device="cpu").pin_memory()
-        self._h_stamp = torch.zeros(_STAGE, dtype=torch.int64,
-                                    device="cpu").pin_memory()
-        self._h_stage = torch.zeros((_STAGE, 264), dtype=torch.uint8,
-                                    device="cpu").pin_memory()
+        self._h_stamp = torch.zeros(
+            _STAGE, dtype=torch.int64, device="cpu"
+        ).pin_memory()
+        self._h_stage = torch.zeros(
+            (_STAGE, 264), dtype=torch.uint8, device="cpu"
+        ).pin_memory()
         self._d_tk = torch.zeros(_RING, dtype=torch.int64, device=dev)
         self._err = torch.zeros(1, dtype=torch.int64, device=dev)
         self._stat = torch.zeros(3, dtype=torch.int64, device=dev)
@@ -213,10 +246,20 @@ class NvmeEngramStore:
         if lk_nvme_direct(is_lk_engram_nvme_enabled()):
             direct_fd = os.open(str(shard), os.O_RDONLY | os.O_DIRECT)
         self._slot = lk_moe.nvme_filler_attach_gather(
-            fd, w_off, s_off, 256, 8, self.row_hi, _DTK_MASK,
-            self._h_ring.data_ptr(), self._h_cnt.data_ptr(),
-            [self._h_stage.data_ptr()], _STAGE, self._h_stamp.data_ptr(),
-            direct_fd, lk_nvme_cache_bytes(is_lk_engram_nvme_enabled()),
+            fd,
+            w_off,
+            s_off,
+            256,
+            8,
+            self.row_hi,
+            _DTK_MASK,
+            self._h_ring.data_ptr(),
+            self._h_cnt.data_ptr(),
+            [self._h_stage.data_ptr()],
+            _STAGE,
+            self._h_stamp.data_ptr(),
+            direct_fd,
+            lk_nvme_cache_bytes(is_lk_engram_nvme_enabled()),
         )
         if self._slot < 0:
             os.close(fd)
@@ -229,8 +272,8 @@ class NvmeEngramStore:
     def validate_weight(self, kind, source):
         if kind in self._loaded:
             raise RuntimeError(
-            "NVMe Engram checkpoints are immutable; restart to reload"
-        )
+                "NVMe Engram checkpoints are immutable; restart to reload"
+            )
         width, dtype = (
             (256, torch.float8_e4m3fn)
             if kind == "weight"
@@ -273,8 +316,9 @@ class NvmeEngramStore:
         import lk_moe
 
         count = indices.numel()
-        out = torch.empty((*indices.shape, 256), dtype=torch.bfloat16,
-                          device=indices.device)
+        out = torch.empty(
+            (*indices.shape, 256), dtype=torch.bfloat16, device=indices.device
+        )
         if not count:
             return out
         if indices.dtype != torch.int64 or not indices.is_cuda:
@@ -285,17 +329,30 @@ class NvmeEngramStore:
         for off in range(0, count, _CHUNK):
             n = min(_CHUNK, count - off)
             _nvme_lookup[(n,)](
-                flat[off:], self._d_tk, self._h_ring.data_ptr(),
-                self._h_cnt.data_ptr(), self._stat, self.row_hi, _DTK_MASK,
+                flat[off:],
+                self._d_tk,
+                self._h_ring.data_ptr(),
+                self._h_cnt.data_ptr(),
+                self._stat,
+                self.row_hi,
+                _DTK_MASK,
                 num_warps=1,
             )
-            lk_moe.nvme_gate(self._h_cnt.data_ptr(), self._err.data_ptr(),
-                             _GATE_LIMIT_US, stream)
+            lk_moe.nvme_gate(
+                self._h_cnt.data_ptr(), self._err.data_ptr(), _GATE_LIMIT_US, stream
+            )
             _nvme_merge[(n,)](
-                flat[off:], rows[off:], self._d_tk,
-                self._h_stamp.data_ptr(), self._h_stage.data_ptr(),
-                self._stat, self.row_hi, _DTK_MASK,
-                DIM=256, BLK=32, E8M0_ZERO=_E8M0_ZERO,
+                flat[off:],
+                rows[off:],
+                self._d_tk,
+                self._h_stamp.data_ptr(),
+                self._h_stage.data_ptr(),
+                self._stat,
+                self.row_hi,
+                _DTK_MASK,
+                DIM=256,
+                BLK=32,
+                E8M0_ZERO=_E8M0_ZERO,
                 FP8_PTR=fp8_native_supported(),
             )
         self._tick()
@@ -315,14 +372,20 @@ class NvmeEngramStore:
                     logger.info(
                         "[engram-nvme] layer-lookups=%d bad=%d bad_ids=%d"
                         " filler(cycles=%d rows=%d preads=%d dedup=%d MB=%d)",
-                        look, bad, bad_id, fs["cycles"], fs["rows"],
-                        fs["preads"], fs["dedup"], fs["bytes"] >> 20,
+                        look,
+                        bad,
+                        bad_id,
+                        fs["cycles"],
+                        fs["rows"],
+                        fs["preads"],
+                        fs["dedup"],
+                        fs["bytes"] >> 20,
                     )
                     if bad or bad_id:
                         raise RuntimeError(
                             "NVMe Engram gather fault: bad=%d bad_ids=%d"
-                            " gate_err=%d" % (bad, bad_id,
-                                             int(self._err.sum().item())))
+                            " gate_err=%d" % (bad, bad_id, int(self._err.sum().item()))
+                        )
                 self._stat.zero_()
 
 
