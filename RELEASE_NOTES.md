@@ -1,3 +1,25 @@
+# lsglang v1.6.4 — Smaller Super-Chunk Transients
+
+**Base:** upstream sglang main @ `06342acad2`; **lk_moe v2.7.2** (unchanged).
+
+## What Changed
+
+- **`_combine` runs per sub-chunk** instead of allocating the whole chunk at
+  once: transient 320 -> 190 MiB at 16,384 rows, +0.4% of a forward, bitwise
+  identical (skipped on sm90/sm100, where the fused kernel would change).
+- **Indexer `scores` peak: 4.11x -> 1.05x of its budget** -- `relu_()` in place
+  and rows sized against the measured 3.1x peak.
+- **DeepSeek-V4.1 scripts: `SUB_M=12288`** (was 8192) and `LK_POOL_LOG=0`. A
+  250k-token request now runs in 21 chunks / 676 s with no OOM.
+
+`expandable_segments` is gone from every launch script: with the card full it
+only logged `memory mapping failed ... (free: 6 MiB)` -- physical pages, not
+fragmentation.
+
+## Commits
+
+Everything added since v1.6.3: `git log --oneline lsglang-v1.6.3..HEAD`.
+
 # lsglang v1.6.3 — The Super-Chunk Now Fits Its Own Reservation
 
 **Base:** upstream sglang main @ `06342acad2`; **lk_moe v2.7.2** (unchanged).
