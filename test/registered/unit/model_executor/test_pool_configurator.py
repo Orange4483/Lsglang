@@ -1756,5 +1756,52 @@ class TestFusedDraftPricing(unittest.TestCase):
         self._assert_unified_bytes_price_the_fused_entry(cfg, config, available)
 
 
+class TestSWARequestCapSuperChunk(CustomTestCase):
+    """The super-chunk has to be inside the SWA reservation, not only inside the
+    per-forward token budget: the chunk is measured against the reservation, so a
+    reservation built from chunked_prefill_size alone clamps a super-chunk to a
+    fraction of itself and logs nothing (lsglang v1.6.3)."""
+
+    PAGE = 256
+    WINDOW = 128
+    INTERVAL = 128
+
+    def _cap(self, *, sub_m, chunked=1024, mrr=2):
+        from sglang.srt.model_executor import pool_configurator as pc
+
+        _publish_config(
+            self,
+            max_running_requests=mrr,
+            chunked_prefill_size=chunked,
+            page_size=self.PAGE,
+            disable_overlap_schedule=False,
+        )
+        with (
+            mock_cpu_env(swa_eviction_interval=self.INTERVAL),
+            patch(
+                "sglang.srt.model_executor.pool_configurator.get_super_chunk_size",
+                return_value=sub_m,
+            ),
+        ):
+            return pc.compute_swa_request_cap(
+                page_size=self.PAGE, window=self.WINDOW, attn_dp_size=1
+            )
+
+    def test_super_chunk_is_reserved(self):
+        # [window + eviction interval + page] + one page of decode alloc, x2 reqs,
+        # plus one reservation per in-flight chunk (overlap on => 2), plus a page.
+        live = 2 * (self.WINDOW + self.INTERVAL + self.PAGE + self.PAGE)
+        self.assertEqual(self._cap(sub_m=0), live + 2 * 1024 + self.PAGE)
+        self.assertEqual(self._cap(sub_m=16384), live + 2 * 16384 + self.PAGE)
+
+    def test_no_super_chunk_size_is_left_clamped(self):
+        live = 2 * (self.WINDOW + self.INTERVAL + self.PAGE + self.PAGE)
+        for sub in (1024, 2048, 8192, 16384, 32768):
+            with self.subTest(super_chunk=sub):
+                # what one of the two in-flight chunks gets must be >= what the
+                # scheduler will actually feed it
+                self.assertGreaterEqual(self._cap(sub_m=sub) - live - self.PAGE, 2 * sub)
+
+
 if __name__ == "__main__":
     unittest.main()

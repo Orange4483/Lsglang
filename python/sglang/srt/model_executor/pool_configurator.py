@@ -58,6 +58,7 @@ from sglang.srt.runtime_context import (
 from sglang.srt.utils.common import (
     ceil_align,
     ceil_div,
+    get_super_chunk_size,
     is_float4_e2m1fn_x2,
     is_hip,
     is_npu,
@@ -937,9 +938,17 @@ def compute_swa_request_cap(
         )
     else:
         chunks_in_flight = 1 if get_schedule().disable_overlap_schedule else 2
+        # The super-chunk raises the per-forward token budget above
+        # chunked_prefill_size (scheduler._get_new_batch_prefill_raw), so the
+        # transient one in-flight chunk needs is the larger of the two. It reads
+        # 0 wherever GPU prefill is off or unset, which leaves the old arithmetic
+        # untouched.
+        chunk_tokens = max(
+            get_schedule().chunked_prefill_size or 0, get_super_chunk_size()
+        )
         return (
             per_request * num_reqs
-            + chunks_in_flight * get_schedule().chunked_prefill_size
+            + chunks_in_flight * chunk_tokens
             + page_size
         )
 
