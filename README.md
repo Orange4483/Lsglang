@@ -83,10 +83,11 @@ pip install -e "python" --no-build-isolation -vvv
 
 ### Quick start (Qwen3.8-Flash-Next [RTX 3090 *2])
 
+Verbatim from the production launch script — copy the script, not this block:
+
 Full launch script: [`launch/sglang_serve_qwen38_tp2_3090.sh`](launch/sglang_serve_qwen38_tp2_3090.sh) (plain decode, no speculation).
 
 ```bash
-
 CUDA_DEVICE_ORDER=PCI_BUS_ID \
 GLIBC_TUNABLES=glibc.malloc.thp_enabled=0 \
 GLOO_SOCKET_IFNAME=lo NCCL_SOCKET_IFNAME=lo \
@@ -98,13 +99,15 @@ OMP_NUM_THREADS=1 \
 LK_THREAD_BINDING=NUMA_NODE \
 LK_GPU_PREFETCH_WINDOW=1 \
 LK_GPU_PREFILL_MIN_TOKENS=1024 \
-LK_GPU_PREFILL_SUB_M=32768 \
+LK_GPU_PREFILL_ENGINE=cutlass \
+LK_GPU_PREFILL_SUB_M=65536 \
+LK_GPU_PREFILL_D_SLOTS=16384 \
 LK_NUMA_INTERLEAVE=1 \
 LK_POWER_SAVING=1 \
 LK_GPU_RESIDENT_MOE_LAYERS="" \
 LK_GPU_RESIDENT_MOE_LAYERS_SPEC="" \
-LK_POOL_SLOTS=96 \
-LK_POOL_LOG=0 \
+LK_POOL_SLOTS=128 \
+FLASHINFER_USE_CUDA_NORM=1 \
 FLASHINFER_DISABLE_VERSION_CHECK=1 \
 sglang serve \
   --model ~/Models/Qwen3.8-Flash-Next-NVFP4-W4A16-ATTN-FP8-MTP-NVFP4 \
