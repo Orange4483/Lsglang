@@ -1,7 +1,7 @@
 # lsglang v1.6.2 — Long-Context Correctness, Deterministic Output, Faster Prefill
 
-**Base:** upstream sglang main @ `06342acad2` (1,387 commits since the v1.6.0
-base `583fada954`); **lk_moe v2.7.2**.
+**Base:** upstream sglang main @ `06342acad2` (v1.6.0 base: `583fada954`);
+**lk_moe v2.7.2**.
 
 Everything on top of upstream is the lk_moe integration and its upgrades.
 
@@ -18,7 +18,7 @@ Everything on top of upstream is the lk_moe integration and its upgrades.
   on upgrade, and it only affects sliding-window models.
 - **Repeated / runaway output and run-to-run differences on Qwen3.8 and
   DeepSeek V4.x.** Async host-to-device copies could read a host buffer that
-  had already been recycled underneath them. All 11 such sites now stage
+  had already been recycled underneath them. Every such site now stages
   through a deep parked ring, which removes that whole family of symptoms
   (greedy decoding producing loops, the same prompt answering differently).
 - **Servers that deadlocked at startup on mixed GPU models (TP4, 3090 +
@@ -59,7 +59,7 @@ Everything on top of upstream is the lk_moe integration and its upgrades.
   (an aborted request could leave freed pages referenced); recycled Mamba
   ping-pong slots are cleared lazily so stale state cannot leak into the tree;
   sparse-attention top-k ties are broken by index order so retrieval is stable.
-- **Upstream**: 1,387 commits of sglang main folded in -- unified memory pool
+- **Upstream**: sglang main folded in through `06342acad2` -- unified memory pool
   (asymmetric KV rows, fused draft / sliding-window / recurrent-state layers),
   scheduler and MemCache refactors, Rust gRPC/router work, and the DeepSeek-V4.1
   late-layer pinned-row perf path.
@@ -108,11 +108,13 @@ build now stops the boot with an error rather than running unenforced.
 
 ## Commits
 
-Since v1.6.0 there are 56 commits of ours on top of the upstream base
-(`git log --oneline --first-parent 583fada954..HEAD` for the full list); the
-most recent 12:
+Full list of what we added on top of the upstream base:
+`git log --oneline --first-parent 583fada954..HEAD`. The ones that matter:
 
 ```
+2924198f55 fix(moe): do not log an ERROR when lk_moe is simply switched off
+6e1c0621de chore(deps): lk_moe 2.7.1 -> 2.7.2
+d833b41d8f docs(releasenotes): user-facing problems, env table, commit delta
 1ae927a69f feat(swa): reclaim out-of-window SWA during prefill by default
 d8e24fb154 chore(release): v1.6.2
 f4e8f864d3 chore(launch): default the cutlass engine, pin LK_GPU_PREFILL_D_SLOTS=16384
@@ -124,10 +126,9 @@ a27d5ea5cc feat(swa): reclaim out-of-window SWA during chunked prefill (opt-in) 
 cbca589a66 feat(lk_moe): LK_GPU_PREFILL_D_SLOTS -> cfg.prefill_d_slots (cutlass act slice window)
 60f6658524 fix(lk_moe): default LK_GPU_PREFILL_ENGINE back to triton   # superseded by f4e8f864d3
 76bd58545f chore(dsv4.1): drop obsolete dspark TP2/TP4 launch scripts
-2783c83388 docs(releasenotes): rewrite as user-facing problems-solved + env table
 ```
 
-lk_moe v2.7.1 -> v2.7.2 (16 commits): CUTLASS fp32 intermediates and the
+lk_moe v2.7.1 -> v2.7.2: CUTLASS fp32 intermediates and the
 single N=2I gate/up grouped gemm, the slot-window activation slice pipeline,
 per-window padding fill, **every wave's staging rows published** (this is the
 384-expert long-context fix), the fp32 prefill accumulator booked inside the
