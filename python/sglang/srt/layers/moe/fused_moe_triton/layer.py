@@ -117,7 +117,14 @@ if is_lk_moe_feature_enabled():
     from lk_moe._hybrid_gemv_kernel import (
         gather_rows, slot_table_fill, moe_gateup, reduce_gate, moe_down, reduce_down)
 else:
-    logger.error("Failed to import lk_moe module or LK_MOE_HYBRID_ENABLED is not set to 1, lk::MOE implementation will not be available")
+    # Off is the default, and nothing failed here: the master switch simply is
+    # not set (a real import error raises instead of reaching this branch).
+    # Keep it at debug so a plain sglang start stays quiet; the helpers above
+    # stay undefined on purpose -- every use site is gated on the master.
+    logger.debug(
+        "lk_moe hybrid MoE path disabled (LK_MOE_HYBRID_ENABLED not set); "
+        "using the regular fused MoE implementation"
+    )
 
 # Pool-decode determinism: publish the claimed batch and make the GPU half
 # stream-wait on that batch's copy fence before reading slots. Diagnostic
