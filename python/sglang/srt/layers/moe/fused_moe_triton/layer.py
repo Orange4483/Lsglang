@@ -130,10 +130,15 @@ _LK_POOL_SPLIT_PROBE = bool(
 )
 _LK_POOL_PROBE_N = 0
 if is_lk_moe_feature_enabled():
-    try:
-        lk_moe.pool_set_det_split(_LK_POOL_DET_SPLIT)
-    except Exception:
-        pass
+    if _LK_POOL_DET_SPLIT:
+        # A build that cannot publish the flag would leave python waiting on
+        # fences C++ never claims; raise instead of half-enabling the knob.
+        lk_moe.pool_set_det_split(True)
+    else:
+        try:
+            lk_moe.pool_set_det_split(False)
+        except Exception:
+            pass  # nothing to publish while the knob is off
     
 # Log the deferred-finalize config at most once per process (rank). Different MoE
 # layers can resolve to different quant methods, so print_info_once (keyed on the
@@ -2479,6 +2484,7 @@ class FusedMoE(torch.nn.Module):
             FusedMoE.pool_hpart = torch.zeros((NGK, rows, 2 * I), dtype=torch.float32, device=dev)
             FusedMoE.pool_gout_part = torch.zeros((rows, H), dtype=torch.float32, device=dev)
         self._pool_layer_info = dict(
+            layer=info["layer"],
             snapshot_addr=info["snapshot_addr"],
             weight_addr=info["weight_addr"], scale_addr=info["scale_addr"],
             slot_bytes=info["slot_weight_bytes"],
@@ -2537,10 +2543,10 @@ class FusedMoE(torch.nn.Module):
             gathered_ids, gathered_weights = topk_ids, topk_weights
         side_stream.wait_stream(torch.cuda.current_stream())
         if _LK_POOL_DET_SPLIT:
-            try:
-                lk_moe.pool_wait_fence(geo["layer"], side_stream.cuda_stream)
-            except Exception:
-                pass
+            # No guard: a fence we fail to wait on silently voids the very
+            # determinism this knob exists for, so a missing geo["layer"] or a
+            # failing wait must kill the step, not slip past an `except: pass`.
+            lk_moe.pool_wait_fence(geo["layer"], side_stream.cuda_stream)
         with torch.cuda.stream(side_stream):
             if rows_per_token > 1:
                 gather_rows[(triton.cdiv(n_slots, 128),)](
@@ -2606,6 +2612,11 @@ class FusedMoE(torch.nn.Module):
             self._pool_decode_launch(hidden_states, topk_ids, topk_weights,
                                   real_tokens=real_tokens,
                                   rows_per_token=rows_per_token)
+        else:
+            # Sticky flag: an uncovered batch must clear it or the C++ side keeps
+            # skipping the resident experts it believes the GPU half covered,
+            # while this batch's GPU half never ran -> silently dropped experts.
+            self.lk_moe.pool_gpu_report(False)
         stream_ptr = torch.cuda.current_stream().cuda_stream
         self.lk_moe.cpu_decode(
             stream_ptr,
