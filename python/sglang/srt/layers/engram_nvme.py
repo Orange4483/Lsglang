@@ -49,7 +49,15 @@ _RING = 1 << 16
 _DTK_MASK = _RING - 1
 _STAGE = _RING
 _CHUNK = _RING // 2
-_GATE_LIMIT_US = 300000
+# Soft limit: past this the gate flags err (slow-disk signal) but keeps
+# waiting. The gate never releases on time; only a dead filler -- caught
+# loudly by the scheduler watchdog -- can hold a stream now.
+_GATE_SOFT_US = int(os.environ.get("LK_ENGRAM_GATE_SOFT_US", "300000"))
+# A/B harness only: 1 restores the legacy release-on-timeout semantics.
+_GATE_RELEASE_ON_LIMIT = int(os.environ.get("LK_ENGRAM_GATE_RELEASE_ON_LIMIT", "0"))
+# A/B harness only: 0 keeps storming after a fault instead of raising, so a
+# legacy-semantics arm can expose silent damage. Never 0 in production.
+_FAULT_LOUD = int(os.environ.get("LK_ENGRAM_FAULT_LOUD", "1"))
 
 
 def checkpoint_table(model_path, layer_id, rows, dim):
@@ -167,8 +175,13 @@ def _nvme_merge(
     slot = tk & stage_mask
     # Exact staging-fault detection: the filler stamps slot with ticket+1
     # after the row lands; any other value means the row never arrived.
-    if tl.load(h_stamp_ptr.to(tl.pointer_type(tl.int64)) + slot) != tk + 1:
-        if owned:
+    # A faulted row counts and emits ZERO, never the bytes still sitting in
+    # the slot (they belong to ticket+ring_mask); the next _tick raises.
+    stamp_ok = (
+        tl.load(h_stamp_ptr.to(tl.pointer_type(tl.int64)) + slot) == tk + 1
+    )
+    if owned:
+        if not stamp_ok:
             tl.atomic_add(stat_ptr + 1, 1)
     base = h_stage_ptr.to(tl.int64) + slot.to(tl.int64) * (DIM + DIM // BLK)
     offs = tl.arange(0, DIM)
@@ -184,7 +197,7 @@ def _nvme_merge(
     ).to(tl.int32)
     scale = (exps << 23).to(tl.float32, bitcast=True)
     scale = tl.where(exps == 0, E8M0_ZERO, scale)
-    out = tl.where(owned, vals * scale, 0.0)
+    out = tl.where(owned & stamp_ok, vals * scale, 0.0)
     tl.store(out_ptr + r * DIM + offs, out.to(tl.bfloat16))
 
 
@@ -220,6 +233,12 @@ class NvmeEngramStore:
             )
         self.rows = rows
         self.row_hi = shard_rows
+        self._layer = layer_id
+        # >0 means the caller already divided the machine-wide cache budget
+        # into this store's share; 0 (harness path) falls back to the raw env.
+        self._cache_bytes = int(cache_bytes)
+        self._warns = 0
+        self._faults = 0
         self._loaded = set()
         shard, (w_off, s_off) = checkpoint_table(model_path, layer_id, rows, dim)
         w_off += row_start * dim
@@ -259,7 +278,8 @@ class NvmeEngramStore:
             _STAGE,
             self._h_stamp.data_ptr(),
             direct_fd,
-            lk_nvme_cache_bytes(is_lk_engram_nvme_enabled()),
+            self._cache_bytes
+            or lk_nvme_cache_bytes(is_lk_engram_nvme_enabled()),
         )
         if self._slot < 0:
             os.close(fd)
@@ -339,7 +359,11 @@ class NvmeEngramStore:
                 num_warps=1,
             )
             lk_moe.nvme_gate(
-                self._h_cnt.data_ptr(), self._err.data_ptr(), _GATE_LIMIT_US, stream
+                self._h_cnt.data_ptr(),
+                self._err.data_ptr(),
+                _GATE_SOFT_US,
+                stream,
+                _GATE_RELEASE_ON_LIMIT,
             )
             _nvme_merge[(n,)](
                 flat[off:],
@@ -363,30 +387,62 @@ class NvmeEngramStore:
 
         self._n += 1
         if self._n % 64 == 0 and not torch.cuda.is_current_stream_capturing():
-            self._pin.copy_(self._stat, non_blocking=True)
-            self._evt.record()
+            # Query the PREVIOUS tick's event: the pinned copy needs stream
+            # time to land, and querying an event recorded micoseconds ago is
+            # never ready -- the pre-fix order (copy, record, query) meant the
+            # processing branch almost never ran at all, which is why no
+            # historical log ever printed a health line. An event that was
+            # never recorded queries True, so the first tick proceeds safely.
             if self._evt.query():
                 look, bad, bad_id = (int(x) for x in self._pin.tolist())
-                if self._n % 1024 == 0:
-                    fs = lk_moe.nvme_filler_stats(self._slot)
-                    logger.info(
-                        "[engram-nvme] layer-lookups=%d bad=%d bad_ids=%d"
-                        " filler(cycles=%d rows=%d preads=%d dedup=%d MB=%d)",
-                        look,
-                        bad,
-                        bad_id,
-                        fs["cycles"],
-                        fs["rows"],
-                        fs["preads"],
-                        fs["dedup"],
-                        fs["bytes"] >> 20,
+                # Gate soft-limit trips are sticky-on-device: read, tally,
+                # re-arm. A trip is survivable (the wait continued and the
+                # rows landed); silence is not.
+                warn = int(self._err.sum().item())
+                if warn:
+                    self._warns += 1
+                    logger.warning(
+                        "[engram-nvme] layer %d gate waited past %d us "
+                        "(warns=%d): disk slower than the pipeline",
+                        self._layer,
+                        _GATE_SOFT_US,
+                        self._warns,
                     )
-                    if bad or bad_id:
+                    self._err.zero_()
+                # One line per processed tick (64 eager lookups). Graph
+                # replay never reaches this python path, so _n counts only
+                # prefill-side calls -- tying the line to %1024 meant a real
+                # server run of thousands of decode steps printed nothing.
+                fs = lk_moe.nvme_filler_stats(self._slot)
+                logger.info(
+                    "[engram-nvme] layer-lookups=%d bad=%d bad_ids=%d"
+                    " warns=%d filler(cycles=%d rows=%d preads=%d dedup=%d"
+                    " hits=%d MB=%d)",
+                    look,
+                    bad,
+                    bad_id,
+                    self._warns,
+                    fs["cycles"],
+                    fs["rows"],
+                    fs["preads"],
+                    fs["dedup"],
+                    fs["hits"],
+                    fs["bytes"] >> 20,
+                )
+                # Every check, not one tick in sixteen: with the forever-wait
+                # gate a fault means bytes that never landed (a chunk I/O
+                # error advanced done), so it must be loud on sight.
+                if bad or bad_id:
+                    self._faults += bad + bad_id
+                    if _FAULT_LOUD:
                         raise RuntimeError(
                             "NVMe Engram gather fault: bad=%d bad_ids=%d"
-                            " gate_err=%d" % (bad, bad_id, int(self._err.sum().item()))
+                            " gate_err=%d" % (bad, bad_id, warn)
                         )
                 self._stat.zero_()
+                # Snapshot for the NEXT processed tick.
+                self._pin.copy_(self._stat, non_blocking=True)
+                self._evt.record()
 
 
 _INSTANCES: list[NvmeEngramStore] = []

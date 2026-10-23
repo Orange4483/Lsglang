@@ -56,6 +56,7 @@ from sglang.srt.runtime_context import get_model, get_parallel, get_serving
 from sglang.srt.utils import add_prefix, is_cuda, is_gfx95_supported, is_hip
 from sglang.srt.utils.common import (
     get_lk_engram_nvme_cache_bytes,
+    lk_nvme_cache_bytes,
     get_lk_engram_nvme_staging_bytes,
     is_lk_engram_nvme_enabled,
 )
@@ -879,6 +880,7 @@ class EngramEmbedding(nn.Module):
         dim: int,
         layer_id: int,
         column_bounds: tuple[int, ...],
+        cache_shares: int = 1,
     ):
         super().__init__()
         self.dim = dim
@@ -904,12 +906,18 @@ class EngramEmbedding(nn.Module):
                 get_exec().graph,
                 envs.SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE.get(),
             )
+            # Whole-machine cache budget: one store per engram layer per
+            # rank, and the NVMe arm's target is a 256GB box where the
+            # per-store reading would OOM the host. Both historical env
+            # names count (whichever is set wins over the other's default).
             self.nvme_table = NvmeEngramStore(
                 get_model().model_path,
                 layer_id,
                 num_embeddings,
                 dim,
-                get_lk_engram_nvme_cache_bytes(),
+                max(1 << 26,
+                    max(get_lk_engram_nvme_cache_bytes(),
+                        lk_nvme_cache_bytes(True)) // max(1, cache_shares)),
                 get_lk_engram_nvme_staging_bytes(),
                 # The filler must serve exactly this rank's shard; re-deriving
                 # the split in the store would drift from shard_range.
@@ -1184,6 +1192,8 @@ class Engram(nn.Module):
             layout.head_dim,
             layer_id,
             column_bounds=layout.column_bounds(self.layer_hash_index),
+            # machine cache budget divided over every store that boots
+            cache_shares=len(layout.layer_ids) * get_parallel().tp_size,
         )
         n_hash_cols = (layout.max_ngram_size - 1) * layout.n_heads
         self.wkv = ReplicatedLinear(
