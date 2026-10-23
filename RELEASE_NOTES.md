@@ -1,3 +1,49 @@
+# lsglang v1.6.3 — The Super-Chunk Now Fits Its Own Reservation
+
+**Base:** upstream sglang main @ `06342acad2`; **lk_moe v2.7.2** (unchanged).
+
+## Problems This Release Fixes
+
+- **`LK_GPU_PREFILL_SUB_M` was only partly honoured on sliding-window models.**
+  The super-chunk raises the per-forward token budget, but the sliding-window
+  pool a chunk is measured against was reserved from `--chunked-prefill-size`
+  alone. On DeepSeek-V4.1 that asked for 16,384-token chunks and delivered
+  5,376-token ones -- a third of the configured size, with no log line saying
+  why. The reservation now covers the larger of the two (6,912 -> 37,632 slots at
+  `SUB_M=16384`, 20,736 at the 8,192 the scripts now ship). Nothing to set; no
+  change where the GPU-prefill tier is off, and none on models with no
+  sliding-window pool (Qwen3.8, GLM-5.3).
+
+## What You Need To Change
+
+Nothing to set. Two things to know if you run a sliding-window model on a 24 GB
+card with `LK_GPU_PREFILL_SUB_M` set:
+
+- The larger sliding-window pool is taken from the same budget as the
+  compressed-KV pools. On the DeepSeek-V4.1 TP2 setup it costs 0.82 GB, and the
+  16,384-token chunks triple the per-forward activations on top of that: the run
+  died at `full token usage 0.38` with a 160 MB activation (`16,384 x 5,120 x 2`)
+  it could not get. The launch scripts therefore ship `SUB_M=8192`, which halves
+  both.
+- Do not buy the headroom with `--mem-fraction-static`. That fraction is the
+  budget the KV pools live in: at 0.74 the DeepSeek-V4.1 setup has 1.06 GB left
+  for pools that need 1.25 GB, so the boot stops with
+  "leaves no room for the full KV pool" instead of running smaller. The launch
+  scripts raise `--max-total-tokens` to 294,912 instead, which costs 54 MB and
+  leaves room to generate after a 256k-token prompt (memory alone allows
+  451,328 tokens there, so 256k was never the constraint -- the flag was).
+
+## Known Issues
+
+- `enable_dynamic_chunking` on a pipeline-parallel group sizes chunks from a
+  profiled model the reservation cannot see, so a sliding-window model in that
+  configuration can still be clamped. Not reachable at `--pp-size 1`.
+
+## Commits
+
+Everything added since v1.6.2: `git log --oneline lsglang-v1.6.2..HEAD`.
+
+
 # lsglang v1.6.2 — Long-Context Correctness, Deterministic Output, Faster Prefill
 
 **Base:** upstream sglang main @ `06342acad2` (v1.6.0 base: `583fada954`);
