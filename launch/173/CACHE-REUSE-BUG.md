@@ -233,6 +233,24 @@ from disk, a later one did not). L1/L2 behaviour is deterministic.
 Conclusion: with the patch, a full pool no longer turns new conversations into
 permanent zero-hit sessions on any of the three tiers.
 
+## Quality comparison vs the full deployment (CMMLU, ModelScope)
+
+CMMLU test split (67 subjects, Chinese multiple-choice) downloaded from
+ModelScope; deterministic samples, same prompt, temperature 0.
+
+| sample | patched .14 (4x4090 + CPU MoE) | full deployment (AxonHub) |
+|---|---|---|
+| CMMLU-60 (1/subject) | 55/60 | 55/60 |
+| CMMLU-120 (2/subject) | **109/120** | 105/120 |
+| gsm8k-50 (patched .14) | 50/50 | - |
+
+On CMMLU-120 the two deployments agree on the predicted letter for 109/120
+items (102 both correct, 7 only the small one, 3 only the full one, 8 both
+wrong); the full deployment produced 6 unparseable answers versus 1 on the small
+one, so the raw gap is mostly answer formatting, not capability. No measurable
+quality loss from the patch.
+
+
 
 ## Related: host OOM restarts
 
