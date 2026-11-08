@@ -121,6 +121,37 @@ The remaining lever is the per-chunk adoption of the request's pages
 (`checkpoint_kv_cache` in `mem_cache/common.py`), which is exactly what
 `SGLANG_DISABLE_CHUNKED_RADIX_INSERT=0` restores.
 
+## Instrumented result (decisive)
+
+A temporary log in the non-new-leaf branch of
+`SwaComponent.commit_insert_component_data` shows, for every turn of the cold
+five-turn run:
+
+```
+SWADBG commit non-leaf key_len=11008 prefix_len=11008 node_len=11008 swa_none=True live=11008
+```
+
+- `swa_none=True`: the matched node really has no SWA data (tombstone);
+- `live=11008` equals the full key length: `params.get_evicted_seqlen(SWA)` is at
+  the *end* of the prefix, i.e. bounded replay evicted every SWA window of the
+  request, as designed. There is no live SWA span for the commit path to attach,
+  which is why the tombstone-repair patch could not change the outcome.
+
+So the only way to reuse such a node is Full KV + replay, and the blocker is in
+the match result: `TreeCore._match_post_processor` computes
+`device_prefix_len = sum(len(v) for v in value[:best_match_device_value_len])`,
+i.e. only the nodes where *every* component has a device value. With the SWA
+component absent the sum is 0, and `last_device_node` collapses to the root, so
+the scheduler's `req.prefix_len` is 0 (and raising it in the SWA finalizer trips
+`assert len(path) >= req.prefix_len`).
+
+Correct fix: in `_match_post_processor`, when
+`enable_decoder_swa_bounded_replay` is on and only the SWA component is missing,
+report `device_prefix_len = full_kv_hit_length` (page aligned) and point
+`last_device_node` at the deepest node that still holds the Full value, so the
+prefill replays the SWA window from it. That is a tree-core change, not a
+component one.
+
 ## Related: host OOM restarts
 
 `--hicache-ratio 4` (the 1.7.2 recipe) sizes the DSV4 host pool at 4x the device
