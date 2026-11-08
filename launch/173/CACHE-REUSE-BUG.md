@@ -3,6 +3,37 @@
 Status: reproduced on .14 / .15 with lsglang 1.7.3 (lk_moe 2.8.4), TP4/TP2,
 `--enable-decoder-swa-bounded-replay`, HiCache L1/L2/L3 alike.
 
+## Permanent variant (the reported 5/5 zeros)
+
+Replaying the captured DSH request body (`request-body-gid___axonhub_Request_42584.json`,
+11,246 prompt tokens, 35 tools, `reasoning_effort: xhigh`) as a growing conversation
+reproduces the "never hits" case:
+
+| turn | msgs | prompt | cached | wall |
+|---|---|---|---|---|
+| 0 | 7 | 11,246 | 0 | 30.2 s |
+| 1 | 9 | 11,282 | 0 | 10.0 s |
+| 2 | 11 | 11,294 | 0 | 10.0 s |
+| 3 | 13 | 11,306 | 0 | 10.0 s |
+| 4 | 15 | 11,318 | 0 | 10.1 s |
+
+Once the first request is cold, that conversation never reuses again. Two identical
+(non-growing) requests of the same body do hit (0 -> 11,008), and the logged
+`input_ids` of consecutive turns share a 11,246-token prefix, so the prompt is
+deterministic: the loss is in the cache, not in the rendering.
+
+Likely mechanism: the cold request's completion insert leaves a **tombstoned** node
+(Full KV present, SWA window missing, see below). Every later turn matches that node
+(`full_hit` > 0, `device_prefix_len` = 0), re-prefills, and its own insert matches the
+same node length, so no new leaf is created and
+`SwaComponent.commit_insert_component_data` returns early when `is_new_leaf` is
+false -- the SWA tombstone is never filled, so the node stays unusable forever until
+it is evicted.
+
+Fix direction: when a re-insert covers a node whose SWA data is missing, attach the
+request's fresh SWA window to it (the same `_populate_range` path used for new leaves,
+limited to the sliding window) instead of returning early for every non-new leaf.
+
 ## Symptom
 
 A long agent conversation (60K+ token context, growing each turn):
