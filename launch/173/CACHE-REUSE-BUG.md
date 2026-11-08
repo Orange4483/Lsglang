@@ -200,6 +200,38 @@ bash launch/173/patches/apply.sh "" --revert      # back to stock
 `DSV41_HICACHE_RATIO` to 1 on the small host (the 1.7.2 recipe's ratio 4 is what
 OOM-killed the scheduler).
 
+## Pool-full matrix (safety check before submitting)
+
+Script: `launch/lan_14_15/two_turn_probe.py` is the minimal repro; the matrix
+below used a local `t_full_matrix.py` that first over-fills the pool with
+14 x 52,655-token prompts (737K > 666K capacity, so the pool is full and old
+prefixes are evicted), then starts brand-new conversations and a 97.5K-token
+fact-recall probe.
+
+| host / cache mode | fill | new 11K convo turn 1 | new 78K convo turn 1 | 97.5K facts | answers |
+|---|---|---|---|---|---|
+| .14 L1 | 14 x 52.6K | 11,008 | 77,824 | 97,280 | all correct |
+| .14 L2 | 14 x 52.6K | 11,008 | 77,824 | 97,280 | all correct |
+| .14 L3 (file) | 14 x 52.6K | 11,008 | 77,824 | 97,280 | all correct |
+| .15 L2 + DSPARK | 14 x 52.6K | 11,008 | 77,824 | 97,280 | all correct |
+| .14 L3, two 39K convos in parallel | full | 38,912 each | - | - | markers correct |
+
+- "turn 1" is the first follow-up of a conversation whose turn 0 was cold; the
+  whole point of the fix is that it now reuses instead of re-prefilling.
+- The 97.5K probe asks for facts placed at 10/50/90% of the prompt; the last two
+  questions are served from the cached prefix (97,280 tokens) and answer
+  `ZX-4471` / `03:40 KST` correctly, so replay does not corrupt attention.
+- Server logs on both hosts contain no traceback/assertion/ERROR after the
+  `fired up` line for any of these runs; no OOM (host pool now ratio 1).
+
+Known rough edge, unrelated to this fix: the L3 file backend does not reliably
+restore a prefix after a *process restart* (one restart restored an 11K prefix
+from disk, a later one did not). L1/L2 behaviour is deterministic.
+
+Conclusion: with the patch, a full pool no longer turns new conversations into
+permanent zero-hit sessions on any of the three tiers.
+
+
 ## Related: host OOM restarts
 
 `--hicache-ratio 4` (the 1.7.2 recipe) sizes the DSV4 host pool at 4x the device
