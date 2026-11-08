@@ -1,12 +1,13 @@
-# .15 prefill / decode sweep (1.7.3 + SWA Full-prefix fix)
+# Prefill / decode sweep on .14 and .15 (1.7.3 + SWA Full-prefix fix)
 
 Goal: keep the 665,535-token context (`max_total_num_tokens = 666,112`) while
 making prefill usable (1000-2000 t/s) and decode as fast as possible.
 
-Hardware: RTX 4090 48G + RTX PRO 5000, TP2 + DSPARK, 128 cores, 1 TB RAM.
 Measured with `bench15.py`: a fresh (unique-prefix) ~32K and ~80K prompt with
 `max_tokens=1` for prefill, and a 320-token generation, median of three runs, for
 decode. `max_total_num_tokens` was 666,112 in every run.
+
+## .15 — RTX 4090 48G + RTX PRO 5000, TP2 + DSPARK, 128 cores, 1 TB RAM
 
 | # | chunk | `LK_GPU_PREFILL_SUB_M` | note | prefill 32K | prefill 80K | decode | KV |
 |---|---|---|---|---|---|---|---|
@@ -46,5 +47,32 @@ DSV41_HICACHE_MODE=l2 DSV41_HICACHE_RATIO=2 \
   bash ~/project/Lsglang-egram-nvme-kv-nvme/lsglang173/start.sh
 ```
 
-`.14` keeps `chunk=8192`, `SUB_M=0`, power saving on: it has 24 GB cards and the
-32768-token super-chunk scratch was never validated there.
+## .14 — 4x RTX 4090 24G, TP4, no DSPARK, 64 cores, 503 GB RAM
+
+| # | chunk | `LK_GPU_PREFILL_SUB_M` | note | prefill 32K | prefill 80K | decode | KV |
+|---|---|---|---|---|---|---|---|
+| A | 8192 | 0 | previous default | 2,318 | 2,225 | 49.6 | 666,112 |
+| B | 1024 | 32768 | `CAP=32768` | **CUDA OOM** | - | - | - |
+| C | 1024 | 16384 | `CAP=16384` | 2,932 | 2,865 | 51.6 | 666,112 |
+| D | 1024 | 24576 | `CAP=24576` | **CUDA OOM** | - | - | - |
+| E | 1024 | 20480 | `CAP=20480, inner=1024` | 2,907 | 3,068 | 49.7 | 666,112 |
+| F | 8192 | 20480 | `CAP=20480, inner=8192` | **3,022** | **3,149** | 49.8 | 666,112 |
+
+- 24 GB cards cap the super-chunk at ~20K tokens: 24576 already OOMs a single
+  32K prompt (`19 MiB free of 23.52 GiB`), so 20480 is the practical ceiling.
+- Keeping `chunk 8192` (instead of 1024) is slightly faster here: fewer
+  scheduling rounds for the same CAP.
+- Two parallel 58.5K prefills on the tuned config: both complete in 42 s
+  (~1,390 t/s each) without OOM, so `--max-running-requests 2` stays safe.
+- Cache reuse and long context re-verified: cold five-turn conversation hits
+  11,008 from turn 1, 121K needle test answers both facts (121,088 cached).
+
+Recommended (now the default on `.14`):
+
+```bash
+DSV41_CHUNK=8192 DSV41_SUB_M=20480 DSV41_HICACHE_MODE=l2 DSV41_HICACHE_RATIO=1 \
+  bash ~/project/Lsglang-egram-nvme-kv-nvme/lsglang173/start.sh
+```
+
+Conservative variant if the workload has bursts of concurrent long prefills:
+`DSV41_SUB_M=16384` (2,932 / 2,865 t/s, more VRAM headroom).
