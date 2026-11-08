@@ -223,6 +223,8 @@ fact-recall probe.
   `ZX-4471` / `03:40 KST` correctly, so replay does not corrupt attention.
 - Server logs on both hosts contain no traceback/assertion/ERROR after the
   `fired up` line for any of these runs; no OOM (host pool now ratio 1).
+- gsm8k-50 on the patched .14 (L3, pool already full): **50/50**, matching the
+  1.7.3 baseline measured before the patch (99/100 on 100 items).
 
 Known rough edge, unrelated to this fix: the L3 file backend does not reliably
 restore a prefix after a *process restart* (one restart restored an 11K prefix
