@@ -18,6 +18,10 @@ if [ "$HOST_NUM" = 14 ]; then
   ENGRAM_ENV=(LK_ENGRAM_NVME=1 SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE=0)
   CUDA_VISIBLE=${DSV41_CUDA_VISIBLE:-0,1,2,3}
   THREADS=${DSV41_THREADS:-16}
+  # 24 GB cards: keep the author's per-chunk staging (SUB_M 0 = wrapper off).
+  DEF_CHUNK=8192
+  DEF_SUBM=0
+  DEF_POWER=1
 else
   MODEL=$HOME/models/DeepSeek-V4.1-Flash-1017
   TP=2
@@ -26,9 +30,16 @@ else
   ENGRAM_ENV=(SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE=1)
   CUDA_VISIBLE=${DSV41_CUDA_VISIBLE:-0,1}
   THREADS=${DSV41_THREADS:-48}
+  # Measured on the 2026-11-09 sweep: chunk 1024 + SUB_M 32768 (CAP=32768,
+  # inner=1024) lifts a cold 32K prefill from 2,129 to 3,424 t/s and 80K to
+  # 3,190 t/s while keeping max_total_num_tokens at 666,112. SUB_M 65536 OOMs
+  # an 80K prefill on this box, so 32768 is the ceiling.
+  DEF_CHUNK=1024
+  DEF_SUBM=32768
+  DEF_POWER=0
 fi
-SUBM=${DSV41_SUB_M:-12288}
-CHUNK=${DSV41_CHUNK:-8192}
+SUBM=${DSV41_SUB_M:-$DEF_SUBM}
+CHUNK=${DSV41_CHUNK:-$DEF_CHUNK}
 SLOTS=${DSV41_POOL_SLOTS:-40}
 MAXTOT=${DSV41_MAX_TOTAL:-666112}
 MAXREQ=${DSV41_MAX_REQ:-2}
@@ -108,7 +119,7 @@ exec env "${ENGRAM_ENV[@]}" \
   LK_GPU_PREFILL_D_SLOTS=16384 \
   LK_GPU_PREFILL_WAVE_EXPERTS="${DSV41_WAVE_EXPERTS:-64}" \
   LK_NUMA_INTERLEAVE=1 \
-  LK_POWER_SAVING=1 \
+  LK_POWER_SAVING="${LK_POWER_SAVING:-$DEF_POWER}" \
   LK_GPU_RESIDENT_MOE_LAYERS="" \
   LK_POOL_SLOTS="$SLOTS" \
   LK_POOL_NO_STAGE=0 \
@@ -146,3 +157,5 @@ exec env "${ENGRAM_ENV[@]}" \
   "${HICACHE_ARGS[@]}" \
   "${LOGREQ_ARGS[@]}" \
   "$@" >>"$LOG" 2>&1
+
+
