@@ -152,6 +152,30 @@ report `device_prefix_len = full_kv_hit_length` (page aligned) and point
 prefill replays the SWA window from it. That is a tree-core change, not a
 component one.
 
+## Fix validated
+
+`launch/173/patches/0001-dsv4-bounded-replay-full-prefix.patch` implements that
+change behind `LK_SWA_BOUNDED_FULL_PREFIX=1` (uses the existing
+`match_full_device_prefix()` helper). Measured on .14, 1.7.3 + L1, same cold
+five-turn captured body:
+
+| turn | cached (stock) | cached (patched) | wall (patched) |
+|---|---|---|---|
+| 0 | 0 | 0 | 29.3 s |
+| 1 | 0 | **11,008** | 5.2 s |
+| 2 | 0 | **11,008** | 5.1 s |
+| 3 | 0 | **11,008** | 5.5 s |
+| 4 | 0 | **11,008** | 5.4 s |
+
+Correctness probe on the same build (fact at 10/50/90% of a 28.7K prompt plus an
+eight-turn memory check): all four answers correct
+(`8821-OMEGA`, `ZX-4471`, `03:40 KST`, `PROJ-5566`), with the last three served
+at 3.9-3.9-2.2 s from the replayed prefix.
+
+Caveats before proposing it upstream: the SWA window is rebuilt from the Full
+KV on the prefill path, so a wider validation (long-context quality, DSPARK,
+MHA models) is still needed; the env gate keeps stock behaviour unless opted in.
+
 ## Related: host OOM restarts
 
 `--hicache-ratio 4` (the 1.7.2 recipe) sizes the DSV4 host pool at 4x the device

@@ -1,0 +1,43 @@
+--- a/python/sglang/srt/mem_cache/unified_cache/unified_tree_core.py
++++ b/python/sglang/srt/mem_cache/unified_cache/unified_tree_core.py
+@@ -17,6 +17,7 @@
+ from __future__ import annotations
+ 
+ import logging
++import os
+ import sys
+ from array import array
+ from collections import defaultdict
+@@ -28,6 +29,7 @@
+ 
+ from sglang.srt.disaggregation.kv_events import StorageMedium
+ from sglang.srt.environ import envs
++from sglang.srt.runtime_context import get_exec
+ from sglang.srt.mem_cache.base_prefix_cache import (
+     DecLockRefParams,
+     DecLockRefResult,
+@@ -1053,6 +1055,24 @@
+                 value_chunks=value,
+                 best_value_len=best_match_device_value_len,
+             )
++        # Bounded replay keeps no SWA KV for a cached prefix (the request's SWA
++        # eviction cursor sits at the end), so the component-based prefix length
++        # collapses to 0 even though the Full KV is fully resident. Expose the
++        # Full-device prefix and let prefill replay the SWA window from it.
++        if (
++            os.environ.get("LK_SWA_BOUNDED_FULL_PREFIX") == "1"
++            and get_exec().features.enable_decoder_swa_bounded_replay
++            and result.device_prefix_len == 0
++            and result.full_kv_hit_length > 0
++        ):
++            matched_len, node_id, _pinned = self.match_full_device_prefix(params.key)
++            aligned = matched_len // self.page_size * self.page_size
++            if aligned > 0:
++                result = result._replace(
++                    device_prefix_len=aligned,
++                    last_device_node=self.node_by_id(node_id),
++                )
++
+         # Expose only NodeIds outside TreeCore.
+         return result._replace(
+             last_device_node=result.last_device_node.id,
