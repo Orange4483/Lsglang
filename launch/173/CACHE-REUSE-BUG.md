@@ -105,6 +105,22 @@ holds only a tombstone. A correct fix must either
 2. teach the prefill path to use the Full prefix and replay the SWA window
    (`swa_branching_seqlen`) — a scheduler-side change.
 
+Repairing the tombstone at commit time
+(`SwaComponent.commit_insert_component_data`, non-new-leaf branch: rebuild the
+node's SWA window from its Full value via `_populate_range`) was also tried:
+
+- `start = end - window` trips `assert node_start >= start` in `_segments`,
+  because `_populate_range` wants `start <= node_start` and walks parents;
+- `start = end - len(node.key)` with a `live_start < end` guard runs without
+  crashing, but the five-turn cold scenario still reports `cached=0`, so the
+  commit-time repair alone does not make the node reusable — it needs
+  instrumentation to see whether the repair runs and what the following match
+  reports.
+
+The remaining lever is the per-chunk adoption of the request's pages
+(`checkpoint_kv_cache` in `mem_cache/common.py`), which is exactly what
+`SGLANG_DISABLE_CHUNKED_RADIX_INSERT=0` restores.
+
 ## Related: host OOM restarts
 
 `--hicache-ratio 4` (the 1.7.2 recipe) sizes the DSV4 host pool at 4x the device
