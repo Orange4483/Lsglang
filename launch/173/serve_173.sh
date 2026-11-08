@@ -11,7 +11,9 @@ mkdir -p "$(dirname "$LOG")"
 if [ "$HOST_NUM" = 14 ]; then
   MODEL=/media/hello/Windows/models/DeepSeek-V4.1-Flash-1017
   TP=4
-  HICACHE_RATIO=${DSV41_HICACHE_RATIO:-4}
+  # ratio 4 (the 1.7.2 recipe) needs ~60 GB of host KV on top of the host MoE
+  # table and OOM-killed the scheduler on a 503 GB host; 1 is the safe default.
+  HICACHE_RATIO=${DSV41_HICACHE_RATIO:-1}
   TEXT_ARGS=(--language-model-only)
   ENGRAM_ENV=(LK_ENGRAM_NVME=1 SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE=0)
   CUDA_VISIBLE=${DSV41_CUDA_VISIBLE:-0,1,2,3}
@@ -34,16 +36,26 @@ MEM=${DSV41_MEM_FRACTION:-0.88}
 KV_NVME_DIR=${DSV41_KV_NVME-/home/hello/hicache_l3_173}
 mkdir -p "$KV_NVME_DIR"
 HICACHE_MODE=${DSV41_HICACHE_MODE:-$([ "${DSV41_HICACHE:-1}" = 1 ] && echo l3 || echo l1)}
+# Host pool sizing. DeepSeek-V4 HiCache rejects --hicache-size, so the only
+# knobs are the device-relative ratio and the host-memory fraction. The ratio
+# alone ignores how much RAM the host actually has (ratio 4 drove a 503 GB host
+# into the kernel OOM killer); the fraction makes sglang shrink its own ratio
+# until the host pools fit.
+if [ -n "${DSV41_HICACHE_HOST_FRACTION:-}" ]; then
+  HICACHE_CAPACITY=(--hicache-host-memory-fraction "$DSV41_HICACHE_HOST_FRACTION")
+else
+  HICACHE_CAPACITY=(--hicache-ratio "$HICACHE_RATIO")
+fi
 case "$HICACHE_MODE" in
   l1)
     HICACHE_ARGS=() ;;
   l2)
     # host pool only: no L3 file backend, so no restore-from-disk path
-    HICACHE_ARGS=(--enable-hierarchical-cache --hicache-ratio "$HICACHE_RATIO"
+    HICACHE_ARGS=(--enable-hierarchical-cache "${HICACHE_CAPACITY[@]}"
       --hicache-mem-layout page_first_direct --hicache-io-backend direct
       --hicache-write-policy write_through) ;;
   *)
-    HICACHE_ARGS=(--enable-hierarchical-cache --hicache-ratio "$HICACHE_RATIO"
+    HICACHE_ARGS=(--enable-hierarchical-cache "${HICACHE_CAPACITY[@]}"
       --hicache-mem-layout page_first_direct --hicache-io-backend direct
       --hicache-write-policy write_through --hicache-storage-backend file
       --hicache-storage-prefetch-policy wait_complete
@@ -100,6 +112,7 @@ exec env "${ENGRAM_ENV[@]}" \
   LK_GPU_RESIDENT_MOE_LAYERS="" \
   LK_POOL_SLOTS="$SLOTS" \
   LK_POOL_NO_STAGE=0 \
+  LK_SWA_BOUNDED_FULL_PREFIX="${LK_SWA_BOUNDED_FULL_PREFIX:-1}" \
   "${SPEC_ENV[@]}" \
   LK_POOL_LOG=${LK_POOL_LOG:-0} \
   SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0 \

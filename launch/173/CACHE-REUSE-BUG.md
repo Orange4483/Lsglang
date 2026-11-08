@@ -176,6 +176,30 @@ Caveats before proposing it upstream: the SWA window is rebuilt from the Full
 KV on the prefill path, so a wider validation (long-context quality, DSPARK,
 MHA models) is still needed; the env gate keeps stock behaviour unless opted in.
 
+Full validation matrix (same cold five-turn captured body, `cached` of turn 1):
+
+| host | config | stock | patched |
+|---|---|---|---|
+| .14 TP4 | L1 | 0 | 11,008 (5.2 s) |
+| .14 TP4 | L2 (`--hicache-ratio 1`) | 0 | 11,008 (5.9 s) |
+| .14 TP4 | L3 (file backend) | 0 | 11,008 (5.7 s) |
+| .15 TP2+DSPARK | L2 | 0 | 11,008 (3.0 s) |
+
+Correctness probes on both patched hosts (28.7K-token prompt, facts at 10/50/90%
+plus an eight-turn memory check) returned every answer correctly:
+`8821-OMEGA`, `ZX-4471`, `03:40`, `PROJ-5566`.
+
+Apply / revert:
+
+```
+bash launch/173/patches/apply.sh                  # idempotent, keeps .orig
+bash launch/173/patches/apply.sh "" --revert      # back to stock
+```
+
+`serve_173.sh` now exports `LK_SWA_BOUNDED_FULL_PREFIX=1` by default and defaults
+`DSV41_HICACHE_RATIO` to 1 on the small host (the 1.7.2 recipe's ratio 4 is what
+OOM-killed the scheduler).
+
 ## Related: host OOM restarts
 
 `--hicache-ratio 4` (the 1.7.2 recipe) sizes the DSV4 host pool at 4x the device
