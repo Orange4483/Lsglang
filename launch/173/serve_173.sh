@@ -55,7 +55,9 @@ SLOTS=${DSV41_POOL_SLOTS:-40}
 MAXTOT=${DSV41_MAX_TOTAL:-666112}
 MAXREQ=${DSV41_MAX_REQ:-2}
 MEM=${DSV41_MEM_FRACTION:-0.88}
-KV_NVME_DIR=${DSV41_KV_NVME-/home/hello/hicache_l3_173}
+# Keep caches out of the home root: one stable directory per host, wiped when
+# the build or the profile changes (see clean_l3.sh).
+KV_NVME_DIR=${DSV41_KV_NVME-$HOME/kvcache/l3}
 mkdir -p "$KV_NVME_DIR"
 HICACHE_MODE=${DSV41_HICACHE_MODE:-$([ "${DSV41_HICACHE:-1}" = 1 ] && echo l3 || echo l1)}
 # Host pool sizing. DeepSeek-V4 HiCache rejects --hicache-size, so the only

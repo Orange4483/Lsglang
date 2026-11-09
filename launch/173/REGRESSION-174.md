@@ -37,9 +37,10 @@ matrix (14 x 52,655-token fills = 737K > 666K capacity, then fresh work):
 | .14 L2 | turn 1+ = 11,008 | 77,824 | 97,280, answers correct |
 | .14 L3 | turn 1+ = 11,008 | 77,824 | 97,280, answers correct |
 | .15 L2 + DSPARK | turn 1+ = 11,008 | 77,824 | 97,280, answers correct |
+| .15 L3 + DSPARK | turn 1+ = 11,008 | 77,824 | 97,280, answers correct |
 
 No zero-hit session, no wrong answer; `max_total_num_tokens` stays 666,112.
-The L3 run even restored the 11K prefix on the first turn after a restart
+The L3 run on .14 even restored the 11K prefix on the first turn after a restart
 (`cached=11,008` at turn 0), which the 1.7.3 build did only sometimes.
 
 ## Performance (tuned parameters unchanged)
@@ -52,18 +53,24 @@ The L3 run even restored the 11K prefix on the first turn after a restart
 Both are within noise of the 1.7.3 numbers (3,022 / 3,149 / 49.8 and
 3,448 / 3,198 / 82.9-96.3), so the release does not change prefill/decode here.
 
-## Boot-time regression on .15 (needs attention)
+## Boot time on .15 (one slow first boot)
 
-The .15 boot spent 7.6 minutes in `Capture draft verify CUDA graph begin`
-(`Load weight end` 21:02:33 -> capture 21:04:54 -> `fired up` 21:12:31; the
-whole start took about 22 minutes against ~6 for 1.7.3). GPU 0 sat at 100 %
-utilisation for the whole capture. It does finish and serves normally
-afterwards, but a restart on this host is now a ~20 minute operation. Worth
-checking whether the DSPARK draft-verify graph recompiles per boot on the
-SM89 + SM120 pair.
+The **first** .15 boot on 1.7.4 spent 7.6 minutes in
+`Capture draft verify CUDA graph begin`
+(`Load weight end` 21:02:33 -> capture 21:04:54 -> `fired up` 21:12:31, about
+22 minutes in total against ~6 for 1.7.3), with GPU 0 at 100 % the whole time.
+The **next** boot on the same env took 9 seconds in that capture and 7 minutes
+total, so it looks like a one-off compile/warm-up on the first start rather than
+a per-restart cost. Worth keeping an eye on for the first boot after an upgrade.
 
-## Launcher change
+## Launcher and layout changes
 
-`launch/173/serve_173.sh` now defaults to the newest packaged env on the host
-(`Lsglang175` -> `Lsglang174` -> `Lsglang173`), so `bash start.sh` picks 1.7.4
-without `ENV173=...`.
+- `launch/173/serve_173.sh` defaults to the newest packaged env on the host
+  (`Lsglang175` -> `Lsglang174` -> `Lsglang173`), so `bash start.sh` picks 1.7.4
+  without `ENV173=...`.
+- L3 now lives under `$HOME/kvcache/l3` (not the home root); the old
+  `~/hicache_l3*` caches were removed because entries are tied to the build and
+  profile. `launch/173/clean_l3.sh` follows the same path.
+- Package tarballs and the CUDA installer moved to `~/artifacts/`
+  (4 x 4.5 GB of Lsglang tarballs + 4.1 GB cuda run); freeing ~18 GB on .14 and
+  ~32 GB on .15.
