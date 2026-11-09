@@ -4,7 +4,15 @@
 #   bash launch/173/serve_173.sh 14|15
 set -uo pipefail
 HOST_NUM=${1:?usage: serve_173.sh 14|15}; shift || true
-E=${ENV173:-$HOME/envs/Lsglang173}
+# Default to the newest packaged env on the host, so a fresh checkout does not
+# silently keep running the previous release.
+E=${ENV173:-}
+if [ -z "$E" ]; then
+  for cand in "$HOME/envs/Lsglang175" "$HOME/envs/Lsglang174" "$HOME/envs/Lsglang173"; do
+    if [ -d "$cand" ]; then E=$cand; break; fi
+  done
+fi
+: "${E:?no lsglang env found under $HOME/envs}"
 PORT=${PORT:-8070}
 LOG=${LOG:-$HOME/project/Lsglang-egram-nvme-kv-nvme/lsglang173/serve_${HOST_NUM}.log}
 mkdir -p "$(dirname "$LOG")"
