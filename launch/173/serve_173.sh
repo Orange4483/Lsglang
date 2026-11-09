@@ -26,12 +26,12 @@ if [ "$HOST_NUM" = 14 ]; then
   ENGRAM_ENV=(LK_ENGRAM_NVME=1 SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE=0)
   CUDA_VISIBLE=${DSV41_CUDA_VISIBLE:-0,1,2,3}
   THREADS=${DSV41_THREADS:-16}
-  # Measured on the 2026-11-09 sweep: chunk 8192 + SUB_M 20480 (CAP=20480,
-  # inner=8192) lifts a cold 32K prefill from 2,318 to 3,022 t/s and 80K from
-  # 2,225 to 3,149 t/s at 666,112 tokens. 24576 OOMs a single 32K prompt on the
-  # 24 GB cards; 20480 survives two parallel 58K prefills.
+  # Long-context safety first: with super-chunk staging (SUB_M > chunk) a single
+  # long prefill runs the 24 GB cards out of VRAM (SUB_M 20480 died at 400K
+  # tokens), while per-chunk staging served a 585K-token prompt at ~2.2K t/s.
+  # Prefill: SUB_M 0 -> 2,318/2,225 t/s (32K/80K), SUB_M 20480 -> 3,022/3,149.
   DEF_CHUNK=8192
-  DEF_SUBM=20480
+  DEF_SUBM=0
   DEF_POWER=1
 else
   MODEL=$HOME/models/DeepSeek-V4.1-Flash-1017
@@ -41,12 +41,12 @@ else
   ENGRAM_ENV=(SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE=1)
   CUDA_VISIBLE=${DSV41_CUDA_VISIBLE:-0,1}
   THREADS=${DSV41_THREADS:-48}
-  # Measured on the 2026-11-09 sweep: chunk 1024 + SUB_M 32768 (CAP=32768,
-  # inner=1024) lifts a cold 32K prefill from 2,129 to 3,424 t/s and 80K to
-  # 3,190 t/s while keeping max_total_num_tokens at 666,112. SUB_M 65536 OOMs
-  # an 80K prefill on this box, so 32768 is the ceiling.
+  # SUB_M 32768 gives the fastest prefill (3,443/3,193 t/s at 32K/80K) but a
+  # single 600K-token prompt OOMs the box; SUB_M 8192 (CAP=8192, inner=1024)
+  # still arms the super-chunk wrapper and served a 585K-token prompt at
+  # 2,087/2,034 t/s, so long context stays usable.
   DEF_CHUNK=1024
-  DEF_SUBM=32768
+  DEF_SUBM=8192
   DEF_POWER=0
 fi
 SUBM=${DSV41_SUB_M:-$DEF_SUBM}
